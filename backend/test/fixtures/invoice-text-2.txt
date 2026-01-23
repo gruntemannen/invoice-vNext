@@ -1,0 +1,9 @@
+Globex Services Ltd
+Invoice # GLOB-7788
+Date: 2025/11/05
+Total Due EUR 2450.00
+Bank: Globex Bank
+IBAN: DE89370400440532013000
+
+Items:
+1) Consulting Services - 2450.00

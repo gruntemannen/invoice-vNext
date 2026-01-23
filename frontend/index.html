@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Invoice Extractor</title>
+    <meta name="description" content="Upload a PDF invoice and get structured JSON extracted with Amazon Bedrock." />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="manifest.json" />
+    <meta name="theme-color" content="#0b1220" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="apple-touch-icon" href="favicon.svg" />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">IE</div>
+          <div class="brand-text">
+            <h1>Invoice Extractor</h1>
+            <p>Upload PDF invoices and review extracted JSON</p>
+          </div>
+        </div>
+      </header>
+
+      <main class="container">
+        <section id="upload-section" class="surface">
+          <div class="section-header">
+            <div>
+              <h2>Upload</h2>
+              <p class="muted">PDF only. The extractor will run after upload completes.</p>
+            </div>
+          </div>
+
+          <div class="upload-row">
+            <input id="file-input" class="file-input" type="file" accept="application/pdf" />
+            <button id="upload-btn" class="button">Upload</button>
+          </div>
+
+          <div class="status-row" aria-live="polite">
+            <div id="upload-spinner" class="spinner hidden" aria-label="Uploading / processing"></div>
+            <div id="upload-status" class="status-text"></div>
+          </div>
+        </section>
+
+        <section id="list-section" class="surface">
+          <div class="section-header">
+            <div>
+              <h2>Processed invoices</h2>
+              <p class="muted">Click an invoice to view the PDF and extracted JSON.</p>
+            </div>
+            <button id="load-more" class="button secondary">Load more</button>
+          </div>
+          <div id="list" class="list" role="list"></div>
+        </section>
+
+        <section id="detail-section" class="surface hidden">
+          <div class="section-header detail-header">
+            <div>
+              <h2>Invoice detail</h2>
+              <div class="detail-meta" id="detail-meta"></div>
+            </div>
+            <div class="detail-actions">
+              <button id="delete" class="button danger">Delete</button>
+              <button id="download" class="button">Download PDF</button>
+              <button id="back" class="button secondary">Back</button>
+            </div>
+          </div>
+
+          <div class="detail-grid">
+            <div class="panel">
+              <div class="panel-title">PDF preview</div>
+              <iframe id="pdf-viewer" class="pdf-viewer" title="Invoice PDF preview"></iframe>
+            </div>
+            <div class="panel">
+              <div class="panel-title">Extracted JSON</div>
+              <pre id="detail-json" class="json-box"></pre>
+            </div>
+          </div>
+        </section>
+
+        <footer class="footer">
+          <span class="muted">Invoice Extractor • S3 + Lambda + Bedrock • Frankfurt (eu-central-1)</span>
+        </footer>
+      </main>
+    </div>
+    <script src="app.js"></script>
+    <script>
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("sw.js").catch(() => {});
+        });
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+ACME Office Supplies
+123 Main Street, Denver, CO 80202, USA
+Invoice Number: INV-1001
+Invoice Date: 2025-12-10
+Due Date: 2026-01-10
+Bill To: Contoso LLC
+Subtotal: 1000.00
+Tax: 80.00
+Total: 1080.00 USD
+
+Line Items:
+1. Printer Paper - 10 reams - 500.00
+2. Toner Cartridge - 2 units - 500.00

@@ -1,0 +1,42 @@
+{
+  "meta": {
+    "messageId": "example-message-2",
+    "receivedAt": "2026-01-02T00:00:00Z",
+    "from": "billing@globex.com",
+    "subject": "Invoice GLOB-7788",
+    "attachmentKey": "attachments/example-message-2/attachment.pdf",
+    "extractionModel": "amazon.nova-lite-v1:0",
+    "confidenceScore": 0.7,
+    "warnings": []
+  },
+  "vendor": {
+    "name": "Globex Services Ltd",
+    "address": {
+      "line1": "Unknown",
+      "city": "Unknown",
+      "postalCode": "Unknown",
+      "country": "Unknown"
+    }
+  },
+  "invoice": {
+    "invoiceNumber": "GLOB-7788",
+    "invoiceDate": "2025-11-05",
+    "currency": "EUR",
+    "totalAmount": 2450.0
+  },
+  "remitTo": {
+    "bankName": "Globex Bank",
+    "iban": "DE89370400440532013000"
+  },
+  "lineItems": [
+    {
+      "lineNumber": 1,
+      "description": "Consulting Services",
+      "amount": 2450.0
+    }
+  ],
+  "raw": {
+    "extractedTextSnippet": "Globex Services Ltd",
+    "fieldsNotFound": ["vendor.address.city", "vendor.address.postalCode"]
+  }
+}

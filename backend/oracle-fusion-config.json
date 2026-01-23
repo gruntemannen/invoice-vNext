@@ -1,0 +1,16 @@
+{
+  "source": "INVOICE_EXTRACTOR",
+  "businessUnit": "Your Business Unit",
+  "defaultInvoiceType": "Standard",
+  "supplierMapping": {
+    "Your Vendor Name": {
+      "supplierNumber": "VENDOR-001",
+      "supplierSite": "MAIN"
+    }
+  },
+  "defaultDistribution": {
+    "account": "5000",
+    "costCenter": "100",
+    "department": "IT"
+  }
+}

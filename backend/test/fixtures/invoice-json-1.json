@@ -1,0 +1,53 @@
+{
+  "meta": {
+    "messageId": "example-message-1",
+    "receivedAt": "2026-01-01T00:00:00Z",
+    "from": "ap@acme.com",
+    "subject": "Invoice INV-1001",
+    "attachmentKey": "attachments/example-message-1/attachment.pdf",
+    "extractionModel": "amazon.nova-lite-v1:0",
+    "confidenceScore": 0.8,
+    "warnings": []
+  },
+  "vendor": {
+    "name": "ACME Office Supplies",
+    "address": {
+      "line1": "123 Main Street",
+      "city": "Denver",
+      "postalCode": "80202",
+      "state": "CO",
+      "country": "USA"
+    },
+    "email": "ap@acme.com"
+  },
+  "invoice": {
+    "invoiceNumber": "INV-1001",
+    "invoiceDate": "2025-12-10",
+    "dueDate": "2026-01-10",
+    "currency": "USD",
+    "paymentTerms": "Net 30",
+    "totalAmount": 1080.0,
+    "taxAmount": 80.0,
+    "netAmount": 1000.0
+  },
+  "lineItems": [
+    {
+      "lineNumber": 1,
+      "description": "Printer Paper",
+      "quantity": 10,
+      "unitPrice": 50,
+      "amount": 500
+    },
+    {
+      "lineNumber": 2,
+      "description": "Toner Cartridge",
+      "quantity": 2,
+      "unitPrice": 250,
+      "amount": 500
+    }
+  ],
+  "raw": {
+    "extractedTextSnippet": "ACME Office Supplies",
+    "fieldsNotFound": []
+  }
+}

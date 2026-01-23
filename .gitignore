@@ -1,0 +1,53 @@
+# Invoice Extractor
+
+# Dependencies
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+infra/node_modules/
+**/package-lock.json
+
+# CDK
+**/cdk.out/
+**/cdk.out.*
+*.js.map
+*.d.ts
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# AWS
+.aws-sam/
+samconfig.toml
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Secrets (never commit)
+**/secrets.json
+**/*-secrets.json
+**/credentials.json

@@ -13,11 +13,17 @@ const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID ?? "anthropic.claude-3-5-s
 
 export const handler = async (event: SQSEvent) => {
   for (const record of event.Records) {
-    const payload = JSON.parse(record.body);
-    const { messageId, attachmentId, attachmentKey, receivedAt, from, subject } = payload;
     const startTime = Date.now();
+    let messageId = "";
+    let attachmentKey = "";
+    let receivedAt = "";
+    let from = "";
+    let subject = "";
 
     try {
+      const payload = JSON.parse(record.body);
+      ({ messageId, attachmentKey, receivedAt, from, subject } = payload);
+      const { attachmentId } = payload;
       const warnings: string[] = [];
 
       // 1. Get the file from S3
@@ -96,15 +102,17 @@ export const handler = async (event: SQSEvent) => {
       log.info("Extraction complete", { messageId, confidence, modelUsed });
     } catch (err: any) {
       log.error("Extraction failed", { messageId, attachmentKey, error: err?.message ?? String(err) });
-      await updateItem(
-        TABLE_NAME,
-        { messageId, attachmentKey },
-        {
-          status: "FAILED",
-          updatedAt: new Date().toISOString(),
-          errors: [err?.message ?? String(err)],
-        }
-      );
+      if (messageId && attachmentKey) {
+        await updateItem(
+          TABLE_NAME,
+          { messageId, attachmentKey },
+          {
+            status: "FAILED",
+            updatedAt: new Date().toISOString(),
+            errors: [err?.message ?? String(err)],
+          }
+        );
+      }
       emitMetric("ExtractionFailure", 1, "Count");
     }
   }

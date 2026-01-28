@@ -21,7 +21,11 @@ Return ONLY valid JSON in this exact format:
 Rules:
 - vendor = the invoice ISSUER/SELLER (the company being paid, who created this invoice). 
 - vendor is NOT the buyer/recipient/bill-to/ship-to.
-- IMPORTANT: In Japanese invoices, names ending with 御中 (onchū), 様 (sama), or 殿 (dono) are RECIPIENTS, not vendors. The vendor is usually the company with a stamp (印) or at the bottom.
+- CRITICAL for Japanese invoices (請求書):
+  - Names followed by 御中, 様, or 殿 are ALWAYS the RECIPIENT (customer), never the vendor.
+  - The vendor is the company with: registration number (登録番号), tax ID, bank account (振込先), or company stamp (印).
+  - Often the recipient is top-left and the vendor info is on the right or bottom.
+  - Example: "EF Cultural Tours GmbH 御中" means EF is the RECIPIENT. Look elsewhere for the vendor.
 - Keep the vendor name in its original language/script (e.g. Japanese 株式会社, Chinese, Korean).
 - totalAmount = final amount including tax.
 - taxAmount = VAT/consumption tax amount.

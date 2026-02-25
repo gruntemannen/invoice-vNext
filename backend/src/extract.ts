@@ -162,8 +162,11 @@ function parseJsonResponse(text: string | undefined): any {
   // Clean up common issues
   let cleaned = text.trim();
 
-  // Remove markdown code fences
-  cleaned = cleaned.replace(/^```json?\s*/i, "").replace(/\s*```$/i, "");
+  // Extract content from markdown code fence if present (handles prose-prefixed responses)
+  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceMatch) {
+    cleaned = fenceMatch[1];
+  }
 
   // Find the JSON object
   const startIdx = cleaned.indexOf("{");
@@ -254,8 +257,14 @@ function parseMoney(input: string): number | null {
   const hasDot = s.includes(".");
 
   if (hasComma && hasDot) {
-    // assume dot is thousands separator
-    s = s.replace(/\./g, "").replace(",", ".");
+    // Determine format by which separator appears last: the last one is the decimal
+    if (s.lastIndexOf(".") > s.lastIndexOf(",")) {
+      // US format: 1,234.56 — comma is thousands, dot is decimal
+      s = s.replace(/,/g, "");
+    } else {
+      // European format: 1.234,56 — dot is thousands, comma is decimal
+      s = s.replace(/\./g, "").replace(",", ".");
+    }
   } else if (hasComma && !hasDot) {
     s = s.replace(",", ".");
   }

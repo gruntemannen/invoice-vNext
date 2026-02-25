@@ -37,7 +37,10 @@ export function calculateConfidence(extracted: any): number {
         : null;
 
     if (typeof lineSum === "number") {
-      const close = (a: number, b: number, t = 0.05) => Math.abs(a - b) <= t;
+      const close = (a: number, b: number, t = 0.01) => {
+        const maxVal = Math.max(Math.abs(a), Math.abs(b));
+        return maxVal === 0 ? a === b : Math.abs(a - b) / maxVal <= t;
+      };
       if (net > 0 && lineSum > 0 && close(net, lineSum)) score += 1;
     }
   }

@@ -77,7 +77,11 @@ function parseAttachmentKey(key: string) {
   const parts = key.split("/");
   const messageId = parts[1] ?? "unknown";
   const file = parts[2] ?? "attachment";
-  const [attachmentId, ...rest] = file.split("_");
-  const safeName = rest.join("_") || file;
-  return { messageId, attachmentId, safeName };
+  // Key format from API: {uuid}_{filename} — use UUID regex to avoid splitting on underscores in filenames
+  const uuidMatch = file.match(/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_(.*)/i);
+  if (uuidMatch) {
+    return { messageId, attachmentId: uuidMatch[1], safeName: uuidMatch[2] || file };
+  }
+  // No UUID prefix (e.g., direct S3 upload): use full filename as the stable identifier
+  return { messageId, attachmentId: file, safeName: file };
 }

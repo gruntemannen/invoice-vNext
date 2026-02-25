@@ -160,7 +160,7 @@ export function validateOracleFusionInvoice(invoice: OracleFusionInvoice): {
   
   if (!invoice.Source) errors.push("Source is required");
   if (!invoice.InvoiceNumber) errors.push("InvoiceNumber is required");
-  if (!invoice.InvoiceAmount) errors.push("InvoiceAmount is required");
+  if (invoice.InvoiceAmount === undefined || invoice.InvoiceAmount === null) errors.push("InvoiceAmount is required");
   if (!invoice.InvoiceDate) errors.push("InvoiceDate is required");
   if (!invoice.InvoiceCurrency) errors.push("InvoiceCurrency is required");
   if (!invoice.BusinessUnit) errors.push("BusinessUnit is required");

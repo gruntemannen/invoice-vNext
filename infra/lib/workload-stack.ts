@@ -48,6 +48,27 @@ export class InvoiceExtractorStack extends cdk.Stack {
       ],
     });
 
+    const attachmentBucket = new s3.Bucket(this, "AttachmentBucket", {
+      bucketName: `${props.projectPrefix}-attachments-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      enforceSSL: true,
+      cors: [
+        {
+          allowedMethods: [s3.HttpMethods.PUT, s3.HttpMethods.GET, s3.HttpMethods.HEAD],
+          allowedOrigins: ["*"],
+          allowedHeaders: ["*"],
+          exposedHeaders: ["ETag"],
+          maxAge: 86400,
+        },
+      ],
+      lifecycleRules: [
+        {
+          transitions: [{ storageClass: s3.StorageClass.INFREQUENT_ACCESS, transitionAfter: cdk.Duration.days(30) }],
+        },
+      ],
+    });
+
     const table = new dynamodb.Table(this, "InvoiceTable", {
       partitionKey: { name: "messageId", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "attachmentKey", type: dynamodb.AttributeType.STRING },
@@ -81,7 +102,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
       timeout: cdk.Duration.minutes(2),
       environment: {
         RAW_BUCKET: rawBucket.bucketName,
-        ATTACHMENT_BUCKET: rawBucket.bucketName,
+        ATTACHMENT_BUCKET: attachmentBucket.bucketName,
         QUEUE_URL: queue.queueUrl,
         TABLE_NAME: table.tableName,
       },
@@ -99,8 +120,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
       timeout: cdk.Duration.minutes(5),
       memorySize: 1024,
       environment: {
-        RAW_BUCKET: rawBucket.bucketName,
-        ATTACHMENT_BUCKET: rawBucket.bucketName,
+        ATTACHMENT_BUCKET: attachmentBucket.bucketName,
         TABLE_NAME: table.tableName,
         BEDROCK_MODEL_ID: bedrockModelId,
       },
@@ -113,7 +133,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
       handler: "handler",
       timeout: cdk.Duration.seconds(30),
       environment: {
-        ATTACHMENT_BUCKET: rawBucket.bucketName,
+        ATTACHMENT_BUCKET: attachmentBucket.bucketName,
         TABLE_NAME: table.tableName,
         QUEUE_URL: queue.queueUrl,
         MAX_UPLOAD_BYTES: String(maxUploadBytes),
@@ -121,11 +141,12 @@ export class InvoiceExtractorStack extends cdk.Stack {
       logRetention: lambdaLogRetention,
     });
 
-    rawBucket.grantReadWrite(ingestFn);
-    rawBucket.grantReadWrite(extractFn);
-    rawBucket.grantRead(apiFn, "attachments/*");
-    rawBucket.grantPut(apiFn, "attachments/*");
-    rawBucket.grantDelete(apiFn, "attachments/*");
+    rawBucket.grantRead(ingestFn);
+    attachmentBucket.grantWrite(ingestFn);
+    attachmentBucket.grantRead(extractFn);
+    attachmentBucket.grantRead(apiFn);
+    attachmentBucket.grantPut(apiFn);
+    attachmentBucket.grantDelete(apiFn);
     table.grantReadWriteData(ingestFn);
     table.grantReadWriteData(extractFn);
     table.grantReadWriteData(apiFn);
@@ -166,7 +187,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
       handler: "handler",
       timeout: cdk.Duration.minutes(2),
       environment: {
-        ATTACHMENT_BUCKET: rawBucket.bucketName,
+        ATTACHMENT_BUCKET: attachmentBucket.bucketName,
         QUEUE_URL: queue.queueUrl,
         TABLE_NAME: table.tableName,
         MAX_UPLOAD_BYTES: String(maxUploadBytes),
@@ -174,14 +195,13 @@ export class InvoiceExtractorStack extends cdk.Stack {
       logRetention: lambdaLogRetention,
     });
 
-    rawBucket.grantRead(uploadIngestFn);
+    attachmentBucket.grantRead(uploadIngestFn);
     table.grantReadWriteData(uploadIngestFn);
     queue.grantSendMessages(uploadIngestFn);
 
-    rawBucket.addEventNotification(
+    attachmentBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED_PUT,
-      new s3n.LambdaDestination(uploadIngestFn),
-      { prefix: "attachments/" }
+      new s3n.LambdaDestination(uploadIngestFn)
     );
 
     rawBucket.addToResourcePolicy(
@@ -307,6 +327,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
     new cdk.CfnOutput(this, "ApiUrl", { value: httpApi.apiEndpoint });
     new cdk.CfnOutput(this, "FrontendUrl", { value: `https://${distribution.domainName}` });
     new cdk.CfnOutput(this, "RawBucketName", { value: rawBucket.bucketName });
+    new cdk.CfnOutput(this, "AttachmentBucketName", { value: attachmentBucket.bucketName });
     new cdk.CfnOutput(this, "QueueUrl", { value: queue.queueUrl });
   }
 }

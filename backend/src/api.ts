@@ -37,7 +37,15 @@ async function listInvoices(event: APIGatewayProxyEventV2) {
   const limit = Math.min(Number(event.queryStringParameters?.limit ?? 25), 100);
   const safeLimit = Number.isFinite(limit) && limit > 0 ? limit : 25;
   const nextToken = event.queryStringParameters?.nextToken;
-  const result = await queryInvoices(TABLE_NAME, safeLimit, nextToken);
+  let result: Awaited<ReturnType<typeof queryInvoices>>;
+  try {
+    result = await queryInvoices(TABLE_NAME, safeLimit, nextToken);
+  } catch (err: any) {
+    if (err?.statusCode === 400) {
+      return jsonResponse({ message: err.message }, 400);
+    }
+    throw err;
+  }
   const items = result.items.map((item: any) => ({
     messageId: item.messageId,
     attachmentId: item.attachmentId,
@@ -147,7 +155,12 @@ async function deleteInvoice(event: APIGatewayProxyEventV2) {
 }
 
 async function createUpload(event: APIGatewayProxyEventV2) {
-  const body = event.body ? JSON.parse(event.body) : {};
+  let body: any = {};
+  try {
+    body = event.body ? JSON.parse(event.body) : {};
+  } catch {
+    return jsonResponse({ message: "Invalid request body" }, 400);
+  }
   const filename = typeof body?.filename === "string" ? body.filename : "invoice.pdf";
   const contentType = "application/pdf";
   const fileSize = typeof body?.fileSize === "number" ? body.fileSize : undefined;

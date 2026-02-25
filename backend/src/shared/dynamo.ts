@@ -56,7 +56,11 @@ export async function queryInvoices(
   };
 
   if (nextToken) {
-    params.ExclusiveStartKey = JSON.parse(Buffer.from(nextToken, "base64").toString("utf-8"));
+    try {
+      params.ExclusiveStartKey = JSON.parse(Buffer.from(nextToken, "base64").toString("utf-8"));
+    } catch {
+      throw Object.assign(new Error("Invalid nextToken"), { statusCode: 400 });
+    }
   }
 
   const res = await docClient.send(new QueryCommand(params));

@@ -21,7 +21,7 @@ export async function parseEmail(raw: Buffer): Promise<ParsedEmail> {
   });
 
   return {
-    messageId: (parsed.messageId || parsed.messageId === "" ? parsed.messageId : `${Date.now()}`) ?? `${Date.now()}`,
+    messageId: parsed.messageId || `${Date.now()}`,
     from: parsed.from?.text ?? "",
     subject: parsed.subject ?? "",
     date: parsed.date ? parsed.date.toISOString() : new Date().toISOString(),

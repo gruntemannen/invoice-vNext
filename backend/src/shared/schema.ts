@@ -1,4 +1,4 @@
-// Schema for model extraction - Oracle Fusion Payables compatible
+// Schema for model extraction - ERP-neutral (maps to a NetSuite vendor bill)
 export const extractionSchema = {
   type: "object",
   additionalProperties: false,

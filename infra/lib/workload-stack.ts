@@ -22,6 +22,7 @@ import * as sns from "aws-cdk-lib/aws-sns";
 import * as cr from "aws-cdk-lib/custom-resources";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as apigwv2Authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
+import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
 
 interface InvoiceExtractorStackProps extends cdk.StackProps {
   projectPrefix: string;
@@ -181,6 +182,16 @@ export class InvoiceExtractorStack extends cdk.Stack {
     queue.grantSendMessages(ingestFn);
     queue.grantConsumeMessages(extractFn);
     queue.grantSendMessages(apiFn);
+
+    // NetSuite OAuth 2.0 (M2M) credentials for the scaffolded push path. Populate the secret
+    // value after deploy (or in a sandbox): { accountId, clientId, certificateId, privateKeyPem, alg }.
+    const netsuiteSecret = new secretsmanager.Secret(this, "NetSuiteSecret", {
+      secretName: `${props.projectPrefix}/netsuite`,
+      description: "NetSuite SuiteTalk OAuth 2.0 M2M credentials (accountId, clientId, certificateId, privateKeyPem, alg)",
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    netsuiteSecret.grantRead(apiFn);
+    apiFn.addEnvironment("NETSUITE_SECRET_ARN", netsuiteSecret.secretArn);
 
     // Bedrock permissions for Claude
     extractFn.addToRolePolicy(
@@ -445,9 +456,9 @@ export class InvoiceExtractorStack extends cdk.Stack {
     });
 
     httpApi.addRoutes({
-      path: "/invoices/{messageId}/{attachmentId}/oracle-fusion",
+      path: "/invoices/{messageId}/{attachmentId}/netsuite",
       methods: [apigwv2.HttpMethod.GET],
-      integration: new apigwv2Integrations.HttpLambdaIntegration("OracleFusionIntegration", apiFn),
+      integration: new apigwv2Integrations.HttpLambdaIntegration("NetSuiteIntegration", apiFn),
       authorizer: jwtAuthorizer,
     });
 
@@ -497,5 +508,6 @@ export class InvoiceExtractorStack extends cdk.Stack {
     new cdk.CfnOutput(this, "CognitoHostedUiDomain", {
       value: `${cognitoDomainPrefix}.auth.${cdk.Aws.REGION}.amazoncognito.com`,
     });
+    new cdk.CfnOutput(this, "NetSuiteSecretName", { value: netsuiteSecret.secretName });
   }
 }

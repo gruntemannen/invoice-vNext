@@ -4,7 +4,12 @@ import { DeleteCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
-import { transformToOracleFusion, validateOracleFusionInvoice, exampleConfig, type OracleFusionConfig } from "./shared/oracle-fusion";
+import {
+  transformToNetSuite,
+  validateNetSuiteVendorBill,
+  exampleNetSuiteConfig,
+  type NetSuiteConfig,
+} from "./shared/netsuite";
 import { computeStats } from "./shared/stats";
 import { log } from "./shared/logger";
 
@@ -26,8 +31,8 @@ export const handler = async (
   if (path === "/upload" && event.requestContext.http.method === "POST") {
     return createUpload(event);
   }
-  if (path.startsWith("/invoices/") && path.endsWith("/oracle-fusion")) {
-    return getOracleFusionFormat(event);
+  if (path.startsWith("/invoices/") && path.endsWith("/netsuite")) {
+    return getNetSuiteFormat(event);
   }
   if (path.startsWith("/invoices/") && event.requestContext.http.method === "DELETE") {
     return deleteInvoice(event);
@@ -85,7 +90,7 @@ async function getInvoiceDetail(event: APIGatewayProxyEventV2) {
   return jsonResponse(item);
 }
 
-async function getOracleFusionFormat(event: APIGatewayProxyEventV2) {
+async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
   const messageId = event.pathParameters?.messageId ?? "";
   const attachmentId = event.pathParameters?.attachmentId ?? "";
 
@@ -94,21 +99,24 @@ async function getOracleFusionFormat(event: APIGatewayProxyEventV2) {
     return jsonResponse({ message: "Not found" }, 404);
   }
 
-  // Load config from environment or use example
-  // In production, you'd load this from DynamoDB, S3, or environment variables
-  const config: OracleFusionConfig = exampleConfig;
+  // EXPORT-ONLY: build + validate the NetSuite vendor bill payload but do NOT
+  // push it. No live call to getAccessToken/upsertVendorBill until creds are
+  // wired in. Config comes from the placeholder example for now; in production
+  // this loads from netsuite-config.json + a secrets store.
+  const config: NetSuiteConfig = exampleNetSuiteConfig;
 
   try {
-    const oracleInvoice = transformToOracleFusion(item.extractedJson, config);
-    const validation = validateOracleFusionInvoice(oracleInvoice);
+    const { bill, warnings } = transformToNetSuite(item.extractedJson, config);
+    const validation = validateNetSuiteVendorBill(bill, config);
 
     return jsonResponse({
-      oracleFormat: oracleInvoice,
+      netsuiteFormat: bill,
+      warnings,
       validation,
       originalExtraction: item.extractedJson,
     });
   } catch (error: any) {
-    log.error("Oracle Fusion transform failed", {
+    log.error("NetSuite transform failed", {
       messageId,
       attachmentId,
       error: error?.message ?? String(error),

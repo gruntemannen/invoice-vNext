@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "ab-eval": "ts-node scripts/ab-eval.ts"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock": "^3.596.0",

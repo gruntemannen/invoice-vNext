@@ -1,8 +1,8 @@
 # Invoice Extractor
 
-**Serverless invoice processing system** that extracts structured data from PDF invoices using AI, with built-in Oracle Fusion Cloud Payables integration.
+**Serverless invoice processing system** that extracts structured data from PDF invoices using AI, with built-in NetSuite integration.
 
-![Architecture](https://img.shields.io/badge/AWS-Serverless-orange) ![Bedrock](https://img.shields.io/badge/AI-Claude%20Sonnet%204.6-blue) ![Oracle](https://img.shields.io/badge/ERP-Oracle%20Fusion-red)
+![Architecture](https://img.shields.io/badge/AWS-Serverless-orange) ![Bedrock](https://img.shields.io/badge/AI-Claude%20Sonnet%204.6-blue) ![NetSuite](https://img.shields.io/badge/ERP-NetSuite-2e7d32)
 
 ## Overview
 
@@ -10,14 +10,14 @@ Invoice Extractor is a production-ready, serverless application that:
 - Accepts PDF invoice uploads via web UI
 - Extracts structured JSON using Claude Sonnet 4.6 on Amazon Bedrock (reads PDFs directly)
 - Stores results in DynamoDB with confidence scoring
-- Transforms data to Oracle Fusion Cloud Payables format
+- Transforms data to NetSuite format
 - Provides a modern PWA interface for review and management
 
 ## Key Features
 
 - **AI-Powered Extraction**: Uses Claude Sonnet 4.6 for accurate invoice data extraction directly from PDFs (no OCR needed)
 - **Multi-Language Support**: Works with invoices in any language (Japanese, Chinese, Korean, European languages, etc.)
-- **Oracle Fusion Ready**: Built-in transformation to Oracle Fusion AP format
+- **NetSuite Ready**: Built-in transformation to NetSuite AP format
 - **Multi-Account Architecture**: Designed for AWS Organizations with separate workload accounts
 - **Confidence Scoring**: Automatic quality assessment of extracted data
 - **PWA Support**: Installable web app with offline capabilities
@@ -51,12 +51,12 @@ Invoice Extractor is a production-ready, serverless application that:
 3. Extract Lambda reads the PDF and sends it directly to Claude Sonnet 4.6
 4. Claude visually analyzes the document and extracts structured data
 5. Results are validated, confidence-scored, and stored in DynamoDB
-6. User can view extracted data and download Oracle Fusion format
+6. User can view extracted data and download NetSuite format
 
 ### Components
 
 - **Frontend**: Static HTML/JS/CSS hosted on S3 + CloudFront
-- **API Lambda**: Handles uploads, downloads, list, delete, and Oracle Fusion transformation
+- **API Lambda**: Handles uploads, downloads, list, delete, and NetSuite transformation
 - **Upload Ingest Lambda**: Triggered by S3 events, creates DynamoDB records
 - **Extract Lambda**: Sends PDFs to Claude Sonnet 4.6, validates and stores results
 - **DynamoDB**: Stores invoice metadata and extracted JSON
@@ -118,46 +118,47 @@ npx cdk deploy InvoiceExtractorStack --context stacks=InvoiceExtractorStack
   - Confidence score
   - Any warnings
 
-### Get Oracle Fusion Format
+### Get NetSuite Format
 ```bash
-curl https://your-api-url/invoices/{messageId}/{attachmentId}/oracle-fusion
+curl https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite
 ```
 
-Returns Oracle Fusion-compatible JSON ready for import.
+Returns NetSuite-compatible JSON ready for import.
 
-## Oracle Fusion Integration
+## NetSuite Integration
 
-The system includes built-in Oracle Fusion Cloud Payables compatibility:
+The system includes built-in NetSuite compatibility:
 
 ### Features
-- Automatic transformation to `payablesInterfaceInvoices` format
-- Configurable supplier mapping
-- Default accounting distribution
-- Validation before import
+- Transform extracted JSON → NetSuite REST `vendorBill` payload (expense sublist)
+- Configurable crosswalks (vendor / GL account / currency / department / class / terms → internal ids)
+- OAuth 2.0 M2M (JWT client-assertion) client, SuiteQL resolver, idempotent `eid:` upsert
+- Validation + gross-vs-net reconciliation before import
 
 ### Configuration
 
-Edit `backend/oracle-fusion-config.json`:
+Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
 
 ```json
 {
-  "source": "INVOICE_EXTRACTOR",
-  "businessUnit": "Your Business Unit",
-  "supplierMapping": {
-    "Vendor Name": {
-      "supplierNumber": "VENDOR-001",
-      "supplierSite": "MAIN"
-    }
-  },
-  "defaultDistribution": {
-    "account": "5000",
-    "costCenter": "100",
-    "department": "IT"
+  "subsidiaryId": "",
+  "apAccountId": "",
+  "defaults": { "departmentId": "", "classId": "", "locationId": "", "taxCodeId": "" },
+  "crosswalks": {
+    "vendorsByTaxId": { "VAT123456": "4521" },
+    "vendorsByName": {},
+    "accountsByCode": { "5000": "212" },
+    "currenciesByCode": { "USD": "1", "EUR": "4" },
+    "departmentsByCode": {},
+    "classesByCode": {},
+    "termsByName": { "Net 30": "5" }
   }
 }
 ```
 
-See [Oracle Fusion Integration Guide](ORACLE-FUSION-INTEGRATION.md) for complete documentation.
+NetSuite OAuth 2.0 credentials live in AWS Secrets Manager (`NETSUITE_SECRET_ARN`), not in this file.
+
+See [NetSuite Integration Guide](NETSUITE-INTEGRATION.md) for setup, field mapping, and the sandbox-validation checklist.
 
 ## Deployment Guide
 
@@ -213,9 +214,9 @@ GET /invoices?limit=25&nextToken=...
 GET /invoices/{messageId}/{attachmentId}
 ```
 
-**Get Oracle Fusion Format**
+**Get NetSuite Format**
 ```
-GET /invoices/{messageId}/{attachmentId}/oracle-fusion
+GET /invoices/{messageId}/{attachmentId}/netsuite
 ```
 
 **Download PDF**
@@ -312,11 +313,11 @@ Common issues:
 - Ensure PDF format (not image or other format)
 - Check S3 bucket permissions
 
-### Oracle Fusion Transformation Errors
+### NetSuite Transformation Errors
 
-- Verify supplier mapping in `oracle-fusion-config.json`
-- Check business unit name matches Oracle exactly
-- Ensure all required fields are extracted
+- Verify the crosswalks in `netsuite-config.json` resolve vendor / account / currency to NetSuite internal ids
+- Check `subsidiaryId` / `apAccountId` match the target NetSuite account
+- Ensure all required fields are extracted (entity, tranDate, at least one expense line)
 
 ## Security
 
@@ -350,5 +351,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - [Project Structure](PROJECT-STRUCTURE.md)
 - [Bedrock Setup](BEDROCK-SETUP.md)
-- [Oracle Fusion Integration](ORACLE-FUSION-INTEGRATION.md)
-- [Oracle Fusion Quickstart](ORACLE-FUSION-QUICKSTART.md)
+- [NetSuite Integration](NETSUITE-INTEGRATION.md)

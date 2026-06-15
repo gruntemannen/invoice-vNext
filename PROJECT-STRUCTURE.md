@@ -8,11 +8,11 @@ This repository contains a serverless application for extracting invoice data us
 - `backend/`: Lambda source code (ingest/upload/API/extraction)
 - `infra/`: AWS CDK app (deploys the stack)
 - `README.md`: Primary documentation
-- `ORACLE-FUSION-*.md`: Oracle Fusion transformation documentation
+- `NETSUITE-INTEGRATION.md`: NetSuite vendor-bill integration documentation
 
 ## Backend
 
-- `backend/src/api.ts`: HTTP API (list/detail/download/delete/oracle-fusion/upload)
+- `backend/src/api.ts`: HTTP API (list/detail/stats/download/delete/netsuite/upload)
 - `backend/src/extract.ts`: Extract Lambda (PDF → Claude Sonnet 4.6 → JSON)
 - `backend/src/ingest.ts`: SES email ingest (optional flow)
 - `backend/src/upload-ingest.ts`: S3 upload ingest (creates records and queues extraction)

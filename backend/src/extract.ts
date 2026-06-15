@@ -281,7 +281,7 @@ function parseMoney(input: string): number | null {
 function reconcileExtraction(extracted: any, warnings: string[]) {
   if (!extracted || typeof extracted !== "object") return;
 
-  // Proforma invoices should be tagged as "Prepayment" for Oracle Fusion purposes.
+  // Proforma invoices are tagged "Prepayment" (a neutral marker; the ERP transform decides handling).
   const currentType = String(extracted?.invoice?.invoiceType ?? "").trim();
   const looksProforma = /pro\s*forma|proforma/i.test(currentType);
   if (looksProforma) {

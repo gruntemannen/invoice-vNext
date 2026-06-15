@@ -1,0 +1,20 @@
+{
+  "_README": "NetSuite vendor-bill push config (mirrors NetSuiteConfig in backend/src/shared/netsuite.ts). This file holds NON-SECRET values only. Credentials (accountId, clientId, certificateId, privateKeyPem, alg) live in a secrets store and are loaded at runtime as NetSuiteSecret. This SUPERSEDES backend/oracle-fusion-config.json, which is now obsolete. Single-subsidiary scaffold: leave subsidiaryId empty/null for a non-OneWorld account; set it to the subsidiary internal id for OneWorld. apAccountId = AP account internal id (also used as the line-level fallback/suspense account). defaults.* = internal ids applied to every line when the per-line crosswalk misses (departmentId, classId, locationId, taxCodeId; taxCodeId is SuiteTax-only). Each crosswalk maps an extracted code/name -> NetSuite internal id (string): vendorsByTaxId keyed by vendor tax/VAT id; vendorsByName keyed by exact vendor name; accountsByCode keyed by GL account code; currenciesByCode keyed by 3-letter ISO code (USD/EUR/CHF); departmentsByCode keyed by department code; classesByCode keyed by cost-center/project code; termsByName keyed by exact payment-terms text (e.g. 'Net 30'). Empty objects mean nothing resolves and the transform emits warnings/placeholders.",
+  "subsidiaryId": null,
+  "apAccountId": null,
+  "defaults": {
+    "departmentId": null,
+    "classId": null,
+    "locationId": null,
+    "taxCodeId": null
+  },
+  "crosswalks": {
+    "vendorsByTaxId": {},
+    "vendorsByName": {},
+    "accountsByCode": {},
+    "currenciesByCode": {},
+    "departmentsByCode": {},
+    "classesByCode": {},
+    "termsByName": {}
+  }
+}

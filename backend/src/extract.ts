@@ -47,7 +47,7 @@ export const handler = async (event: SQSEvent) => {
 
       // If parsing failed, try once with repair prompt
       if (!extracted) {
-        log.warn("First parse failed, trying repair", { responseSnippet: response.text?.slice(0, 200) });
+        log.warn("First parse failed, trying repair", { responseLength: response.text?.length ?? 0 });
         const repairResponse = await invokeBedrock(BEDROCK_MODEL_ID, buildRepairPrompt(response.text ?? ""), []);
         extracted = parseJsonResponse(repairResponse.text);
         modelUsed = repairResponse.modelId;

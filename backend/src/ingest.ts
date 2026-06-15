@@ -14,6 +14,10 @@ const ATTACHMENT_BUCKET = process.env.ATTACHMENT_BUCKET ?? "";
 const QUEUE_URL = process.env.QUEUE_URL ?? "";
 const TABLE_NAME = process.env.TABLE_NAME ?? "";
 
+// Reject oversized or non-invoice attachments before storing/enqueuing (cost + abuse control).
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const ALLOWED_TYPES = ["application/pdf", "image/png", "image/jpeg"];
+
 export const handler = async (event: S3Event) => {
   for (const record of event.Records) {
     const bucket = record.s3.bucket.name;
@@ -31,6 +35,21 @@ export const handler = async (event: S3Event) => {
     emitMetric("AttachmentsDetected", parsed.attachments.length, "Count");
 
     for (const attachment of parsed.attachments) {
+      const contentType = (attachment.contentType ?? "").toLowerCase();
+      const size = attachment.size ?? attachment.content?.length ?? 0;
+      const typeOk =
+        ALLOWED_TYPES.includes(contentType) || /\.(pdf|png|jpe?g)$/i.test(attachment.filename ?? "");
+      if (!typeOk || size > MAX_ATTACHMENT_BYTES) {
+        log.warn("Skipping attachment (unsupported type or too large)", {
+          messageId: safeMessageId,
+          contentType,
+          size,
+          filename: attachment.filename,
+        });
+        emitMetric("AttachmentsRejected", 1, "Count");
+        continue;
+      }
+
       const attachmentId = uuidv4();
       const safeName = attachment.filename ? attachment.filename.replace(/[^\w.\-]+/g, "_") : "attachment";
       const attachmentKey = `attachments/${safeMessageId}/${attachmentId}_${safeName}`;

@@ -15,7 +15,7 @@ export const handler = async (event: S3Event) => {
   for (const record of event.Records) {
     const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
     const sizeBytes = record.s3.object.size ?? 0;
-    if (!key.startsWith("attachments/")) {
+    if (!key.startsWith("uploads/")) {
       continue;
     }
 

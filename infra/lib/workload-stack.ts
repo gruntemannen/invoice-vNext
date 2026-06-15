@@ -16,6 +16,10 @@ import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as ses from "aws-cdk-lib/aws-ses";
 import * as sesActions from "aws-cdk-lib/aws-ses-actions";
+import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
+import * as cloudwatchActions from "aws-cdk-lib/aws-cloudwatch-actions";
+import * as sns from "aws-cdk-lib/aws-sns";
+import * as cr from "aws-cdk-lib/custom-resources";
 
 interface InvoiceExtractorStackProps extends cdk.StackProps {
   projectPrefix: string;
@@ -29,6 +33,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     const rawBucket = new s3.Bucket(this, "RawEmailBucket", {
       bucketName: `${props.projectPrefix}-raw-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+      versioned: true,
       encryption: s3.BucketEncryption.S3_MANAGED,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
@@ -50,6 +55,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     const attachmentBucket = new s3.Bucket(this, "AttachmentBucket", {
       bucketName: `${props.projectPrefix}-attachments-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+      versioned: true,
       encryption: s3.BucketEncryption.S3_MANAGED,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
@@ -73,6 +79,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
       partitionKey: { name: "messageId", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "attachmentKey", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      pointInTimeRecovery: true,
       timeToLiveAttribute: "ttl",
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
@@ -133,6 +140,9 @@ export class InvoiceExtractorStack extends cdk.Stack {
       handler: "handler",
       timeout: cdk.Duration.minutes(5),
       memorySize: 1024,
+      // Cap parallel Bedrock invocations to bound cost if the upload/email paths are
+      // flooded (denial-of-wallet control the README claimed but never set).
+      reservedConcurrentExecutions: 5,
       environment: {
         ATTACHMENT_BUCKET: attachmentBucket.bucketName,
         TABLE_NAME: table.tableName,
@@ -219,9 +229,14 @@ export class InvoiceExtractorStack extends cdk.Stack {
     table.grantReadWriteData(uploadIngestFn);
     queue.grantSendMessages(uploadIngestFn);
 
+    // Web uploads land under "uploads/" and only those should trigger the upload-ingest
+    // Lambda. Email attachments live under "attachments/" and are enqueued directly by the
+    // ingest Lambda, so they must NOT be re-processed here (prevents double extraction and
+    // clobbering of the email sender metadata).
     attachmentBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED_PUT,
-      new s3n.LambdaDestination(uploadIngestFn)
+      new s3n.LambdaDestination(uploadIngestFn),
+      { prefix: "uploads/" }
     );
 
     rawBucket.addToResourcePolicy(
@@ -230,7 +245,11 @@ export class InvoiceExtractorStack extends cdk.Stack {
         resources: [`${rawBucket.bucketArn}/raw/*`],
         principals: [new iam.ServicePrincipal("ses.amazonaws.com")],
         conditions: {
-          StringEquals: { "aws:Referer": cdk.Aws.ACCOUNT_ID },
+          // aws:Referer is spoofable; SES now supports the standard source conditions.
+          StringEquals: { "aws:SourceAccount": cdk.Aws.ACCOUNT_ID },
+          ArnLike: {
+            "aws:SourceArn": `arn:aws:ses:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:receipt-rule-set/${props.projectPrefix}-rule-set:receipt-rule/*`,
+          },
         },
       })
     );
@@ -250,10 +269,62 @@ export class InvoiceExtractorStack extends cdk.Stack {
       ],
     });
 
+    // SES only routes inbound mail through the ONE active rule set per region, and there is
+    // no native CloudFormation resource to activate one. Use a custom resource to call
+    // ses:SetActiveReceiptRuleSet on deploy (and clear it on delete). Only one rule set can be
+    // active per account/region, so coordinate if other stacks manage SES receipt rules.
+    new cr.AwsCustomResource(this, "ActivateReceiptRuleSet", {
+      onUpdate: {
+        service: "SES",
+        action: "setActiveReceiptRuleSet",
+        parameters: { RuleSetName: receiptRuleSet.receiptRuleSetName },
+        physicalResourceId: cr.PhysicalResourceId.of(`active-${props.projectPrefix}-rule-set`),
+      },
+      onDelete: {
+        service: "SES",
+        action: "setActiveReceiptRuleSet",
+        parameters: {},
+      },
+      policy: cr.AwsCustomResourcePolicy.fromSdkCalls({
+        resources: cr.AwsCustomResourcePolicy.ANY_RESOURCE,
+      }),
+    });
+
     extractFn.addEventSourceMapping("ExtractQueueMapping", {
       eventSourceArn: queue.queueArn,
       batchSize: 1,
     });
+
+    // Operational alarms. Subscribe an email/Slack endpoint to this topic after deploy.
+    const alarmTopic = new sns.Topic(this, "AlarmsTopic", {
+      topicName: `${props.projectPrefix}-alarms`,
+    });
+
+    dlq
+      .metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(5) })
+      .createAlarm(this, "DlqNotEmptyAlarm", {
+        alarmDescription: "Messages have landed in the extraction dead-letter queue",
+        threshold: 0,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      })
+      .addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
+
+    new cloudwatch.Metric({
+      namespace: "InvoiceExtractor",
+      metricName: "ExtractionFailure",
+      statistic: "Sum",
+      period: cdk.Duration.minutes(15),
+    })
+      .createAlarm(this, "ExtractionFailureAlarm", {
+        alarmDescription: "Invoice extractions are failing",
+        threshold: 5,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      })
+      .addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
 
     const httpApi = new apigwv2.HttpApi(this, "InvoiceApi", {
       apiName: `${props.projectPrefix}-api`,
@@ -349,5 +420,6 @@ export class InvoiceExtractorStack extends cdk.Stack {
     new cdk.CfnOutput(this, "RawBucketName", { value: rawBucket.bucketName });
     new cdk.CfnOutput(this, "AttachmentBucketName", { value: attachmentBucket.bucketName });
     new cdk.CfnOutput(this, "QueueUrl", { value: queue.queueUrl });
+    new cdk.CfnOutput(this, "AlarmsTopicArn", { value: alarmTopic.topicArn });
   }
 }

@@ -5,6 +5,7 @@ import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } fro
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
 import { transformToOracleFusion, validateOracleFusionInvoice, exampleConfig, type OracleFusionConfig } from "./shared/oracle-fusion";
+import { log } from "./shared/logger";
 
 const TABLE_NAME = process.env.TABLE_NAME ?? "";
 const ATTACHMENT_BUCKET = process.env.ATTACHMENT_BUCKET ?? "";
@@ -99,10 +100,12 @@ async function getOracleFusionFormat(event: APIGatewayProxyEventV2) {
       originalExtraction: item.extractedJson,
     });
   } catch (error: any) {
-    return jsonResponse({
-      message: "Failed to transform to Oracle Fusion format",
-      error: error?.message || String(error),
-    }, 500);
+    log.error("Oracle Fusion transform failed", {
+      messageId,
+      attachmentId,
+      error: error?.message ?? String(error),
+    });
+    return jsonResponse({ message: "Failed to transform invoice" }, 500);
   }
 }
 
@@ -174,8 +177,10 @@ async function createUpload(event: APIGatewayProxyEventV2) {
 
   const messageId = uuidv4();
   const attachmentId = uuidv4();
-  const safeName = filename.replace(/[^\w.\-]+/g, "_");
-  const attachmentKey = `attachments/${messageId}/${attachmentId}_${safeName}`;
+  const safeName = filename.replace(/[^\w.\-]+/g, "_").replace(/^\.+/, "").slice(0, 120) || "invoice.pdf";
+  // Web uploads go under "uploads/" so they are picked up by UploadIngestLambda;
+  // emailed attachments live under "attachments/" and are handled by IngestLambda.
+  const attachmentKey = `uploads/${messageId}/${attachmentId}_${safeName}`;
 
   const url = await getSignedUrl(
     s3,

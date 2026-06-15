@@ -20,6 +20,8 @@ import * as cloudwatch from "aws-cdk-lib/aws-cloudwatch";
 import * as cloudwatchActions from "aws-cdk-lib/aws-cloudwatch-actions";
 import * as sns from "aws-cdk-lib/aws-sns";
 import * as cr from "aws-cdk-lib/custom-resources";
+import * as cognito from "aws-cdk-lib/aws-cognito";
+import * as apigwv2Authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 
 interface InvoiceExtractorStackProps extends cdk.StackProps {
   projectPrefix: string;
@@ -326,57 +328,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
       })
       .addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
 
-    const httpApi = new apigwv2.HttpApi(this, "InvoiceApi", {
-      apiName: `${props.projectPrefix}-api`,
-      corsPreflight: {
-        allowOrigins: ["*"],
-        allowMethods: [
-          apigwv2.CorsHttpMethod.GET,
-          apigwv2.CorsHttpMethod.POST,
-          apigwv2.CorsHttpMethod.DELETE,
-          apigwv2.CorsHttpMethod.OPTIONS,
-        ],
-        allowHeaders: ["content-type"],
-        maxAge: cdk.Duration.days(10),
-      },
-    });
-
-    httpApi.addRoutes({
-      path: "/invoices",
-      methods: [apigwv2.HttpMethod.GET],
-      integration: new apigwv2Integrations.HttpLambdaIntegration("ListIntegration", apiFn),
-    });
-
-    httpApi.addRoutes({
-      path: "/invoices/{messageId}/{attachmentId}",
-      methods: [apigwv2.HttpMethod.GET],
-      integration: new apigwv2Integrations.HttpLambdaIntegration("DetailIntegration", apiFn),
-    });
-
-    httpApi.addRoutes({
-      path: "/invoices/{messageId}/{attachmentId}",
-      methods: [apigwv2.HttpMethod.DELETE],
-      integration: new apigwv2Integrations.HttpLambdaIntegration("DeleteIntegration", apiFn),
-    });
-
-    httpApi.addRoutes({
-      path: "/invoices/{messageId}/{attachmentId}/download",
-      methods: [apigwv2.HttpMethod.GET],
-      integration: new apigwv2Integrations.HttpLambdaIntegration("DownloadIntegration", apiFn),
-    });
-
-    httpApi.addRoutes({
-      path: "/invoices/{messageId}/{attachmentId}/oracle-fusion",
-      methods: [apigwv2.HttpMethod.GET],
-      integration: new apigwv2Integrations.HttpLambdaIntegration("OracleFusionIntegration", apiFn),
-    });
-
-    httpApi.addRoutes({
-      path: "/upload",
-      methods: [apigwv2.HttpMethod.POST],
-      integration: new apigwv2Integrations.HttpLambdaIntegration("UploadIntegration", apiFn),
-    });
-
+    // --- Frontend hosting (created before the API so the Cognito callback URLs and the
+    // API CORS allow-list can reference the CloudFront URL) ---
     const siteBucket = new s3.Bucket(this, "FrontendBucket", {
       bucketName: `${props.projectPrefix}-ui-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
@@ -395,6 +348,116 @@ export class InvoiceExtractorStack extends cdk.Stack {
       defaultRootObject: "index.html",
     });
 
+    const appUrl = `https://${distribution.domainName}`;
+
+    // --- Cognito (admin authentication for the API + UI) ---
+    const cognitoDomainPrefix = `${props.projectPrefix}-admin-${cdk.Aws.ACCOUNT_ID}`;
+
+    const userPool = new cognito.UserPool(this, "AdminUserPool", {
+      userPoolName: `${props.projectPrefix}-admins`,
+      selfSignUpEnabled: false, // admins are invited, not self-registered
+      signInAliases: { email: true },
+      standardAttributes: { email: { required: true, mutable: true } },
+      passwordPolicy: {
+        minLength: 12,
+        requireLowercase: true,
+        requireUppercase: true,
+        requireDigits: true,
+        requireSymbols: true,
+      },
+      mfa: cognito.Mfa.OPTIONAL,
+      mfaSecondFactor: { sms: false, otp: true },
+      accountRecovery: cognito.AccountRecovery.EMAIL_ONLY,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    userPool.addDomain("AdminUserPoolDomain", {
+      cognitoDomain: { domainPrefix: cognitoDomainPrefix },
+    });
+
+    const userPoolClient = userPool.addClient("AdminWebClient", {
+      userPoolClientName: `${props.projectPrefix}-admin-web`,
+      generateSecret: false, // public SPA client
+      authFlows: { userSrp: true },
+      oAuth: {
+        flows: { implicitCodeGrant: true },
+        scopes: [cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL, cognito.OAuthScope.PROFILE],
+        callbackUrls: [appUrl, `${appUrl}/`],
+        logoutUrls: [appUrl, `${appUrl}/`],
+      },
+    });
+
+    // JWT authorizer validating Cognito id tokens on every API route.
+    const jwtAuthorizer = new apigwv2Authorizers.HttpJwtAuthorizer(
+      "AdminJwtAuthorizer",
+      `https://cognito-idp.${cdk.Aws.REGION}.amazonaws.com/${userPool.userPoolId}`,
+      { jwtAudience: [userPoolClient.userPoolClientId] }
+    );
+
+    const httpApi = new apigwv2.HttpApi(this, "InvoiceApi", {
+      apiName: `${props.projectPrefix}-api`,
+      corsPreflight: {
+        allowOrigins: [appUrl],
+        allowMethods: [
+          apigwv2.CorsHttpMethod.GET,
+          apigwv2.CorsHttpMethod.POST,
+          apigwv2.CorsHttpMethod.DELETE,
+          apigwv2.CorsHttpMethod.OPTIONS,
+        ],
+        allowHeaders: ["content-type", "authorization"],
+        maxAge: cdk.Duration.days(10),
+      },
+    });
+
+    httpApi.addRoutes({
+      path: "/invoices",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("ListIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/stats",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("StatsIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/invoices/{messageId}/{attachmentId}",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("DetailIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/invoices/{messageId}/{attachmentId}",
+      methods: [apigwv2.HttpMethod.DELETE],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("DeleteIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/invoices/{messageId}/{attachmentId}/download",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("DownloadIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/invoices/{messageId}/{attachmentId}/oracle-fusion",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("OracleFusionIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/upload",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("UploadIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
     new s3deploy.BucketDeployment(this, "FrontendDeploy", {
       destinationBucket: siteBucket,
       sources: [
@@ -405,6 +468,14 @@ export class InvoiceExtractorStack extends cdk.Stack {
             {
               apiBaseUrl: httpApi.apiEndpoint,
               maxUploadBytes,
+              cognito: {
+                region: cdk.Aws.REGION,
+                userPoolId: userPool.userPoolId,
+                clientId: userPoolClient.userPoolClientId,
+                domain: `${cognitoDomainPrefix}.auth.${cdk.Aws.REGION}.amazoncognito.com`,
+                scope: "openid email profile",
+                redirectUri: appUrl,
+              },
             },
             null,
             2
@@ -421,5 +492,10 @@ export class InvoiceExtractorStack extends cdk.Stack {
     new cdk.CfnOutput(this, "AttachmentBucketName", { value: attachmentBucket.bucketName });
     new cdk.CfnOutput(this, "QueueUrl", { value: queue.queueUrl });
     new cdk.CfnOutput(this, "AlarmsTopicArn", { value: alarmTopic.topicArn });
+    new cdk.CfnOutput(this, "UserPoolId", { value: userPool.userPoolId });
+    new cdk.CfnOutput(this, "UserPoolClientId", { value: userPoolClient.userPoolClientId });
+    new cdk.CfnOutput(this, "CognitoHostedUiDomain", {
+      value: `${cognitoDomainPrefix}.auth.${cdk.Aws.REGION}.amazoncognito.com`,
+    });
   }
 }

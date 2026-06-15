@@ -5,6 +5,7 @@ import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } fro
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
 import { transformToOracleFusion, validateOracleFusionInvoice, exampleConfig, type OracleFusionConfig } from "./shared/oracle-fusion";
+import { computeStats } from "./shared/stats";
 import { log } from "./shared/logger";
 
 const TABLE_NAME = process.env.TABLE_NAME ?? "";
@@ -16,6 +17,9 @@ export const handler = async (
   event: APIGatewayProxyEventV2
 ): Promise<APIGatewayProxyResultV2> => {
   const path = event.rawPath ?? "";
+  if (path === "/stats" && event.requestContext.http.method === "GET") {
+    return getStats();
+  }
   if (path === "/invoices") {
     return listInvoices(event);
   }
@@ -64,6 +68,10 @@ async function listInvoices(event: APIGatewayProxyEventV2) {
   }));
 
   return jsonResponse({ items, nextToken: result.nextToken });
+}
+
+async function getStats() {
+  return jsonResponse(await computeStats(TABLE_NAME));
 }
 
 async function getInvoiceDetail(event: APIGatewayProxyEventV2) {

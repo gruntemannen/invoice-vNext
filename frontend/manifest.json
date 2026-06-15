@@ -1,12 +1,12 @@
 {
-  "name": "Invoice Extractor",
-  "short_name": "Invoice Extractor",
-  "description": "Upload invoices and review extracted JSON.",
+  "name": "Invoice Admin",
+  "short_name": "Invoice Admin",
+  "description": "Admin console for emailed-invoice extraction: dashboard, audit, and upload.",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",
-  "background_color": "#0b1220",
-  "theme_color": "#0b1220",
+  "background_color": "#f5f7fb",
+  "theme_color": "#f6f8fc",
   "icons": [
     {
       "src": "favicon.svg",
@@ -16,4 +16,3 @@
     }
   ]
 }
-

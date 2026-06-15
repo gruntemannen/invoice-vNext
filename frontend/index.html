@@ -3,89 +3,207 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Invoice Extractor</title>
-    <meta name="description" content="Upload a PDF invoice and get structured JSON extracted with Amazon Bedrock." />
+    <title>Invoice Admin</title>
+    <meta name="description" content="Admin console for emailed-invoice extraction: dashboard, audit, and upload." />
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="manifest" href="manifest.json" />
-    <meta name="theme-color" content="#0b1220" />
+    <meta name="theme-color" content="#f6f8fc" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <link rel="apple-touch-icon" href="favicon.svg" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div class="app">
-      <header class="topbar">
+    <!-- Full-screen gate shown until auth resolves -->
+    <div id="boot-gate" class="boot-gate">
+      <div class="boot-card">
+        <div class="spinner"></div>
+        <div id="boot-text" class="boot-text">Signing you in…</div>
+      </div>
+    </div>
+
+    <div id="app-shell" class="shell hidden">
+      <!-- Sidebar -->
+      <aside class="sidebar">
         <div class="brand">
-          <div class="brand-mark" aria-hidden="true">IE</div>
+          <div class="brand-mark" aria-hidden="true">IA</div>
           <div class="brand-text">
-            <h1>Invoice Extractor</h1>
-            <p>Upload PDF invoices and review extracted JSON</p>
+            <strong>Invoice Admin</strong>
+            <span>Extraction console</span>
           </div>
         </div>
-      </header>
 
-      <main class="container">
-        <section id="upload-section" class="surface">
-          <div class="section-header">
-            <div>
-              <h2>Upload</h2>
-              <p class="muted">PDF only. The extractor will run after upload completes.</p>
+        <nav class="nav" aria-label="Primary">
+          <button class="nav-item active" data-view="dashboard">
+            <span class="nav-ico" aria-hidden="true">▣</span> Dashboard
+          </button>
+          <button class="nav-item" data-view="audit">
+            <span class="nav-ico" aria-hidden="true">▤</span> Audit
+          </button>
+          <button class="nav-item" data-view="upload">
+            <span class="nav-ico" aria-hidden="true">↥</span> Upload
+          </button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <span class="muted">eu-central-1 • PWA</span>
+        </div>
+      </aside>
+
+      <!-- Main column -->
+      <div class="main">
+        <header class="topbar">
+          <button id="nav-toggle" class="icon-btn" aria-label="Toggle navigation">≡</button>
+          <h1 id="view-title">Dashboard</h1>
+          <div class="topbar-right">
+            <button id="refresh-btn" class="button ghost" title="Refresh">↻ Refresh</button>
+            <div class="user-chip">
+              <span class="avatar" id="user-avatar" aria-hidden="true">?</span>
+              <span class="user-email" id="user-email">—</span>
+              <button id="logout-btn" class="button ghost small">Sign out</button>
             </div>
           </div>
+        </header>
 
-          <div class="upload-row">
-            <input id="file-input" class="file-input" type="file" accept="application/pdf" />
-            <button id="upload-btn" class="button">Upload</button>
-          </div>
+        <main class="content">
+          <!-- ============ DASHBOARD ============ -->
+          <section id="view-dashboard" class="view">
+            <div id="dash-error" class="banner error hidden"></div>
 
-          <div class="status-row" aria-live="polite">
-            <div id="upload-spinner" class="spinner hidden" aria-label="Uploading / processing"></div>
-            <div id="upload-status" class="status-text"></div>
-          </div>
-        </section>
-
-        <section id="list-section" class="surface">
-          <div class="section-header">
-            <div>
-              <h2>Processed invoices</h2>
-              <p class="muted">Click an invoice to view the PDF and extracted JSON.</p>
+            <div class="kpi-grid" id="kpi-grid">
+              <!-- KPI cards injected by JS -->
             </div>
-            <button id="load-more" class="button secondary">Load more</button>
-          </div>
-          <div id="list" class="list" role="list"></div>
-        </section>
 
-        <section id="detail-section" class="surface hidden">
-          <div class="section-header detail-header">
-            <div>
-              <h2>Invoice detail</h2>
-              <div class="detail-meta" id="detail-meta"></div>
-            </div>
-            <div class="detail-actions">
-              <button id="delete" class="button danger">Delete</button>
-              <button id="download" class="button">Download PDF</button>
-              <button id="back" class="button secondary">Back</button>
-            </div>
-          </div>
-
-          <div class="detail-grid">
             <div class="panel">
-              <div class="panel-title">PDF preview</div>
-              <iframe id="pdf-viewer" class="pdf-viewer" title="Invoice PDF preview"></iframe>
+              <div class="panel-head">
+                <div>
+                  <h2>30-day trend</h2>
+                  <p class="muted">Ingested vs. completed vs. failed, by day.</p>
+                </div>
+                <div class="legend" id="trend-legend"></div>
+              </div>
+              <div id="trend-chart" class="chart-wrap">
+                <div class="empty">No data yet.</div>
+              </div>
             </div>
-            <div class="panel">
-              <div class="panel-title">Extracted JSON</div>
-              <pre id="detail-json" class="json-box"></pre>
-            </div>
-          </div>
-        </section>
 
-        <footer class="footer">
-          <span class="muted">Invoice Extractor • S3 + Lambda + Bedrock • Frankfurt (eu-central-1)</span>
-        </footer>
-      </main>
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>Recent failures</h2>
+                  <p class="muted">Most recent extraction failures.</p>
+                </div>
+              </div>
+              <div id="recent-failures" class="failures">
+                <div class="empty">No recent failures.</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============ AUDIT ============ -->
+          <section id="view-audit" class="view hidden">
+            <div id="audit-error" class="banner error hidden"></div>
+
+            <div class="toolbar">
+              <div class="search-box">
+                <span class="search-ico" aria-hidden="true">⌕</span>
+                <input
+                  id="audit-search"
+                  type="search"
+                  placeholder="Search vendor, subject, sender, invoice #…"
+                  autocomplete="off"
+                />
+              </div>
+              <select id="audit-status" class="select">
+                <option value="ALL">All statuses</option>
+                <option value="PENDING">Pending</option>
+                <option value="COMPLETED">Completed</option>
+                <option value="FAILED">Failed</option>
+              </select>
+              <span id="audit-count" class="muted count-pill">0 rows</span>
+            </div>
+
+            <div class="panel no-pad">
+              <div class="table-scroll">
+                <table class="table" id="audit-table">
+                  <thead>
+                    <tr>
+                      <th>Received</th>
+                      <th>Vendor</th>
+                      <th>Invoice #</th>
+                      <th class="num">Amount</th>
+                      <th>Status</th>
+                      <th class="num">Confidence</th>
+                    </tr>
+                  </thead>
+                  <tbody id="audit-body"></tbody>
+                </table>
+              </div>
+              <div class="table-foot">
+                <button id="audit-load-more" class="button secondary">Load more</button>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============ UPLOAD ============ -->
+          <section id="view-upload" class="view hidden">
+            <div class="panel narrow">
+              <div class="panel-head">
+                <div>
+                  <h2>Upload an invoice</h2>
+                  <p class="muted">PDF only. Extraction runs automatically after upload.</p>
+                </div>
+              </div>
+
+              <div class="dropzone" id="dropzone">
+                <input id="file-input" class="file-input" type="file" accept="application/pdf" />
+                <p class="muted small">Drag &amp; drop a PDF here, or use the file picker above.</p>
+              </div>
+
+              <div class="upload-actions">
+                <button id="upload-btn" class="button">Upload &amp; extract</button>
+                <div class="status-row" aria-live="polite">
+                  <div id="upload-spinner" class="spinner small hidden" aria-label="Working"></div>
+                  <div id="upload-status" class="status-text"></div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
     </div>
+
+    <!-- ============ DETAIL DRAWER ============ -->
+    <div id="drawer-overlay" class="drawer-overlay hidden">
+      <div class="drawer" role="dialog" aria-modal="true" aria-label="Invoice detail">
+        <div class="drawer-head">
+          <div>
+            <h2 id="drawer-title">Invoice detail</h2>
+            <div class="drawer-meta" id="drawer-meta"></div>
+          </div>
+          <button id="drawer-close" class="icon-btn" aria-label="Close">✕</button>
+        </div>
+
+        <div class="drawer-body">
+          <div class="meta-grid" id="drawer-fields"></div>
+
+          <div class="drawer-section">
+            <div class="panel-title">Extracted JSON</div>
+            <pre id="drawer-json" class="json-box"></pre>
+          </div>
+        </div>
+
+        <div class="drawer-foot">
+          <button id="drawer-delete" class="button danger">Delete</button>
+          <button id="drawer-download" class="button">Download PDF</button>
+          <button id="drawer-dismiss" class="button secondary">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast host -->
+    <div id="toast-host" class="toast-host" aria-live="polite"></div>
+
     <script src="app.js"></script>
     <script>
       if ("serviceWorker" in navigator) {

@@ -9,7 +9,7 @@ Invoice Extractor produces a simple extracted JSON shape (vendor, invoice, lineI
 ## Architecture
 
 ```
-PDF → Text extraction → Bedrock (Nova Lite) → Extracted JSON → Transform → Oracle Fusion JSON
+PDF → Bedrock (Claude Sonnet 4.6, reads the PDF directly — no OCR) → Extracted JSON → Transform → Oracle Fusion JSON
 ```
 
 ## Extracted JSON (input to transformation)

@@ -13,7 +13,7 @@ This repository contains a serverless application for extracting invoice data us
 ## Backend
 
 - `backend/src/api.ts`: HTTP API (list/detail/download/delete/oracle-fusion/upload)
-- `backend/src/extract.ts`: Extract Lambda (PDF → Claude 3.5 Sonnet → JSON)
+- `backend/src/extract.ts`: Extract Lambda (PDF → Claude Sonnet 4.6 → JSON)
 - `backend/src/ingest.ts`: SES email ingest (optional flow)
 - `backend/src/upload-ingest.ts`: S3 upload ingest (creates records and queues extraction)
 - `backend/src/shared/`: Shared utilities (Bedrock invocation, DynamoDB, S3, prompts, etc.)

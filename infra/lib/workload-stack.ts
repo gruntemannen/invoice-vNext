@@ -95,9 +95,17 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     const lambdaLogRetention = logs.RetentionDays.TWO_WEEKS;
 
+    // Lambda handler sources live in the sibling `backend` package. Point NodejsFunction at
+    // that package as its project root so the cross-package entries are under projectRoot and
+    // their dependencies resolve during esbuild bundling.
+    const backendRoot = path.join(__dirname, "../../backend");
+    const backendLockFile = path.join(backendRoot, "package-lock.json");
+
     const ingestFn = new lambdaNode.NodejsFunction(this, "IngestLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: path.join(__dirname, "../../backend/src/ingest.ts"),
+      projectRoot: backendRoot,
+      depsLockFilePath: backendLockFile,
       handler: "handler",
       timeout: cdk.Duration.minutes(2),
       environment: {
@@ -109,13 +117,19 @@ export class InvoiceExtractorStack extends cdk.Stack {
       logRetention: lambdaLogRetention,
     });
 
-    // Claude 3.5 Sonnet - reads PDFs directly (no OCR needed)
-    const bedrockModelId = "anthropic.claude-3-5-sonnet-20240620-v1:0";
+    // Claude Sonnet 4.6 - reads PDFs directly (no OCR needed).
+    // This is the EU cross-region inference profile: Sonnet 4.6 has no in-region
+    // on-demand endpoint in eu-central-1, so the bare model id won't work here.
+    // If you deploy outside the EU geo, switch the prefix (us./jp./au.) to match the
+    // deploy region, or use the residency-agnostic "global.anthropic.claude-sonnet-4-6".
+    const bedrockModelId = "eu.anthropic.claude-sonnet-4-6";
     const maxUploadBytes = 10 * 1024 * 1024;
 
     const extractFn = new lambdaNode.NodejsFunction(this, "ExtractLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: path.join(__dirname, "../../backend/src/extract.ts"),
+      projectRoot: backendRoot,
+      depsLockFilePath: backendLockFile,
       handler: "handler",
       timeout: cdk.Duration.minutes(5),
       memorySize: 1024,
@@ -130,6 +144,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
     const apiFn = new lambdaNode.NodejsFunction(this, "ApiLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: path.join(__dirname, "../../backend/src/api.ts"),
+      projectRoot: backendRoot,
+      depsLockFilePath: backendLockFile,
       handler: "handler",
       timeout: cdk.Duration.seconds(30),
       environment: {
@@ -159,10 +175,12 @@ export class InvoiceExtractorStack extends cdk.Stack {
       new iam.PolicyStatement({
         actions: ["bedrock:InvokeModel"],
         resources: [
-          // Claude 3.5 Sonnet
-          `arn:aws:bedrock:${cdk.Aws.REGION}::foundation-model/${bedrockModelId}`,
-          // Allow all Claude models in case of fallback
-          `arn:aws:bedrock:*::foundation-model/anthropic.claude-*`,
+          // bedrockModelId is a cross-region inference profile, not a base model,
+          // so InvokeModel must be granted on the inference-profile resource...
+          `arn:aws:bedrock:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:inference-profile/${bedrockModelId}`,
+          // ...and on the underlying foundation model in every region the EU geo
+          // profile may route to (hence the region wildcard).
+          `arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6*`,
         ],
       })
     );
@@ -184,6 +202,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
     const uploadIngestFn = new lambdaNode.NodejsFunction(this, "UploadIngestLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
       entry: path.join(__dirname, "../../backend/src/upload-ingest.ts"),
+      projectRoot: backendRoot,
+      depsLockFilePath: backendLockFile,
       handler: "handler",
       timeout: cdk.Duration.minutes(2),
       environment: {

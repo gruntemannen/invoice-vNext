@@ -2,20 +2,20 @@
 
 **Serverless invoice processing system** that extracts structured data from PDF invoices using AI, with built-in Oracle Fusion Cloud Payables integration.
 
-![Architecture](https://img.shields.io/badge/AWS-Serverless-orange) ![Bedrock](https://img.shields.io/badge/AI-Claude%203.5%20Sonnet-blue) ![Oracle](https://img.shields.io/badge/ERP-Oracle%20Fusion-red)
+![Architecture](https://img.shields.io/badge/AWS-Serverless-orange) ![Bedrock](https://img.shields.io/badge/AI-Claude%20Sonnet%204.6-blue) ![Oracle](https://img.shields.io/badge/ERP-Oracle%20Fusion-red)
 
 ## Overview
 
 Invoice Extractor is a production-ready, serverless application that:
 - Accepts PDF invoice uploads via web UI
-- Extracts structured JSON using Claude 3.5 Sonnet on Amazon Bedrock (reads PDFs directly)
+- Extracts structured JSON using Claude Sonnet 4.6 on Amazon Bedrock (reads PDFs directly)
 - Stores results in DynamoDB with confidence scoring
 - Transforms data to Oracle Fusion Cloud Payables format
 - Provides a modern PWA interface for review and management
 
 ## Key Features
 
-- **AI-Powered Extraction**: Uses Claude 3.5 Sonnet for accurate invoice data extraction directly from PDFs (no OCR needed)
+- **AI-Powered Extraction**: Uses Claude Sonnet 4.6 for accurate invoice data extraction directly from PDFs (no OCR needed)
 - **Multi-Language Support**: Works with invoices in any language (Japanese, Chinese, Korean, European languages, etc.)
 - **Oracle Fusion Ready**: Built-in transformation to Oracle Fusion AP format
 - **Multi-Account Architecture**: Designed for AWS Organizations with separate workload accounts
@@ -40,7 +40,7 @@ Invoice Extractor is a production-ready, serverless application that:
                    ┌──────────────┐
                    │ Extract      │
                    │ Lambda       │
-                   │ (Claude 3.5) │
+                   │ (Sonnet 4.6) │
                    └──────────────┘
 ```
 
@@ -48,7 +48,7 @@ Invoice Extractor is a production-ready, serverless application that:
 
 1. User uploads a PDF invoice via the web UI
 2. PDF is stored in S3 and a processing job is queued
-3. Extract Lambda reads the PDF and sends it directly to Claude 3.5 Sonnet
+3. Extract Lambda reads the PDF and sends it directly to Claude Sonnet 4.6
 4. Claude visually analyzes the document and extracts structured data
 5. Results are validated, confidence-scored, and stored in DynamoDB
 6. User can view extracted data and download Oracle Fusion format
@@ -58,7 +58,7 @@ Invoice Extractor is a production-ready, serverless application that:
 - **Frontend**: Static HTML/JS/CSS hosted on S3 + CloudFront
 - **API Lambda**: Handles uploads, downloads, list, delete, and Oracle Fusion transformation
 - **Upload Ingest Lambda**: Triggered by S3 events, creates DynamoDB records
-- **Extract Lambda**: Sends PDFs to Claude 3.5 Sonnet, validates and stores results
+- **Extract Lambda**: Sends PDFs to Claude Sonnet 4.6, validates and stores results
 - **DynamoDB**: Stores invoice metadata and extracted JSON
 - **SQS**: Queues extraction jobs with DLQ for failed processing
 
@@ -179,7 +179,7 @@ See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for detailed instructions.
 ### Environment Variables
 
 **Extract Lambda**:
-- `BEDROCK_MODEL_ID`: AI model (default: `anthropic.claude-3-5-sonnet-20240620-v1:0`)
+- `BEDROCK_MODEL_ID`: AI model (default: `eu.anthropic.claude-sonnet-4-6` — the EU cross-region inference profile for Claude Sonnet 4.6; use the `us.`/`jp.`/`au.` prefix or `global.` for other geos)
 
 **API Lambda**:
 - `MAX_UPLOAD_BYTES`: Max file size (default: 10MB)
@@ -193,10 +193,11 @@ See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for detailed instructions.
 
 ### Bedrock Model Access
 
-Ensure Claude 3.5 Sonnet access is enabled:
-1. Go to AWS Bedrock Console
+Ensure Claude Sonnet 4.6 access is enabled:
+1. Go to AWS Bedrock Console (in the deployment region, e.g. eu-central-1)
 2. Navigate to "Model access"
-3. Enable "Claude 3.5 Sonnet" (Anthropic)
+3. Enable "Claude Sonnet 4.6" (Anthropic)
+4. Confirm the cross-region inference profile is usable (the default model id is the EU geo profile `eu.anthropic.claude-sonnet-4-6`)
 
 ## API Reference
 
@@ -262,7 +263,7 @@ Body: { "filename": "invoice.pdf", "fileSize": 123456 }
   ],
   "meta": {
     "confidenceScore": 0.95,
-    "extractionModel": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "extractionModel": "eu.anthropic.claude-sonnet-4-6",
     "warnings": []
   }
 }
@@ -330,7 +331,7 @@ Common issues:
 For 1,000 invoices/month:
 
 - **Lambda**: ~$5 (execution time)
-- **Bedrock (Claude 3.5 Sonnet)**: ~$15-25 (input/output tokens)
+- **Bedrock (Claude Sonnet 4.6)**: ~$15-25 (input/output tokens)
 - **DynamoDB**: ~$1 (on-demand)
 - **S3**: ~$1 (storage + requests)
 - **CloudFront**: ~$1 (data transfer)

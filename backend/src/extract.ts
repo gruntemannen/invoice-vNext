@@ -9,7 +9,7 @@ import { emitMetric } from "./shared/metrics";
 
 const ATTACHMENT_BUCKET = process.env.ATTACHMENT_BUCKET ?? "";
 const TABLE_NAME = process.env.TABLE_NAME ?? "";
-const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID ?? "anthropic.claude-3-5-sonnet-20240620-v1:0";
+const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID ?? "eu.anthropic.claude-sonnet-4-6";
 
 export const handler = async (event: SQSEvent) => {
   for (const record of event.Records) {

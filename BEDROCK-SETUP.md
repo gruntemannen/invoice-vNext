@@ -22,7 +22,7 @@ Before the Lambda function can invoke Bedrock models, you must enable access to 
    - In the left sidebar, click **"Model access"**
    - Click **"Manage model access"** or **"Edit"**
    - Find and enable the following model:
-     - **Claude 3.5 Sonnet** (Anthropic) - `anthropic.claude-3-5-sonnet-20240620-v1:0`
+     - **Claude Sonnet 4.6** (Anthropic) - `eu.anthropic.claude-sonnet-4-6`
    - Click **"Request model access"** or **"Save changes"**
    - Accept the EULA if prompted
 
@@ -87,7 +87,7 @@ After enabling model access and deploying the updated stack:
 To use different Claude models, update `infra/lib/workload-stack.ts`:
 
 ```typescript
-const bedrockModelId = "anthropic.claude-3-5-sonnet-20240620-v1:0"; // or other Claude model
+const bedrockModelId = "eu.anthropic.claude-sonnet-4-6"; // or other Claude model
 ```
 
 Then redeploy:
@@ -99,13 +99,13 @@ npx cdk deploy InvoiceExtractorStack
 ## Supported Models
 
 The application is configured to use:
-- **Primary:** Claude 3.5 Sonnet (`anthropic.claude-3-5-sonnet-20240620-v1:0`)
+- **Primary:** Claude Sonnet 4.6 (`eu.anthropic.claude-sonnet-4-6`)
 
-Claude 3.5 Sonnet is used because it can read PDFs directly (no OCR needed), providing accurate extraction even for scanned documents and non-Latin scripts (Japanese, Chinese, Korean, etc.).
+Claude Sonnet 4.6 is used because it can read PDFs directly (no OCR needed), providing accurate extraction even for scanned documents and non-Latin scripts (Japanese, Chinese, Korean, etc.).
 
 ## Cost Considerations
 
-- **Claude 3.5 Sonnet:** ~$3 per 1M input tokens, ~$15 per 1M output tokens
+- **Claude Sonnet 4.6:** ~$3 per 1M input tokens, ~$15 per 1M output tokens
 - Typical invoice extraction uses 5-20K input tokens (PDF content) and 1-2K output tokens (JSON)
 - Estimated cost: ~$0.02-0.05 per invoice
 

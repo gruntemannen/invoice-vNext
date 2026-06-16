@@ -7,60 +7,61 @@
 ## Overview
 
 Invoice Extractor is a production-ready, serverless application that:
-- Accepts PDF invoice uploads via web UI
+- Ingests PDF invoices from **email** (Amazon SES) and **web upload**
 - Extracts structured JSON using Claude Sonnet 4.6 on Amazon Bedrock (reads PDFs directly)
 - Stores results in DynamoDB with confidence scoring
-- Transforms data to NetSuite format
-- Provides a modern PWA interface for review and management
+- Pushes invoices to **NetSuite** as Accounts Payable vendor bills (export-only scaffold today; OAuth 2.0 push-ready)
+- Provides a **Cognito-authenticated admin console** for ingestion stats, success rates, and audit
 
 ## Key Features
 
 - **AI-Powered Extraction**: Uses Claude Sonnet 4.6 for accurate invoice data extraction directly from PDFs (no OCR needed)
+- **Email + Web Ingestion**: Accepts invoices via Amazon SES email receiving or direct web upload
 - **Multi-Language Support**: Works with invoices in any language (Japanese, Chinese, Korean, European languages, etc.)
-- **NetSuite Ready**: Built-in transformation to NetSuite AP format
-- **Multi-Account Architecture**: Designed for AWS Organizations with separate workload accounts
+- **NetSuite Integration**: Transforms extracted data into a NetSuite REST vendor bill — export-only today, with an OAuth 2.0 (M2M) push scaffold included
+- **Admin Console**: Cognito-authenticated dashboard with ingestion stats, success rates, and a DynamoDB audit view
+- **Secure by Default**: JWT-protected API, least-privilege IAM, DynamoDB PITR, S3 versioning, a Bedrock concurrency cap, and CloudWatch alarms
 - **Confidence Scoring**: Automatic quality assessment of extracted data
-- **PWA Support**: Installable web app with offline capabilities
+- **Multi-Account Architecture**: Designed for AWS Organizations with separate workload accounts
 - **Cost Optimized**: Pay-per-use serverless architecture
 
 ## Architecture
 
 ```
-┌─────────────┐
-│   Web UI    │ (CloudFront + S3)
-│   (PWA)     │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  API Lambda │────▶│ Upload to S3 │────▶│ DynamoDB    │
-└─────────────┘     └──────┬───────┘     └─────────────┘
-                          │
-                          ▼
-                   ┌──────────────┐
-                   │ Extract      │
-                   │ Lambda       │
-                   │ (Sonnet 4.6) │
-                   └──────────────┘
+Ingestion
+  Email  ─▶ Amazon SES ─▶ S3 (raw/)   ─▶ Ingest Lambda ┐
+  Upload ─▶ S3 (uploads/)             ─▶ Upload Lambda ┘─▶ SQS
+                                                          │
+Processing                                                ▼
+                                  Extract Lambda (Claude Sonnet 4.6, reads PDF)
+                                                          │
+                                                          ▼
+                                                      DynamoDB
+                                                          ▲
+Access  (Cognito JWT on every route)                      │
+  Admin UI (CloudFront PWA) ─▶ API Lambda ────────────────┘
+                                  └─▶ NetSuite vendor bill (export-only)
 ```
 
 ### How It Works
 
-1. User uploads a PDF invoice via the web UI
-2. PDF is stored in S3 and a processing job is queued
-3. Extract Lambda reads the PDF and sends it directly to Claude Sonnet 4.6
+1. An invoice arrives by **email** (Amazon SES → S3 `raw/`) or **web upload** (→ S3 `uploads/`)
+2. An ingest Lambda records it in DynamoDB and queues a processing job (SQS)
+3. The Extract Lambda sends the PDF directly to Claude Sonnet 4.6
 4. Claude visually analyzes the document and extracts structured data
 5. Results are validated, confidence-scored, and stored in DynamoDB
-6. User can view extracted data and download NetSuite format
+6. Admins sign in to the console (Cognito) to review stats/audit, and can export any invoice as a NetSuite vendor bill
 
 ### Components
 
-- **Frontend**: Static HTML/JS/CSS hosted on S3 + CloudFront
-- **API Lambda**: Handles uploads, downloads, list, delete, and NetSuite transformation
-- **Upload Ingest Lambda**: Triggered by S3 events, creates DynamoDB records
+- **Admin UI**: Static PWA (S3 + CloudFront) — Cognito hosted-UI login, dashboard (stats / success rate / trend), and a DynamoDB audit view
+- **Cognito**: User pool + JWT authorizer protecting every API route
+- **API Lambda**: Authenticated endpoints — list, **stats**, detail, download, delete, upload, and NetSuite export
+- **Ingest Lambda**: Parses inbound SES email (S3 `raw/`) and queues attachments
+- **Upload Ingest Lambda**: Handles web uploads (S3 `uploads/`)
 - **Extract Lambda**: Sends PDFs to Claude Sonnet 4.6, validates and stores results
-- **DynamoDB**: Stores invoice metadata and extracted JSON
-- **SQS**: Queues extraction jobs with DLQ for failed processing
+- **DynamoDB**: Stores invoice metadata and extracted JSON (PITR enabled)
+- **SQS**: Queues extraction jobs with a DLQ + CloudWatch alarms
 
 ## Quick Start
 
@@ -98,36 +99,43 @@ cd infra
 npx cdk deploy InvoiceExtractorStack --context stacks=InvoiceExtractorStack
 ```
 
-4. **Access the UI**:
-   - The deployment outputs a CloudFront URL
-   - Open in browser and start uploading invoices
+4. **Create an admin user & sign in**:
+   - Create a user in the Cognito user pool (stack output `UserPoolId`) — self-signup is disabled
+   - Open the CloudFront URL (output `FrontendUrl`), sign in via the Cognito hosted UI, and you land on the dashboard
 
 ## Usage
 
-### Upload Invoice
-1. Navigate to the web UI
-2. Click "Choose File" and select a PDF invoice
-3. Click "Upload"
-4. Wait for processing (typically 5-15 seconds)
+### Sign in
+The admin console is protected by Amazon Cognito. Open the CloudFront URL and sign in via the
+hosted UI; the app stores the returned id token and sends it as a bearer token on every API call.
 
-### Review Extracted Data
-- View list of processed invoices
-- Click an invoice to see:
-  - PDF preview
-  - Extracted JSON data
-  - Confidence score
-  - Any warnings
+### Dashboard
+- KPI cards: total ingested, success rate, completed / failed / pending, average confidence
+- 30-day ingestion trend (ingested vs completed vs failed)
+- Recent failures, each linking straight to the record
 
-### Get NetSuite Format
+### Audit (browse DynamoDB)
+- Filter by status and search by vendor / subject / sender / invoice number
+- Open any record for full metadata, the extracted JSON, a PDF download, and delete
+
+### Ingest invoices
+- **Email**: send to the SES-verified address (lands in S3 `raw/` and is processed automatically)
+- **Upload**: use the Upload action in the console (presigned PUT to S3 `uploads/`)
+
+### Export to NetSuite
+For any invoice, build the NetSuite vendor-bill payload (authenticated):
 ```bash
-curl https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite
+curl -H "Authorization: Bearer <id_token>" \
+  https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite
 ```
-
-Returns NetSuite-compatible JSON ready for import.
+Returns `{ netsuiteFormat, warnings, validation, originalExtraction }`. See the
+[NetSuite Integration Guide](NETSUITE-INTEGRATION.md) to enable live push.
 
 ## NetSuite Integration
 
-The system includes built-in NetSuite compatibility:
+Extracted invoices map to NetSuite Accounts Payable **vendor bills**. The transform, OAuth 2.0
+(M2M) client, SuiteQL resolver, and idempotent upsert are implemented; the API is **export-only**
+today (it builds + validates the payload), and live push is a credentials + sandbox-validation step.
 
 ### Features
 - Transform extracted JSON → NetSuite REST `vendorBill` payload (expense sublist)
@@ -204,10 +212,18 @@ Ensure Claude Sonnet 4.6 access is enabled:
 
 ### Endpoints
 
+All endpoints require a Cognito JWT: `Authorization: Bearer <id_token>`.
+
 **List Invoices**
 ```
 GET /invoices?limit=25&nextToken=...
 ```
+
+**Dashboard Stats**
+```
+GET /stats
+```
+Returns totals, success rate, average confidence, a 30-day trend, and recent failures.
 
 **Get Invoice Detail**
 ```
@@ -321,11 +337,12 @@ Common issues:
 
 ## Security
 
-- **No public S3 access**: All buckets use CloudFront OAI
-- **IAM least privilege**: Separate roles per Lambda
-- **SSL enforced**: All S3 buckets require SSL
-- **CORS configured**: API allows only necessary origins
-- **No authentication**: Add API Gateway authorizer for production
+- **Authentication**: Amazon Cognito user pool + JWT authorizer on every API route (invite-only, optional TOTP MFA)
+- **No public S3 access**: All buckets use CloudFront OAI; SSL enforced
+- **IAM least privilege**: Separate roles per Lambda; NetSuite credentials in Secrets Manager
+- **CORS**: API restricted to the CloudFront origin
+- **Data protection**: DynamoDB PITR, S3 versioning, and model-output PII kept out of logs
+- **Cost/abuse controls**: reserved concurrency on the Bedrock Lambda + email attachment validation
 
 ## Cost Estimate
 

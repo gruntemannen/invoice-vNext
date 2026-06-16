@@ -30,5 +30,9 @@ if (shouldDeploy("InvoiceExtractorStack")) {
   new InvoiceExtractorStack(app, "InvoiceExtractorStack", {
     env: { account: cdk.Aws.ACCOUNT_ID, region: config.region },
     projectPrefix: config.projectPrefix,
+    bedrockModelId: config.bedrockModelId,
+    maxUploadBytes: config.maxUploadBytes,
+    dataRetentionDays: config.dataRetentionDays,
+    extractReservedConcurrency: config.extractReservedConcurrency,
   });
 }

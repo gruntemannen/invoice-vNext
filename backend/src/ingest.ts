@@ -15,8 +15,10 @@ const QUEUE_URL = process.env.QUEUE_URL ?? "";
 const TABLE_NAME = process.env.TABLE_NAME ?? "";
 
 // Reject oversized or non-invoice attachments before storing/enqueuing (cost + abuse control).
-const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES = Number(process.env.MAX_UPLOAD_BYTES ?? String(10 * 1024 * 1024));
 const ALLOWED_TYPES = ["application/pdf", "image/png", "image/jpeg"];
+// Days before a record + its attachment are auto-deleted (DynamoDB TTL).
+const RETENTION_DAYS = Number(process.env.DATA_RETENTION_DAYS ?? "90");
 
 export const handler = async (event: S3Event) => {
   for (const record of event.Records) {
@@ -55,7 +57,7 @@ export const handler = async (event: S3Event) => {
       const attachmentKey = `attachments/${safeMessageId}/${attachmentId}_${safeName}`;
       await putObject(ATTACHMENT_BUCKET, attachmentKey, attachment.content, attachment.contentType);
 
-      const ttl = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 90;
+      const ttl = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * RETENTION_DAYS;
       const item = {
         messageId: safeMessageId,
         attachmentKey,

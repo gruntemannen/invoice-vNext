@@ -10,6 +10,7 @@ const ATTACHMENT_BUCKET = process.env.ATTACHMENT_BUCKET ?? "";
 const QUEUE_URL = process.env.QUEUE_URL ?? "";
 const TABLE_NAME = process.env.TABLE_NAME ?? "";
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES ?? "0");
+const RETENTION_DAYS = Number(process.env.DATA_RETENTION_DAYS ?? "90");
 
 export const handler = async (event: S3Event) => {
   for (const record of event.Records) {
@@ -22,7 +23,7 @@ export const handler = async (event: S3Event) => {
     const { messageId, attachmentId, safeName } = parseAttachmentKey(key);
     const receivedAt = new Date().toISOString();
 
-    const ttl = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 90;
+    const ttl = Math.floor(Date.now() / 1000) + 60 * 60 * 24 * RETENTION_DAYS;
     const item = {
       messageId,
       attachmentKey: key,

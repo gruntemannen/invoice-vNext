@@ -7,14 +7,12 @@
     "ab-eval": "ts-node scripts/ab-eval.ts"
   },
   "dependencies": {
-    "@aws-sdk/client-bedrock": "^3.596.0",
     "@aws-sdk/client-bedrock-runtime": "^3.596.0",
     "@aws-sdk/client-dynamodb": "^3.596.0",
     "@aws-sdk/client-s3": "^3.596.0",
     "@aws-sdk/client-sqs": "^3.596.0",
     "@aws-sdk/lib-dynamodb": "^3.596.0",
     "@aws-sdk/s3-request-presigner": "^3.596.0",
-    "ajv": "^8.12.0",
     "mailparser": "^3.6.5",
     "uuid": "^9.0.1"
   },

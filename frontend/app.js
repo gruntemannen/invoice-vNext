@@ -851,6 +851,9 @@ async function loadConfig() {
   state.apiBaseUrl = (cfg.apiBaseUrl || "").replace(/\/+$/, "");
   state.maxUploadBytes = Number(cfg.maxUploadBytes ?? 0);
   state.cognito = cfg.cognito || null;
+  state.region = cfg.region || "";
+  const regionLabel = document.getElementById("region-label");
+  if (regionLabel) regionLabel.textContent = state.region ? `${state.region} • PWA` : "PWA";
 }
 
 function renderUserChip() {

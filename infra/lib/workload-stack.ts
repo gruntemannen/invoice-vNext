@@ -27,6 +27,10 @@ import * as kms from "aws-cdk-lib/aws-kms";
 
 interface InvoiceExtractorStackProps extends cdk.StackProps {
   projectPrefix: string;
+  bedrockModelId: string;
+  maxUploadBytes: number;
+  dataRetentionDays: number;
+  extractReservedConcurrency: number;
 }
 
 export class InvoiceExtractorStack extends cdk.Stack {
@@ -60,15 +64,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
       enforceSSL: true,
       serverAccessLogsBucket: accessLogsBucket,
       serverAccessLogsPrefix: "raw-bucket/",
-      cors: [
-        {
-          allowedMethods: [s3.HttpMethods.PUT, s3.HttpMethods.GET, s3.HttpMethods.HEAD],
-          allowedOrigins: ["*"],
-          allowedHeaders: ["*"],
-          exposedHeaders: ["ETag"],
-          maxAge: 86400,
-        },
-      ],
+      // No CORS: this bucket is written only by SES (inbound email), never by a browser.
       lifecycleRules: [
         {
           transitions: [{ storageClass: s3.StorageClass.INFREQUENT_ACCESS, transitionAfter: cdk.Duration.days(30) }],
@@ -125,7 +121,9 @@ export class InvoiceExtractorStack extends cdk.Stack {
     });
 
     const queue = new sqs.Queue(this, "ExtractionQueue", {
-      visibilityTimeout: cdk.Duration.minutes(5),
+      // Must exceed the extract Lambda timeout (5m) so a long run can't have its message
+      // become visible again and get redelivered mid-processing.
+      visibilityTimeout: cdk.Duration.minutes(6),
       deadLetterQueue: { queue: dlq, maxReceiveCount: 5 },
     });
 
@@ -136,6 +134,15 @@ export class InvoiceExtractorStack extends cdk.Stack {
     // their dependencies resolve during esbuild bundling.
     const backendRoot = path.join(__dirname, "../../backend");
     const backendLockFile = path.join(backendRoot, "package-lock.json");
+
+    // Extraction model id and upload limit are configurable (see infra/lib/config.ts).
+    // bedrockModelId is a cross-region inference profile; its geo prefix (us./eu./jp./au./global.)
+    // must match the deploy region — a bare on-demand model id will not work in regions without
+    // an in-region endpoint.
+    const bedrockModelId = props.bedrockModelId;
+    const maxUploadBytes = props.maxUploadBytes;
+    // Underlying foundation model id for the IAM grant (strip any geo inference-profile prefix).
+    const foundationModelId = bedrockModelId.replace(/^(?:us|eu|jp|au|apac|global)\./, "");
 
     const ingestFn = new lambdaNode.NodejsFunction(this, "IngestLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
@@ -149,17 +156,11 @@ export class InvoiceExtractorStack extends cdk.Stack {
         ATTACHMENT_BUCKET: attachmentBucket.bucketName,
         QUEUE_URL: queue.queueUrl,
         TABLE_NAME: table.tableName,
+        MAX_UPLOAD_BYTES: String(maxUploadBytes),
+        DATA_RETENTION_DAYS: String(props.dataRetentionDays),
       },
       logRetention: lambdaLogRetention,
     });
-
-    // Claude Sonnet 4.6 - reads PDFs directly (no OCR needed).
-    // This is the EU cross-region inference profile: Sonnet 4.6 has no in-region
-    // on-demand endpoint in eu-west-1, so the bare model id won't work here.
-    // If you deploy outside the EU geo, switch the prefix (us./jp./au.) to match the
-    // deploy region, or use the residency-agnostic "global.anthropic.claude-sonnet-4-6".
-    const bedrockModelId = "eu.anthropic.claude-sonnet-4-6";
-    const maxUploadBytes = 10 * 1024 * 1024;
 
     const extractFn = new lambdaNode.NodejsFunction(this, "ExtractLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
@@ -170,8 +171,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
       timeout: cdk.Duration.minutes(5),
       memorySize: 1024,
       // Cap parallel Bedrock invocations to bound cost if the upload/email paths are
-      // flooded (denial-of-wallet control the README claimed but never set).
-      reservedConcurrentExecutions: 5,
+      // flooded (denial-of-wallet control). Configurable via config.ts.
+      reservedConcurrentExecutions: props.extractReservedConcurrency,
       environment: {
         ATTACHMENT_BUCKET: attachmentBucket.bucketName,
         TABLE_NAME: table.tableName,
@@ -229,7 +230,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
           `arn:aws:bedrock:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:inference-profile/${bedrockModelId}`,
           // ...and on the underlying foundation model in every region the EU geo
           // profile may route to (hence the region wildcard).
-          `arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6*`,
+          `arn:aws:bedrock:*::foundation-model/${foundationModelId}*`,
         ],
       })
     );
@@ -260,11 +261,11 @@ export class InvoiceExtractorStack extends cdk.Stack {
         QUEUE_URL: queue.queueUrl,
         TABLE_NAME: table.tableName,
         MAX_UPLOAD_BYTES: String(maxUploadBytes),
+        DATA_RETENTION_DAYS: String(props.dataRetentionDays),
       },
       logRetention: lambdaLogRetention,
     });
 
-    attachmentBucket.grantRead(uploadIngestFn);
     table.grantReadWriteData(uploadIngestFn);
     queue.grantSendMessages(uploadIngestFn);
 
@@ -535,6 +536,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
             {
               apiBaseUrl: httpApi.apiEndpoint,
               maxUploadBytes,
+              region: cdk.Aws.REGION,
               cognito: {
                 region: cdk.Aws.REGION,
                 userPoolId: userPool.userPoolId,

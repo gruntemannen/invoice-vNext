@@ -88,8 +88,19 @@ export const config = {
   memberAccountEmail: "your-email@company.com",
   memberAccountName: "invoice-extractor",
   managementAccountId: "YOUR_MGMT_ACCOUNT_ID",
-  region: "eu-west-1", // an SES-inbound-capable region (eu-central-1 does NOT support email receiving)
+
+  // Deploy region. For the email path this MUST support SES inbound receiving
+  // (e.g. us-east-1, us-west-2, eu-west-1). eu-central-1 does NOT.
+  region: "eu-west-1",
   projectPrefix: "invoice-extractor",
+
+  // Bedrock extraction model — a cross-region inference profile whose geo prefix
+  // (us./eu./jp./au./global.) matches `region`.
+  bedrockModelId: "eu.anthropic.claude-sonnet-4-6",
+
+  maxUploadBytes: 10 * 1024 * 1024,   // max invoice attachment size (bytes)
+  dataRetentionDays: 90,              // DynamoDB TTL / attachment retention
+  extractReservedConcurrency: 5,      // cap on concurrent Bedrock calls (cost control)
 };
 ```
 
@@ -185,20 +196,27 @@ See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for detailed instructions.
 
 ## Configuration
 
-### Environment Variables
+### `infra/lib/config.ts`
 
-**Extract Lambda**:
-- `BEDROCK_MODEL_ID`: AI model (default: `eu.anthropic.claude-sonnet-4-6` — the EU cross-region inference profile for Claude Sonnet 4.6; use the `us.`/`jp.`/`au.` prefix or `global.` for other geos)
+All deploy-time choices live in one file and are threaded into the stack and the Lambda
+environment variables:
 
-**API Lambda**:
-- `MAX_UPLOAD_BYTES`: Max file size (default: 10MB)
+| Field | Purpose |
+|---|---|
+| `region` | AWS region. Must support SES inbound receiving if you use the email path (eu-central-1 does not). |
+| `projectPrefix` | Prefix for all resource names (lowercase, DNS-safe). |
+| `bedrockModelId` | Bedrock model id (cross-region inference profile); its geo prefix must match `region`. |
+| `maxUploadBytes` | Max invoice attachment size (default 10 MiB). |
+| `dataRetentionDays` | DynamoDB TTL + attachment retention in days (default 90). |
+| `extractReservedConcurrency` | Cap on concurrent Bedrock invocations (cost control; tune to your account quota). |
+| `managementAccountId` / `memberAccount*` | AWS Organizations multi-account settings. |
 
 ### Cost Controls
 
 - **CloudWatch Logs**: 2-week retention
-- **DynamoDB TTL**: 90 days (configurable)
+- **DynamoDB TTL**: `dataRetentionDays` (default 90)
 - **S3 Lifecycle**: Transition to IA after 30 days
-- **Lambda Reserved Concurrency**: Limit extraction Lambda to control Bedrock costs
+- **Reserved Concurrency**: `extractReservedConcurrency` caps Bedrock spend
 
 ### Bedrock Model Access
 

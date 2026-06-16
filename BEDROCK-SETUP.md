@@ -49,7 +49,7 @@ npx cdk deploy InvoiceExtractorStack
 
 After enabling model access and deploying the updated stack:
 
-1. **Upload a test invoice** through the web interface
+1. **Upload a test invoice** through the admin console (after signing in via Cognito)
 2. **Check CloudWatch Logs** for the ExtractLambda function
 3. **Verify success** by viewing the extracted JSON
 
@@ -82,12 +82,15 @@ After enabling model access and deploying the updated stack:
 2. Search for "Bedrock"
 3. Request quota increase for "Invocations per minute"
 
-### Using Different Models
+### Using Different Models / Regions
 
-To use different Claude models, update `infra/lib/workload-stack.ts`:
+The model id is set in `infra/lib/config.ts` (`bedrockModelId`). Use a cross-region inference
+profile whose geo prefix matches your `region` — `us.` / `eu.` / `jp.` / `au.`, or `global.`
+for residency-agnostic routing:
 
 ```typescript
-const bedrockModelId = "eu.anthropic.claude-sonnet-4-6"; // or other Claude model
+// infra/lib/config.ts
+bedrockModelId: "us.anthropic.claude-sonnet-4-6", // example for a US-region deploy
 ```
 
 Then redeploy:

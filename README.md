@@ -192,7 +192,19 @@ npx cdk deploy InvoiceExtractorStack
 
 ### Multi-Account Deployment (Organizations)
 
-See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for detailed instructions.
+For an AWS Organizations setup, set `managementAccountId` / `memberAccount*` in
+`infra/lib/config.ts`, then deploy the helper stacks before the workload stack. The
+`stacks` context selects which stack(s) to act on (see `infra/bin/app.ts`):
+
+```bash
+cd infra
+# (optional) create the member/workload account under the org
+npx cdk deploy OrgAccountStack --context stacks=OrgAccountStack
+# bootstrap the member account for CDK
+npx cdk deploy MemberBootstrapStack --context stacks=MemberBootstrapStack
+# deploy the workload into the member account
+npx cdk deploy InvoiceExtractorStack --context stacks=InvoiceExtractorStack
+```
 
 ## Configuration
 
@@ -343,8 +355,8 @@ Common issues:
 
 ### Upload Fails
 
-- Check file size (max 10MB by default)
-- Ensure PDF format (not image or other format)
+- Check file size (default 10 MB; configurable via `maxUploadBytes` in `config.ts`)
+- Ensure PDF format (uploads must be PDF; the email path also accepts PNG/JPEG)
 - Check S3 bucket permissions
 
 ### NetSuite Transformation Errors
@@ -371,8 +383,9 @@ For 1,000 invoices/month:
 - **DynamoDB**: ~$1 (on-demand)
 - **S3**: ~$1 (storage + requests)
 - **CloudFront**: ~$1 (data transfer)
+- **KMS + Secrets Manager**: ~$1-2
 
-**Total**: ~$23-33/month
+**Total**: ~$25-35/month
 
 ## Contributing
 

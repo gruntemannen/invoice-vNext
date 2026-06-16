@@ -23,6 +23,7 @@ import * as cr from "aws-cdk-lib/custom-resources";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as apigwv2Authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as secretsmanager from "aws-cdk-lib/aws-secretsmanager";
+import * as kms from "aws-cdk-lib/aws-kms";
 
 interface InvoiceExtractorStackProps extends cdk.StackProps {
   projectPrefix: string;
@@ -34,12 +35,31 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     cdk.Tags.of(this).add("Project", props.projectPrefix);
 
+    // Customer-managed KMS key for data at rest (attachment bucket + DynamoDB).
+    const dataKey = new kms.Key(this, "DataKey", {
+      description: `${props.projectPrefix} data-at-rest CMK`,
+      enableKeyRotation: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // Central S3 server-access-log bucket (SSE-S3: log delivery does not support a CMK target).
+    const accessLogsBucket = new s3.Bucket(this, "AccessLogsBucket", {
+      bucketName: `${props.projectPrefix}-access-logs-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      lifecycleRules: [{ expiration: cdk.Duration.days(365) }],
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
     const rawBucket = new s3.Bucket(this, "RawEmailBucket", {
       bucketName: `${props.projectPrefix}-raw-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
       versioned: true,
       encryption: s3.BucketEncryption.S3_MANAGED,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
+      serverAccessLogsBucket: accessLogsBucket,
+      serverAccessLogsPrefix: "raw-bucket/",
       cors: [
         {
           allowedMethods: [s3.HttpMethods.PUT, s3.HttpMethods.GET, s3.HttpMethods.HEAD],
@@ -59,9 +79,13 @@ export class InvoiceExtractorStack extends cdk.Stack {
     const attachmentBucket = new s3.Bucket(this, "AttachmentBucket", {
       bucketName: `${props.projectPrefix}-attachments-${cdk.Aws.ACCOUNT_ID}-${cdk.Aws.REGION}`,
       versioned: true,
-      encryption: s3.BucketEncryption.S3_MANAGED,
+      encryption: s3.BucketEncryption.KMS,
+      encryptionKey: dataKey,
+      bucketKeyEnabled: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       enforceSSL: true,
+      serverAccessLogsBucket: accessLogsBucket,
+      serverAccessLogsPrefix: "attachment-bucket/",
       cors: [
         {
           allowedMethods: [s3.HttpMethods.PUT, s3.HttpMethods.GET, s3.HttpMethods.HEAD],
@@ -83,6 +107,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
       sortKey: { name: "attachmentKey", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       pointInTimeRecovery: true,
+      encryption: dynamodb.TableEncryption.CUSTOMER_MANAGED,
+      encryptionKey: dataKey,
       timeToLiveAttribute: "ttl",
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
@@ -100,7 +126,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     const queue = new sqs.Queue(this, "ExtractionQueue", {
       visibilityTimeout: cdk.Duration.minutes(5),
-      deadLetterQueue: { queue: dlq, maxReceiveCount: 2 },
+      deadLetterQueue: { queue: dlq, maxReceiveCount: 5 },
     });
 
     const lambdaLogRetention = logs.RetentionDays.TWO_WEEKS;
@@ -129,7 +155,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     // Claude Sonnet 4.6 - reads PDFs directly (no OCR needed).
     // This is the EU cross-region inference profile: Sonnet 4.6 has no in-region
-    // on-demand endpoint in eu-central-1, so the bare model id won't work here.
+    // on-demand endpoint in eu-west-1, so the bare model id won't work here.
     // If you deploy outside the EU geo, switch the prefix (us./jp./au.) to match the
     // deploy region, or use the residency-agnostic "global.anthropic.claude-sonnet-4-6".
     const bedrockModelId = "eu.anthropic.claude-sonnet-4-6";
@@ -346,15 +372,45 @@ export class InvoiceExtractorStack extends cdk.Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
+      serverAccessLogsBucket: accessLogsBucket,
+      serverAccessLogsPrefix: "frontend-bucket/",
     });
 
     const oai = new cloudfront.OriginAccessIdentity(this, "OAI");
     siteBucket.grantRead(oai);
 
+    // Security response headers (HSTS, CSP, frame/referrer/content-type protections).
+    const securityHeaders = new cloudfront.ResponseHeadersPolicy(this, "SecurityHeaders", {
+      responseHeadersPolicyName: `${props.projectPrefix}-security-headers`,
+      securityHeadersBehavior: {
+        strictTransportSecurity: {
+          accessControlMaxAge: cdk.Duration.days(365),
+          includeSubdomains: true,
+          preload: true,
+          override: true,
+        },
+        contentTypeOptions: { override: true },
+        frameOptions: { frameOption: cloudfront.HeadersFrameOption.DENY, override: true },
+        referrerPolicy: {
+          referrerPolicy: cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
+          override: true,
+        },
+        contentSecurityPolicy: {
+          // script-src 'self' is safe: the page has no inline scripts (see frontend/sw-register.js).
+          // connect-src covers the API Gateway + presigned S3 (both *.amazonaws.com); the Cognito
+          // hosted-UI login is a top-level navigation, not a fetch.
+          contentSecurityPolicy:
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://*.amazonaws.com; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+          override: true,
+        },
+      },
+    });
+
     const distribution = new cloudfront.Distribution(this, "FrontendDistribution", {
       defaultBehavior: {
         origin: new origins.S3Origin(siteBucket, { originAccessIdentity: oai }),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        responseHeadersPolicy: securityHeaders,
       },
       defaultRootObject: "index.html",
     });

@@ -88,7 +88,7 @@ export const config = {
   memberAccountEmail: "your-email@company.com",
   memberAccountName: "invoice-extractor",
   managementAccountId: "YOUR_MGMT_ACCOUNT_ID",
-  region: "eu-central-1",
+  region: "eu-west-1", // an SES-inbound-capable region (eu-central-1 does NOT support email receiving)
   projectPrefix: "invoice-extractor",
 };
 ```
@@ -203,7 +203,7 @@ See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for detailed instructions.
 ### Bedrock Model Access
 
 Ensure Claude Sonnet 4.6 access is enabled:
-1. Go to AWS Bedrock Console (in the deployment region, e.g. eu-central-1)
+1. Go to AWS Bedrock Console (in the deployment region, e.g. eu-west-1)
 2. Navigate to "Model access"
 3. Enable "Claude Sonnet 4.6" (Anthropic)
 4. Confirm the cross-region inference profile is usable (the default model id is the EU geo profile `eu.anthropic.claude-sonnet-4-6`)
@@ -289,7 +289,7 @@ Body: { "filename": "invoice.pdf", "fileSize": 123456 }
 Notes:
 - `invoice.totalAmount` **includes tax** (gross).
 - `lineItems.unitPrice` and `lineItems.amount` are **pre-tax** (net).
-- `invoice.invoiceType` is "Standard" or "Prepayment" (for proforma invoices).
+- `invoice.invoiceType` is "Standard" or "Proforma".
 - Vendor names are preserved in original language/script (Japanese, Chinese, etc.).
 
 ## Monitoring

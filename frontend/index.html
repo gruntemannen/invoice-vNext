@@ -46,7 +46,7 @@
         </nav>
 
         <div class="sidebar-foot">
-          <span class="muted">eu-central-1 • PWA</span>
+          <span class="muted">eu-west-1 • PWA</span>
         </div>
       </aside>
 
@@ -205,12 +205,6 @@
     <div id="toast-host" class="toast-host" aria-live="polite"></div>
 
     <script src="app.js"></script>
-    <script>
-      if ("serviceWorker" in navigator) {
-        window.addEventListener("load", () => {
-          navigator.serviceWorker.register("sw.js").catch(() => {});
-        });
-      }
-    </script>
+    <script src="sw-register.js"></script>
   </body>
 </html>

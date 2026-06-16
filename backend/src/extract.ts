@@ -281,14 +281,15 @@ function parseMoney(input: string): number | null {
 function reconcileExtraction(extracted: any, warnings: string[]) {
   if (!extracted || typeof extracted !== "object") return;
 
-  // Proforma invoices are tagged "Prepayment" (a neutral marker; the ERP transform decides handling).
+  // Proforma invoices are tagged with the neutral type "Proforma"; the ERP transform
+  // (e.g. NetSuite) decides how to handle it. (Was the Oracle-specific "Prepayment".)
   const currentType = String(extracted?.invoice?.invoiceType ?? "").trim();
   const looksProforma = /pro\s*forma|proforma/i.test(currentType);
   if (looksProforma) {
     extracted.invoice = extracted.invoice ?? {};
-    if (extracted.invoice.invoiceType !== "Prepayment") {
-      extracted.invoice.invoiceType = "Prepayment";
-      warnings.push("tagged_prepayment_from_proforma");
+    if (extracted.invoice.invoiceType !== "Proforma") {
+      extracted.invoice.invoiceType = "Proforma";
+      warnings.push("tagged_proforma");
     }
   }
 

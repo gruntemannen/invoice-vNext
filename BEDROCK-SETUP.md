@@ -16,7 +16,7 @@ Before the Lambda function can invoke Bedrock models, you must enable access to 
 
 1. **Navigate to Amazon Bedrock Console**
    - Go to https://console.aws.amazon.com/bedrock/
-   - Ensure you're in the correct region (e.g., `eu-central-1`)
+   - Ensure you're in the correct region (e.g., `eu-west-1`)
 
 2. **Request Model Access**
    - In the left sidebar, click **"Model access"**

@@ -1,5 +1,5 @@
 import { SQSEvent } from "aws-lambda";
-import { getObjectBuffer } from "./shared/s3";
+import { getObject } from "./shared/s3";
 import { updateItem } from "./shared/dynamo";
 import { invokeBedrock, DocumentInput } from "./shared/bedrock";
 import { buildExtractionPrompt, buildRepairPrompt } from "./shared/prompts";
@@ -9,7 +9,9 @@ import { emitMetric } from "./shared/metrics";
 
 const ATTACHMENT_BUCKET = process.env.ATTACHMENT_BUCKET ?? "";
 const TABLE_NAME = process.env.TABLE_NAME ?? "";
-const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID ?? "anthropic.claude-3-5-sonnet-20240620-v1:0";
+// Region-agnostic default so a misconfigured/test env doesn't silently pick an EU profile;
+// the CDK always sets BEDROCK_MODEL_ID from config.ts.
+const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID ?? "global.anthropic.claude-sonnet-4-6";
 
 export const handler = async (event: SQSEvent) => {
   for (const record of event.Records) {
@@ -26,11 +28,11 @@ export const handler = async (event: SQSEvent) => {
       const { attachmentId } = payload;
       const warnings: string[] = [];
 
-      // 1. Get the file from S3
-      const attachment = await getObjectBuffer(ATTACHMENT_BUCKET, attachmentKey);
+      // 1. Get the file from S3 (with its stored content-type)
+      const { body: attachment, contentType } = await getObject(ATTACHMENT_BUCKET, attachmentKey);
 
       // 2. Prepare document for AI (PDF sent directly to Claude)
-      const doc = prepareDocument(attachmentKey, attachment);
+      const doc = prepareDocument(attachmentKey, attachment, contentType);
       log.info("Document prepared", {
         attachmentKey,
         mediaType: doc.mediaType,
@@ -47,7 +49,7 @@ export const handler = async (event: SQSEvent) => {
 
       // If parsing failed, try once with repair prompt
       if (!extracted) {
-        log.warn("First parse failed, trying repair", { responseSnippet: response.text?.slice(0, 200) });
+        log.warn("First parse failed, trying repair", { responseLength: response.text?.length ?? 0 });
         const repairResponse = await invokeBedrock(BEDROCK_MODEL_ID, buildRepairPrompt(response.text ?? ""), []);
         extracted = parseJsonResponse(repairResponse.text);
         modelUsed = repairResponse.modelId;
@@ -122,35 +124,25 @@ export const handler = async (event: SQSEvent) => {
  * Prepare document for AI processing.
  * PDFs are sent directly to Claude which can read them natively.
  */
-function prepareDocument(attachmentKey: string, attachment: Buffer): DocumentInput {
+function prepareDocument(attachmentKey: string, attachment: Buffer, contentType?: string): DocumentInput {
   const lower = attachmentKey.toLowerCase();
+  const ct = (contentType ?? "").toLowerCase();
+  const data = attachment.toString("base64");
 
-  if (lower.endsWith(".pdf")) {
-    return {
-      mediaType: "application/pdf",
-      data: attachment.toString("base64"),
-    };
+  // Prefer the stored content-type over the key extension: emailed attachments may be
+  // stored with a sanitized, extension-less filename, so the suffix can be missing.
+  if (ct === "application/pdf" || lower.endsWith(".pdf")) {
+    return { mediaType: "application/pdf", data };
+  }
+  if (ct === "image/png" || lower.endsWith(".png")) {
+    return { mediaType: "image/png", data };
+  }
+  if (ct === "image/jpeg" || ct === "image/jpg" || lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+    return { mediaType: "image/jpeg", data };
   }
 
-  if (lower.endsWith(".png")) {
-    return {
-      mediaType: "image/png",
-      data: attachment.toString("base64"),
-    };
-  }
-
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
-    return {
-      mediaType: "image/jpeg",
-      data: attachment.toString("base64"),
-    };
-  }
-
-  // Default to PDF for unknown types
-  return {
-    mediaType: "application/pdf",
-    data: attachment.toString("base64"),
-  };
+  // Default to PDF for unknown types.
+  return { mediaType: "application/pdf", data };
 }
 
 /**
@@ -281,14 +273,15 @@ function parseMoney(input: string): number | null {
 function reconcileExtraction(extracted: any, warnings: string[]) {
   if (!extracted || typeof extracted !== "object") return;
 
-  // Proforma invoices should be tagged as "Prepayment" for Oracle Fusion purposes.
+  // Proforma invoices are tagged with the neutral type "Proforma"; the ERP transform
+  // (e.g. NetSuite) decides how to handle it. (Was the Oracle-specific "Prepayment".)
   const currentType = String(extracted?.invoice?.invoiceType ?? "").trim();
   const looksProforma = /pro\s*forma|proforma/i.test(currentType);
   if (looksProforma) {
     extracted.invoice = extracted.invoice ?? {};
-    if (extracted.invoice.invoiceType !== "Prepayment") {
-      extracted.invoice.invoiceType = "Prepayment";
-      warnings.push("tagged_prepayment_from_proforma");
+    if (extracted.invoice.invoiceType !== "Proforma") {
+      extracted.invoice.invoiceType = "Proforma";
+      warnings.push("tagged_proforma");
     }
   }
 

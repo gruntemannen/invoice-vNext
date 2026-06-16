@@ -63,14 +63,6 @@ export function calculateConfidence(extracted: any): number {
   const isVisualProcessing = snippet.includes("visually by AI") || snippet.includes("PDF processed");
   if (snippet && snippet.length < 80 && !isVisualProcessing) conf = Math.min(conf, 0.35);
 
-  // If we had to reconcile (meaning the raw extraction was inconsistent), cap confidence.
-  const warnings: unknown = extracted?.meta?.warnings;
-  if (Array.isArray(warnings)) {
-    if (warnings.some((w) => String(w).startsWith("reconciled_"))) {
-      conf = Math.min(conf, 0.85);
-    }
-  }
-
   return conf;
 }
 

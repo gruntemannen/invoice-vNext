@@ -1,143 +1,732 @@
-let apiBaseUrl = "";
-let nextToken = undefined;
-let items = [];
+/* =========================================================================
+   Invoice Admin — static PWA admin console (vanilla JS, no build step)
+   Views: Dashboard (GET /stats), Audit (GET /invoices), Upload (POST /upload).
+   Auth: Cognito Hosted UI implicit flow; id_token in sessionStorage; Bearer
+         header on every API call; 401/403 -> re-login.
+   ========================================================================= */
 
-const listEl = document.getElementById("list");
-const detailSection = document.getElementById("detail-section");
-const listSection = document.getElementById("list-section");
-const detailJson = document.getElementById("detail-json");
-const detailMeta = document.getElementById("detail-meta");
-const pdfViewer = document.getElementById("pdf-viewer");
-const loadMoreBtn = document.getElementById("load-more");
-const backBtn = document.getElementById("back");
-const downloadBtn = document.getElementById("download");
-const deleteBtn = document.getElementById("delete");
-const uploadBtn = document.getElementById("upload-btn");
-const fileInput = document.getElementById("file-input");
-const uploadStatus = document.getElementById("upload-status");
-const uploadSpinner = document.getElementById("upload-spinner");
-let maxUploadBytes = 0;
-let currentDetail = null;
+"use strict";
 
-async function loadConfig() {
-  const res = await fetch("config.json");
-  const cfg = await res.json();
-  apiBaseUrl = cfg.apiBaseUrl;
-  maxUploadBytes = Number(cfg.maxUploadBytes ?? 0);
+/* --------------------------- Global state ------------------------------ */
+const state = {
+  cfg: null,
+  apiBaseUrl: "",
+  maxUploadBytes: 0,
+  cognito: null,
+  idToken: null,
+  userEmail: null,
+  // audit
+  invoices: [],
+  nextToken: undefined,
+  statusFilter: "ALL",
+  searchTerm: "",
+  loadingMore: false,
+  // detail drawer
+  currentDetail: null,
+};
+
+const TOKEN_KEY = "invoice_admin_id_token";
+
+/* ----------------------------- DOM refs -------------------------------- */
+const $ = (id) => document.getElementById(id);
+const bootGate = $("boot-gate");
+const bootText = $("boot-text");
+const appShell = $("app-shell");
+
+/* ========================================================================
+   AUTH
+   ===================================================================== */
+
+function base64UrlDecode(str) {
+  // JWT uses base64url; pad and convert to standard base64.
+  let s = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const decoded = atob(s);
+  // Handle UTF-8 payloads.
+  try {
+    return decodeURIComponent(
+      decoded
+        .split("")
+        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
+        .join("")
+    );
+  } catch {
+    return decoded;
+  }
 }
 
-function renderList() {
-  listEl.innerHTML = "";
-  items.forEach((item) => {
-    const card = document.createElement("div");
-    card.className = "card";
-    card.innerHTML = `
-      <div class="card-title">${item.subject || "(no subject)"}</div>
-      <div class="card-subtitle">${item.from || "(unknown sender)"}</div>
-      <div class="card-meta">
-        <span>${new Date(item.receivedAt).toLocaleString()}</span>
-        <span class="badge ${badgeClass(item.confidence)}">Confidence ${formatConfidence(item.confidence)}</span>
-        <span class="status">${item.status}</span>
-      </div>
-      <div class="card-details">
-        <span>${item.vendorName || "Vendor unknown"}</span>
-        <span>${item.invoiceNumber || "Invoice # missing"}</span>
-        <span>${formatAmount(item.totalAmount, item.currency)}</span>
-      </div>
-    `;
-    card.onclick = () => openDetail(item.messageId, item.attachmentId);
-    listEl.appendChild(card);
+function decodeJwt(token) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    return JSON.parse(base64UrlDecode(parts[1]));
+  } catch {
+    return null;
+  }
+}
+
+function isTokenValid(token) {
+  const payload = decodeJwt(token);
+  if (!payload || typeof payload.exp !== "number") return false;
+  // exp is in seconds; allow a 30s clock-skew margin.
+  return payload.exp * 1000 > Date.now() + 30_000;
+}
+
+/** Pull an id_token out of the URL hash (implicit flow callback). */
+function readTokenFromHash() {
+  if (!window.location.hash || window.location.hash.length < 2) return null;
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  const token = params.get("id_token");
+  if (token) {
+    // Clean the hash so the token isn't left in the address bar / history.
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+  }
+  return token;
+}
+
+function buildLoginUrl() {
+  const c = state.cognito;
+  const qs = new URLSearchParams({
+    client_id: c.clientId,
+    response_type: "token",
+    scope: c.scope || "openid email profile",
+    redirect_uri: c.redirectUri,
+  });
+  return `https://${c.domain}/login?${qs.toString()}`;
+}
+
+function buildLogoutUrl() {
+  const c = state.cognito;
+  const qs = new URLSearchParams({
+    client_id: c.clientId,
+    logout_uri: c.redirectUri,
+  });
+  return `https://${c.domain}/logout?${qs.toString()}`;
+}
+
+function redirectToLogin() {
+  bootText.textContent = "Redirecting to sign in…";
+  showBootGate();
+  window.location.assign(buildLoginUrl());
+}
+
+function logout() {
+  try {
+    sessionStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* ignore */
+  }
+  state.idToken = null;
+  window.location.assign(buildLogoutUrl());
+}
+
+/** Resolve auth on boot. Returns true if we have a valid token. */
+function resolveAuth() {
+  // 1) hash (fresh login callback)
+  let token = readTokenFromHash();
+  // 2) sessionStorage
+  if (!token) {
+    try {
+      token = sessionStorage.getItem(TOKEN_KEY);
+    } catch {
+      token = null;
+    }
+  }
+
+  if (token && isTokenValid(token)) {
+    try {
+      sessionStorage.setItem(TOKEN_KEY, token);
+    } catch {
+      /* ignore */
+    }
+    state.idToken = token;
+    const payload = decodeJwt(token) || {};
+    state.userEmail = payload.email || payload["cognito:username"] || payload.sub || "Signed in";
+    return true;
+  }
+
+  // No valid token.
+  try {
+    sessionStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* ignore */
+  }
+  state.idToken = null;
+  return false;
+}
+
+/* ========================================================================
+   API HELPER — attaches Bearer token, handles 401/403
+   ===================================================================== */
+
+async function apiFetch(path, options = {}) {
+  const url = path.startsWith("http") ? path : `${state.apiBaseUrl}${path}`;
+  const headers = Object.assign({}, options.headers || {});
+  if (state.idToken) headers["Authorization"] = `Bearer ${state.idToken}`;
+
+  const res = await fetch(url, { ...options, headers });
+
+  if (res.status === 401 || res.status === 403) {
+    // Token rejected/expired -> clear and re-login.
+    try {
+      sessionStorage.removeItem(TOKEN_KEY);
+    } catch {
+      /* ignore */
+    }
+    state.idToken = null;
+    redirectToLogin();
+    // Throw so callers stop processing; redirect is already underway.
+    throw new Error("Unauthorized");
+  }
+  return res;
+}
+
+/* ========================================================================
+   FORMATTERS
+   ===================================================================== */
+
+function fmtDate(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
   });
 }
 
-function badgeClass(confidence) {
-  if (confidence >= 0.8) return "good";
-  if (confidence >= 0.5) return "medium";
+function fmtDay(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function fmtRelative(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso).getTime();
+  if (isNaN(d)) return "—";
+  const diff = Date.now() - d;
+  const min = Math.round(diff / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.round(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.round(hr / 24);
+  return `${day}d ago`;
+}
+
+function fmtAmount(amount, currency) {
+  if (typeof amount !== "number" || isNaN(amount)) return "—";
+  if (currency) {
+    try {
+      return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(amount);
+    } catch {
+      /* fall through for non-ISO currency codes */
+    }
+  }
+  return `${currency ? currency + " " : ""}${amount.toFixed(2)}`;
+}
+
+function fmtPct(value) {
+  if (typeof value !== "number" || isNaN(value)) return "—";
+  return `${Math.round(value * 100)}%`;
+}
+
+function confidenceClass(c) {
+  if (typeof c !== "number") return "low";
+  if (c >= 0.8) return "good";
+  if (c >= 0.5) return "medium";
   return "low";
 }
 
-function formatConfidence(confidence) {
-  if (typeof confidence !== "number") return "n/a";
-  return `${Math.round(confidence * 100)}%`;
-}
-
-function formatAmount(amount, currency) {
-  if (typeof amount !== "number") return "Total unknown";
-  return `${currency || ""} ${amount.toFixed(2)}`;
-}
-
-async function loadInvoices() {
-  const params = new URLSearchParams();
-  if (nextToken) params.set("nextToken", nextToken);
-  const res = await fetch(`${apiBaseUrl}/invoices?${params.toString()}`);
-  const data = await res.json();
-  items = items.concat(data.items || []);
-  nextToken = data.nextToken;
-  loadMoreBtn.disabled = !nextToken;
-  renderList();
-}
-
-async function openDetail(messageId, attachmentId) {
-  const res = await fetch(`${apiBaseUrl}/invoices/${messageId}/${attachmentId}`);
-  const data = await res.json();
-  currentDetail = { messageId, attachmentId };
-  
-  // Display extracted JSON or error information
-  if (data.status === "FAILED") {
-    const errorInfo = {
-      status: "FAILED",
-      errors: data.errors || ["Unknown error"],
-      messageId: data.messageId,
-      attachmentId: data.attachmentId,
-      receivedAt: data.receivedAt,
-    };
-    detailJson.textContent = JSON.stringify(errorInfo, null, 2);
-  } else {
-    detailJson.textContent = JSON.stringify(data.extractedJson ?? data, null, 2);
+function statusClass(status) {
+  switch (status) {
+    case "COMPLETED":
+      return "ok";
+    case "FAILED":
+      return "fail";
+    case "PENDING":
+      return "pending";
+    default:
+      return "pending";
   }
-  
-  detailMeta.textContent = `Message: ${messageId} | Attachment: ${attachmentId}`;
-  const d = await fetch(`${apiBaseUrl}/invoices/${messageId}/${attachmentId}/download`);
-  const j = await d.json();
-  if (d.ok && j?.url) {
-    pdfViewer.src = j.url;
-    downloadBtn.onclick = () => window.open(j.url, "_blank");
-  } else {
-    pdfViewer.src = "";
-    downloadBtn.onclick = null;
-  }
-  listSection.classList.add("hidden");
-  detailSection.classList.remove("hidden");
 }
 
-async function deleteCurrentInvoice() {
-  if (!currentDetail?.messageId || !currentDetail?.attachmentId) return;
-  const ok = window.confirm("Delete this invoice and its uploaded PDF?");
-  if (!ok) return;
+function escapeHtml(str) {
+  if (str == null) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
-  const res = await fetch(`${apiBaseUrl}/invoices/${currentDetail.messageId}/${currentDetail.attachmentId}`, {
-    method: "DELETE",
+function fmtBytes(bytes) {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+/* ========================================================================
+   TOASTS
+   ===================================================================== */
+
+function toast(message, kind = "info") {
+  const host = $("toast-host");
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.textContent = message;
+  host.appendChild(el);
+  setTimeout(() => el.classList.add("show"), 10);
+  setTimeout(() => {
+    el.classList.remove("show");
+    setTimeout(() => el.remove(), 300);
+  }, 4000);
+}
+
+/* ========================================================================
+   NAVIGATION
+   ===================================================================== */
+
+const VIEW_TITLES = { dashboard: "Dashboard", audit: "Audit", upload: "Upload" };
+
+function switchView(view) {
+  document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
+  $(`view-${view}`).classList.remove("hidden");
+
+  document.querySelectorAll(".nav-item").forEach((b) => {
+    b.classList.toggle("active", b.dataset.view === view);
   });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    window.alert(data?.message || `Delete failed (${res.status}).`);
+  $("view-title").textContent = VIEW_TITLES[view] || "Dashboard";
+  document.body.classList.remove("nav-open");
+
+  if (view === "dashboard") loadStats();
+  if (view === "audit" && state.invoices.length === 0) loadInvoices(true);
+}
+
+/* ========================================================================
+   DASHBOARD
+   ===================================================================== */
+
+const KPI_DEFS = [
+  { key: "total", label: "Total ingested", tone: "blue" },
+  { key: "successRate", label: "Success rate", tone: "green", pct: true },
+  { key: "completed", label: "Completed", tone: "green" },
+  { key: "failed", label: "Failed", tone: "red" },
+  { key: "pending", label: "Pending", tone: "amber" },
+  { key: "avgConfidence", label: "Avg confidence", tone: "violet", pct: true },
+];
+
+async function loadStats() {
+  const errBox = $("dash-error");
+  errBox.classList.add("hidden");
+  renderKpis(null); // skeleton
+
+  try {
+    const res = await apiFetch("/stats");
+    if (!res.ok) throw new Error(`Stats request failed (${res.status})`);
+    const stats = await res.json();
+    renderDashboard(stats);
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    errBox.textContent = "Could not load dashboard stats. Showing last known state.";
+    errBox.classList.remove("hidden");
+    renderKpis({}); // render zeros rather than a blank page
+  }
+}
+
+function renderDashboard(stats) {
+  const totals = stats.totals || {};
+  renderKpis({
+    total: totals.all ?? 0,
+    completed: totals.completed ?? 0,
+    failed: totals.failed ?? 0,
+    pending: totals.pending ?? 0,
+    successRate: stats.successRate ?? 0,
+    avgConfidence: stats.avgConfidence ?? 0,
+  });
+  renderTrend(Array.isArray(stats.byDay) ? stats.byDay : []);
+  renderRecentFailures(Array.isArray(stats.recentFailures) ? stats.recentFailures : []);
+}
+
+function renderKpis(data) {
+  const grid = $("kpi-grid");
+  grid.innerHTML = "";
+  KPI_DEFS.forEach((def) => {
+    const card = document.createElement("div");
+    card.className = `kpi ${def.tone}`;
+    let valueHtml;
+    if (data == null) {
+      valueHtml = `<span class="kpi-skel"></span>`;
+    } else {
+      const raw = data[def.key];
+      const val = def.pct ? fmtPct(raw) : Number(raw ?? 0).toLocaleString();
+      valueHtml = escapeHtml(val);
+    }
+    card.innerHTML = `
+      <div class="kpi-label">${escapeHtml(def.label)}</div>
+      <div class="kpi-value">${valueHtml}</div>
+    `;
+    grid.appendChild(card);
+  });
+}
+
+/** Inline-SVG grouped bar chart: ingested / completed / failed per day. */
+function renderTrend(byDay) {
+  const wrap = $("trend-chart");
+  const legend = $("trend-legend");
+  legend.innerHTML = `
+    <span class="lg"><i class="sw sw-ing"></i>Ingested</span>
+    <span class="lg"><i class="sw sw-ok"></i>Completed</span>
+    <span class="lg"><i class="sw sw-fail"></i>Failed</span>
+  `;
+
+  if (!byDay.length) {
+    wrap.innerHTML = `<div class="empty">No data in the last 30 days.</div>`;
     return;
   }
 
-  // Reset UI + reload list
-  currentDetail = null;
-  pdfViewer.src = "";
-  detailSection.classList.add("hidden");
-  listSection.classList.remove("hidden");
-  items = [];
-  nextToken = undefined;
-  await loadInvoices();
+  // Geometry
+  const W = 980;
+  const H = 280;
+  const padL = 38;
+  const padR = 12;
+  const padT = 14;
+  const padB = 34;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  const maxVal = Math.max(
+    1,
+    ...byDay.map((d) => Math.max(d.ingested || 0, d.completed || 0, d.failed || 0))
+  );
+  // "nice" y-axis ceiling
+  const ceil = niceCeil(maxVal);
+
+  const n = byDay.length;
+  const slot = plotW / n;
+  const groupPad = slot * 0.18;
+  const groupW = slot - groupPad * 2;
+  const barW = groupW / 3;
+
+  const y = (v) => padT + plotH - (v / ceil) * plotH;
+  const colors = { ing: "var(--c-ing)", ok: "var(--c-ok)", fail: "var(--c-fail)" };
+
+  // Y gridlines (4 steps)
+  let grid = "";
+  const steps = 4;
+  for (let i = 0; i <= steps; i++) {
+    const v = (ceil / steps) * i;
+    const yy = y(v);
+    grid += `<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${W - padR}" y2="${yy.toFixed(
+      1
+    )}" class="grid-line" />`;
+    grid += `<text x="${padL - 6}" y="${(yy + 3).toFixed(1)}" class="axis-label" text-anchor="end">${Math.round(
+      v
+    )}</text>`;
+  }
+
+  // Bars + x labels. Label every ~Nth day to avoid clutter.
+  const labelEvery = Math.ceil(n / 10);
+  let bars = "";
+  let xlabels = "";
+  byDay.forEach((d, i) => {
+    const gx = padL + i * slot + groupPad;
+    const series = [
+      { v: d.ingested || 0, c: colors.ing },
+      { v: d.completed || 0, c: colors.ok },
+      { v: d.failed || 0, c: colors.fail },
+    ];
+    series.forEach((s, j) => {
+      const bx = gx + j * barW;
+      const by = y(s.v);
+      const bh = Math.max(0, padT + plotH - by);
+      const title = `${d.date}\nIngested ${d.ingested || 0} · Completed ${d.completed ||
+        0} · Failed ${d.failed || 0}`;
+      bars += `<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${(barW - 1).toFixed(
+        1
+      )}" height="${bh.toFixed(1)}" fill="${s.c}" rx="1.5"><title>${escapeHtml(
+        title
+      )}</title></rect>`;
+    });
+    if (i % labelEvery === 0 || i === n - 1) {
+      const cx = gx + groupW / 2;
+      xlabels += `<text x="${cx.toFixed(1)}" y="${H - padB + 18}" class="axis-label" text-anchor="middle">${escapeHtml(
+        fmtDay(d.date)
+      )}</text>`;
+    }
+  });
+
+  wrap.innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" class="chart-svg" preserveAspectRatio="xMidYMid meet" role="img" aria-label="30-day ingestion trend">
+      ${grid}
+      ${bars}
+      ${xlabels}
+    </svg>
+  `;
 }
 
+function niceCeil(v) {
+  if (v <= 5) return 5;
+  const pow = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / pow;
+  let step;
+  if (n <= 1) step = 1;
+  else if (n <= 2) step = 2;
+  else if (n <= 5) step = 5;
+  else step = 10;
+  return step * pow;
+}
+
+function renderRecentFailures(failures) {
+  const box = $("recent-failures");
+  if (!failures.length) {
+    box.innerHTML = `<div class="empty">No recent failures. 🎉</div>`;
+    return;
+  }
+  box.innerHTML = "";
+  failures.forEach((f) => {
+    const row = document.createElement("div");
+    row.className = "failure-row";
+    row.innerHTML = `
+      <div class="failure-main">
+        <div class="failure-subject">${escapeHtml(f.subject || "(no subject)")}</div>
+        <div class="failure-sub muted">${escapeHtml(f.from || "(unknown sender)")} · ${escapeHtml(
+      fmtRelative(f.updatedAt)
+    )}</div>
+        <div class="failure-error">${escapeHtml(f.error || "Unknown error")}</div>
+      </div>
+      <button class="button ghost small">Open</button>
+    `;
+    row.querySelector("button").onclick = () => openDetail(f.messageId, f.attachmentId);
+    box.appendChild(row);
+  });
+}
+
+/* ========================================================================
+   AUDIT
+   ===================================================================== */
+
+async function loadInvoices(reset) {
+  if (state.loadingMore) return;
+  const errBox = $("audit-error");
+
+  if (reset) {
+    state.invoices = [];
+    state.nextToken = undefined;
+  }
+
+  state.loadingMore = true;
+  const loadMoreBtn = $("audit-load-more");
+  loadMoreBtn.disabled = true;
+  loadMoreBtn.textContent = "Loading…";
+
+  try {
+    const params = new URLSearchParams({ limit: "50" });
+    if (state.nextToken) params.set("nextToken", state.nextToken);
+    const res = await apiFetch(`/invoices?${params.toString()}`);
+    if (!res.ok) throw new Error(`Invoices request failed (${res.status})`);
+    const data = await res.json();
+    state.invoices = state.invoices.concat(data.items || []);
+    state.nextToken = data.nextToken;
+    errBox.classList.add("hidden");
+    renderAudit();
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    errBox.textContent = "Could not load invoices. Check your connection and try Refresh.";
+    errBox.classList.remove("hidden");
+    if (state.invoices.length === 0) renderAudit(); // show empty state, not blank
+  } finally {
+    state.loadingMore = false;
+    loadMoreBtn.textContent = "Load more";
+    loadMoreBtn.disabled = !state.nextToken;
+    loadMoreBtn.classList.toggle("hidden", !state.nextToken);
+  }
+}
+
+function filteredInvoices() {
+  const term = state.searchTerm.trim().toLowerCase();
+  return state.invoices.filter((it) => {
+    if (state.statusFilter !== "ALL" && it.status !== state.statusFilter) return false;
+    if (!term) return true;
+    const hay = [it.vendorName, it.subject, it.from, it.invoiceNumber]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return hay.includes(term);
+  });
+}
+
+function renderAudit() {
+  const body = $("audit-body");
+  const rows = filteredInvoices();
+  $("audit-count").textContent = `${rows.length} row${rows.length === 1 ? "" : "s"}`;
+  body.innerHTML = "";
+
+  if (rows.length === 0) {
+    body.innerHTML = `<tr><td colspan="6"><div class="empty">No invoices match your filters.</div></td></tr>`;
+    return;
+  }
+
+  rows.forEach((it) => {
+    const tr = document.createElement("tr");
+    tr.className = "row-click";
+    tr.innerHTML = `
+      <td>${escapeHtml(fmtDate(it.receivedAt))}</td>
+      <td class="cell-strong">${escapeHtml(it.vendorName || "—")}</td>
+      <td>${escapeHtml(it.invoiceNumber || "—")}</td>
+      <td class="num">${escapeHtml(fmtAmount(it.totalAmount, it.currency))}</td>
+      <td><span class="badge ${statusClass(it.status)}">${escapeHtml(it.status || "—")}</span></td>
+      <td class="num">${
+        it.status === "COMPLETED"
+          ? `<span class="conf ${confidenceClass(it.confidence)}">${fmtPct(it.confidence)}</span>`
+          : "—"
+      }</td>
+    `;
+    tr.onclick = () => openDetail(it.messageId, it.attachmentId);
+    body.appendChild(tr);
+  });
+}
+
+/* ========================================================================
+   DETAIL DRAWER
+   ===================================================================== */
+
+const DETAIL_FIELDS = [
+  ["Status", (d) => `<span class="badge ${statusClass(d.status)}">${escapeHtml(d.status || "—")}</span>`],
+  ["Vendor", (d) => escapeHtml(d.vendorName || "—")],
+  ["Invoice #", (d) => escapeHtml(d.invoiceNumber || "—")],
+  ["Amount", (d) => escapeHtml(fmtAmount(d.totalAmount, d.currency))],
+  ["Confidence", (d) => (d.status === "COMPLETED" ? escapeHtml(fmtPct(d.confidence)) : "—")],
+  ["From", (d) => escapeHtml(d.from || "—")],
+  ["Subject", (d) => escapeHtml(d.subject || "—")],
+  ["Received", (d) => escapeHtml(fmtDate(d.receivedAt))],
+  ["Updated", (d) => escapeHtml(fmtDate(d.updatedAt))],
+];
+
+async function openDetail(messageId, attachmentId) {
+  if (!messageId || !attachmentId) return;
+  state.currentDetail = { messageId, attachmentId };
+
+  const overlay = $("drawer-overlay");
+  const fields = $("drawer-fields");
+  const jsonBox = $("drawer-json");
+
+  // Open immediately with a loading state.
+  fields.innerHTML = `<div class="empty">Loading…</div>`;
+  jsonBox.textContent = "";
+  $("drawer-meta").textContent = "";
+  overlay.classList.remove("hidden");
+  document.body.classList.add("no-scroll");
+
+  try {
+    const res = await apiFetch(`/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}`);
+    if (!res.ok) throw new Error(`Detail request failed (${res.status})`);
+    const d = await res.json();
+
+    $("drawer-meta").textContent = `${messageId} · ${attachmentId}`;
+    fields.innerHTML = DETAIL_FIELDS.map(
+      ([label, fn]) => `
+      <div class="meta-item">
+        <span class="meta-label">${escapeHtml(label)}</span>
+        <span class="meta-value">${fn(d)}</span>
+      </div>`
+    ).join("");
+
+    let jsonPayload;
+    if (d.status === "FAILED") {
+      jsonPayload = {
+        status: "FAILED",
+        errors: d.errors || ["Unknown error"],
+        messageId: d.messageId,
+        attachmentId: d.attachmentId,
+        receivedAt: d.receivedAt,
+      };
+    } else {
+      jsonPayload = d.extractedJson ?? d;
+    }
+    jsonBox.textContent = JSON.stringify(jsonPayload, null, 2);
+
+    // Wire download lazily (presigned URL fetched on click to keep it fresh).
+    $("drawer-download").onclick = () => downloadPdf(messageId, attachmentId);
+    $("drawer-delete").onclick = () => deleteInvoice(messageId, attachmentId);
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    fields.innerHTML = `<div class="banner error">Could not load this record.</div>`;
+  }
+}
+
+function closeDrawer() {
+  $("drawer-overlay").classList.add("hidden");
+  document.body.classList.remove("no-scroll");
+  state.currentDetail = null;
+}
+
+async function downloadPdf(messageId, attachmentId) {
+  try {
+    const res = await apiFetch(
+      `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}/download`
+    );
+    const j = await res.json().catch(() => ({}));
+    if (res.ok && j && j.url) {
+      window.open(j.url, "_blank", "noopener");
+    } else {
+      toast("Download URL unavailable.", "error");
+    }
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    toast("Download failed.", "error");
+  }
+}
+
+async function deleteInvoice(messageId, attachmentId) {
+  if (!window.confirm("Delete this invoice and its uploaded PDF? This cannot be undone.")) return;
+  try {
+    const res = await apiFetch(
+      `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}`,
+      { method: "DELETE" }
+    );
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      toast(data.message || `Delete failed (${res.status}).`, "error");
+      return;
+    }
+    toast("Invoice deleted.", "success");
+    closeDrawer();
+    // Drop it from the local list and re-render without a full reload.
+    state.invoices = state.invoices.filter(
+      (it) => !(it.messageId === messageId && it.attachmentId === attachmentId)
+    );
+    renderAudit();
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    toast("Delete failed.", "error");
+  }
+}
+
+/* ========================================================================
+   UPLOAD
+   ===================================================================== */
+
 async function uploadInvoice() {
+  const fileInput = $("file-input");
+  const uploadStatus = $("upload-status");
+  const uploadBtn = $("upload-btn");
+  const spinner = $("upload-spinner");
+
   try {
     if (!fileInput.files || fileInput.files.length === 0) {
-      uploadStatus.textContent = "Select a file first.";
+      uploadStatus.textContent = "Select a PDF first.";
       return;
     }
     const file = fileInput.files[0];
@@ -145,16 +734,16 @@ async function uploadInvoice() {
       uploadStatus.textContent = "PDF files only.";
       return;
     }
-    if (maxUploadBytes > 0 && file.size > maxUploadBytes) {
-      uploadStatus.textContent = `File too large. Max ${formatBytes(maxUploadBytes)}.`;
+    if (state.maxUploadBytes > 0 && file.size > state.maxUploadBytes) {
+      uploadStatus.textContent = `File too large. Max ${fmtBytes(state.maxUploadBytes)}.`;
       return;
     }
 
-    uploadStatus.textContent = "Requesting upload URL...";
     uploadBtn.disabled = true;
-    setSpinner(true);
+    spinner.classList.remove("hidden");
+    uploadStatus.textContent = "Requesting upload URL…";
 
-    const res = await fetch(`${apiBaseUrl}/upload`, {
+    const res = await apiFetch("/upload", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -163,13 +752,14 @@ async function uploadInvoice() {
         fileSize: file.size,
       }),
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      uploadStatus.textContent = data?.message || "Upload request failed.";
+      uploadStatus.textContent = data.message || "Upload request failed.";
       return;
     }
 
-    uploadStatus.textContent = "Uploading to S3...";
+    uploadStatus.textContent = "Uploading to S3…";
+    // NOTE: presigned PUT goes straight to S3 — do NOT attach the Bearer header.
     const putRes = await fetch(data.uploadUrl, {
       method: "PUT",
       headers: { "content-type": "application/pdf" },
@@ -180,80 +770,188 @@ async function uploadInvoice() {
       return;
     }
 
-    uploadStatus.textContent = "Upload complete. Processing...";
-    items = [];
-    nextToken = undefined;
-    await waitForExtraction(data.messageId, data.attachmentId);
+    uploadStatus.textContent = "Upload complete. Extraction running…";
+    await waitForExtraction(data.messageId, data.attachmentId, uploadStatus);
   } catch (err) {
-    uploadStatus.textContent = "Upload failed. Check browser console/network.";
+    if (err.message === "Unauthorized") return;
     console.error(err);
+    uploadStatus.textContent = "Upload failed. Check the console / network tab.";
   } finally {
     uploadBtn.disabled = false;
-    setSpinner(false);
+    spinner.classList.add("hidden");
   }
 }
 
-async function waitForExtraction(messageId, attachmentId) {
+async function waitForExtraction(messageId, attachmentId, uploadStatus) {
   const maxAttempts = 20;
   const delayMs = 3000;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    const res = await fetch(`${apiBaseUrl}/invoices/${messageId}/${attachmentId}`);
-    
-    // 404 is expected during initial S3 event → Lambda trigger delay
+    let res;
+    try {
+      res = await apiFetch(
+        `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}`
+      );
+    } catch (err) {
+      if (err.message === "Unauthorized") return;
+      throw err;
+    }
+
     if (res.status === 404) {
-      uploadStatus.textContent = `Waiting for processing to start... (${attempt}/${maxAttempts})`;
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      uploadStatus.textContent = `Waiting for processing to start… (${attempt}/${maxAttempts})`;
+      await sleep(delayMs);
       continue;
     }
-    
+
     const data = await res.json().catch(() => ({}));
-    
-    // Processing complete
-    if (res.ok && data?.status && data.status !== "PENDING") {
+    if (res.ok && data.status && data.status !== "PENDING") {
       if (data.status === "FAILED") {
-        const errorMsg = data.errors?.join(", ") || "Unknown error";
-        uploadStatus.textContent = `Processing failed: ${errorMsg}`;
+        const errMsg = (data.errors || []).join(", ") || "Unknown error";
+        uploadStatus.textContent = `Processing failed: ${errMsg}`;
+        toast("Extraction failed.", "error");
       } else {
-        uploadStatus.textContent = `Processing ${data.status.toLowerCase()}.`;
+        uploadStatus.textContent = "Extraction complete. Opening record…";
+        toast("Extraction complete.", "success");
       }
-      await loadInvoices();
-      await openDetail(messageId, attachmentId);
+      // Refresh audit list so the new record is present, then open it.
+      await loadInvoices(true);
+      openDetail(messageId, attachmentId);
       return;
     }
-    
-    // Still pending
-    uploadStatus.textContent = `Processing... (${attempt}/${maxAttempts})`;
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+    uploadStatus.textContent = `Processing… (${attempt}/${maxAttempts})`;
+    await sleep(delayMs);
+  }
+  uploadStatus.textContent = "Processing is taking longer than expected. Check the Audit view shortly.";
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/* ========================================================================
+   BOOT
+   ===================================================================== */
+
+function showBootGate() {
+  bootGate.classList.remove("hidden");
+  appShell.classList.add("hidden");
+}
+
+function showApp() {
+  bootGate.classList.add("hidden");
+  appShell.classList.remove("hidden");
+}
+
+async function loadConfig() {
+  const res = await fetch("config.json", { cache: "no-store" });
+  if (!res.ok) throw new Error(`config.json failed (${res.status})`);
+  const cfg = await res.json();
+  state.cfg = cfg;
+  state.apiBaseUrl = (cfg.apiBaseUrl || "").replace(/\/+$/, "");
+  state.maxUploadBytes = Number(cfg.maxUploadBytes ?? 0);
+  state.cognito = cfg.cognito || null;
+  state.region = cfg.region || "";
+  const regionLabel = document.getElementById("region-label");
+  if (regionLabel) regionLabel.textContent = state.region ? `${state.region} • PWA` : "PWA";
+}
+
+function renderUserChip() {
+  $("user-email").textContent = state.userEmail || "Signed in";
+  const initial = (state.userEmail || "?").trim().charAt(0).toUpperCase() || "?";
+  $("user-avatar").textContent = initial;
+}
+
+function wireEvents() {
+  // Nav
+  document.querySelectorAll(".nav-item").forEach((btn) => {
+    btn.onclick = () => switchView(btn.dataset.view);
+  });
+  $("nav-toggle").onclick = () => document.body.classList.toggle("nav-open");
+  $("logout-btn").onclick = logout;
+
+  // Refresh (context-aware)
+  $("refresh-btn").onclick = () => {
+    const active = document.querySelector(".nav-item.active");
+    const view = active ? active.dataset.view : "dashboard";
+    if (view === "audit") loadInvoices(true);
+    else loadStats();
+  };
+
+  // Audit filters
+  $("audit-search").addEventListener("input", (e) => {
+    state.searchTerm = e.target.value;
+    renderAudit();
+  });
+  $("audit-status").addEventListener("change", (e) => {
+    state.statusFilter = e.target.value;
+    renderAudit();
+  });
+  $("audit-load-more").onclick = () => loadInvoices(false);
+
+  // Drawer
+  $("drawer-close").onclick = closeDrawer;
+  $("drawer-dismiss").onclick = closeDrawer;
+  $("drawer-overlay").addEventListener("click", (e) => {
+    if (e.target === $("drawer-overlay")) closeDrawer();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("drawer-overlay").classList.contains("hidden")) closeDrawer();
+  });
+
+  // Upload
+  $("upload-btn").onclick = uploadInvoice;
+  const dz = $("dropzone");
+  const fileInput = $("file-input");
+  ["dragenter", "dragover"].forEach((ev) =>
+    dz.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dz.classList.add("drag");
+    })
+  );
+  ["dragleave", "drop"].forEach((ev) =>
+    dz.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dz.classList.remove("drag");
+    })
+  );
+  dz.addEventListener("drop", (e) => {
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+      fileInput.files = e.dataTransfer.files;
+      $("upload-status").textContent = `Selected: ${e.dataTransfer.files[0].name}`;
+    }
+  });
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files && fileInput.files.length) {
+      $("upload-status").textContent = `Selected: ${fileInput.files[0].name}`;
+    }
+  });
+}
+
+async function boot() {
+  showBootGate();
+  try {
+    await loadConfig();
+  } catch (err) {
+    console.error(err);
+    bootText.textContent = "Configuration failed to load. Please retry shortly.";
+    return;
   }
 
-  uploadStatus.textContent = "Processing is taking longer than expected.";
-  await loadInvoices();
-}
-
-function setSpinner(isVisible) {
-  if (isVisible) {
-    uploadSpinner.classList.remove("hidden");
-  } else {
-    uploadSpinner.classList.add("hidden");
+  if (!state.cognito || !state.cognito.domain || !state.cognito.clientId) {
+    bootText.textContent = "Authentication is not configured. Contact your administrator.";
+    return;
   }
+
+  if (!resolveAuth()) {
+    redirectToLogin();
+    return;
+  }
+
+  renderUserChip();
+  wireEvents();
+  showApp();
+  switchView("dashboard");
 }
 
-function formatBytes(bytes) {
-  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${bytes} B`;
-}
-
-backBtn.onclick = () => {
-  detailSection.classList.add("hidden");
-  listSection.classList.remove("hidden");
-  pdfViewer.src = "";
-  currentDetail = null;
-};
-
-loadMoreBtn.onclick = loadInvoices;
-uploadBtn.onclick = uploadInvoice;
-deleteBtn.onclick = deleteCurrentInvoice;
-
-loadConfig().then(loadInvoices);
+boot();

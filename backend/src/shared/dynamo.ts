@@ -1,5 +1,5 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, UpdateCommand, GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, UpdateCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 
 const client = new DynamoDBClient({});
 export const docClient = DynamoDBDocumentClient.from(client);
@@ -34,11 +34,6 @@ export async function updateItem(
       ExpressionAttributeValues: values,
     })
   );
-}
-
-export async function getItem(tableName: string, key: { messageId: string; attachmentKey: string }) {
-  const res = await docClient.send(new GetCommand({ TableName: tableName, Key: key }));
-  return res.Item;
 }
 
 export async function queryInvoices(

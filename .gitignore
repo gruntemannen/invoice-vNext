@@ -51,3 +51,6 @@ samconfig.toml
 **/secrets.json
 **/*-secrets.json
 **/credentials.json
+
+# A/B eval sample invoices (may contain real PII/financial data)
+samples/

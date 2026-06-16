@@ -1,66 +1,67 @@
 # Invoice Extractor
 
-**Serverless invoice processing system** that extracts structured data from PDF invoices using AI, with built-in Oracle Fusion Cloud Payables integration.
+**Serverless invoice processing system** that extracts structured data from PDF invoices using AI, with built-in NetSuite integration.
 
-![Architecture](https://img.shields.io/badge/AWS-Serverless-orange) ![Bedrock](https://img.shields.io/badge/AI-Claude%203.5%20Sonnet-blue) ![Oracle](https://img.shields.io/badge/ERP-Oracle%20Fusion-red)
+![Architecture](https://img.shields.io/badge/AWS-Serverless-orange) ![Bedrock](https://img.shields.io/badge/AI-Claude%20Sonnet%204.6-blue) ![NetSuite](https://img.shields.io/badge/ERP-NetSuite-2e7d32)
 
 ## Overview
 
 Invoice Extractor is a production-ready, serverless application that:
-- Accepts PDF invoice uploads via web UI
-- Extracts structured JSON using Claude 3.5 Sonnet on Amazon Bedrock (reads PDFs directly)
+- Ingests PDF invoices from **email** (Amazon SES) and **web upload**
+- Extracts structured JSON using Claude Sonnet 4.6 on Amazon Bedrock (reads PDFs directly)
 - Stores results in DynamoDB with confidence scoring
-- Transforms data to Oracle Fusion Cloud Payables format
-- Provides a modern PWA interface for review and management
+- Pushes invoices to **NetSuite** as Accounts Payable vendor bills (export-only scaffold today; OAuth 2.0 push-ready)
+- Provides a **Cognito-authenticated admin console** for ingestion stats, success rates, and audit
 
 ## Key Features
 
-- **AI-Powered Extraction**: Uses Claude 3.5 Sonnet for accurate invoice data extraction directly from PDFs (no OCR needed)
+- **AI-Powered Extraction**: Uses Claude Sonnet 4.6 for accurate invoice data extraction directly from PDFs (no OCR needed)
+- **Email + Web Ingestion**: Accepts invoices via Amazon SES email receiving or direct web upload
 - **Multi-Language Support**: Works with invoices in any language (Japanese, Chinese, Korean, European languages, etc.)
-- **Oracle Fusion Ready**: Built-in transformation to Oracle Fusion AP format
-- **Multi-Account Architecture**: Designed for AWS Organizations with separate workload accounts
+- **NetSuite Integration**: Transforms extracted data into a NetSuite REST vendor bill — export-only today, with an OAuth 2.0 (M2M) push scaffold included
+- **Admin Console**: Cognito-authenticated dashboard with ingestion stats, success rates, and a DynamoDB audit view
+- **Secure by Default**: JWT-protected API, least-privilege IAM, DynamoDB PITR, S3 versioning, a Bedrock concurrency cap, and CloudWatch alarms
 - **Confidence Scoring**: Automatic quality assessment of extracted data
-- **PWA Support**: Installable web app with offline capabilities
+- **Multi-Account Architecture**: Designed for AWS Organizations with separate workload accounts
 - **Cost Optimized**: Pay-per-use serverless architecture
 
 ## Architecture
 
 ```
-┌─────────────┐
-│   Web UI    │ (CloudFront + S3)
-│   (PWA)     │
-└──────┬──────┘
-       │
-       ▼
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  API Lambda │────▶│ Upload to S3 │────▶│ DynamoDB    │
-└─────────────┘     └──────┬───────┘     └─────────────┘
-                          │
-                          ▼
-                   ┌──────────────┐
-                   │ Extract      │
-                   │ Lambda       │
-                   │ (Claude 3.5) │
-                   └──────────────┘
+Ingestion
+  Email  ─▶ Amazon SES ─▶ S3 (raw/)   ─▶ Ingest Lambda ┐
+  Upload ─▶ S3 (uploads/)             ─▶ Upload Lambda ┘─▶ SQS
+                                                          │
+Processing                                                ▼
+                                  Extract Lambda (Claude Sonnet 4.6, reads PDF)
+                                                          │
+                                                          ▼
+                                                      DynamoDB
+                                                          ▲
+Access  (Cognito JWT on every route)                      │
+  Admin UI (CloudFront PWA) ─▶ API Lambda ────────────────┘
+                                  └─▶ NetSuite vendor bill (export-only)
 ```
 
 ### How It Works
 
-1. User uploads a PDF invoice via the web UI
-2. PDF is stored in S3 and a processing job is queued
-3. Extract Lambda reads the PDF and sends it directly to Claude 3.5 Sonnet
+1. An invoice arrives by **email** (Amazon SES → S3 `raw/`) or **web upload** (→ S3 `uploads/`)
+2. An ingest Lambda records it in DynamoDB and queues a processing job (SQS)
+3. The Extract Lambda sends the PDF directly to Claude Sonnet 4.6
 4. Claude visually analyzes the document and extracts structured data
 5. Results are validated, confidence-scored, and stored in DynamoDB
-6. User can view extracted data and download Oracle Fusion format
+6. Admins sign in to the console (Cognito) to review stats/audit, and can export any invoice as a NetSuite vendor bill
 
 ### Components
 
-- **Frontend**: Static HTML/JS/CSS hosted on S3 + CloudFront
-- **API Lambda**: Handles uploads, downloads, list, delete, and Oracle Fusion transformation
-- **Upload Ingest Lambda**: Triggered by S3 events, creates DynamoDB records
-- **Extract Lambda**: Sends PDFs to Claude 3.5 Sonnet, validates and stores results
-- **DynamoDB**: Stores invoice metadata and extracted JSON
-- **SQS**: Queues extraction jobs with DLQ for failed processing
+- **Admin UI**: Static PWA (S3 + CloudFront) — Cognito hosted-UI login, dashboard (stats / success rate / trend), and a DynamoDB audit view
+- **Cognito**: User pool + JWT authorizer protecting every API route
+- **API Lambda**: Authenticated endpoints — list, **stats**, detail, download, delete, upload, and NetSuite export
+- **Ingest Lambda**: Parses inbound SES email (S3 `raw/`) and queues attachments
+- **Upload Ingest Lambda**: Handles web uploads (S3 `uploads/`)
+- **Extract Lambda**: Sends PDFs to Claude Sonnet 4.6, validates and stores results
+- **DynamoDB**: Stores invoice metadata and extracted JSON (PITR enabled)
+- **SQS**: Queues extraction jobs with a DLQ + CloudWatch alarms
 
 ## Quick Start
 
@@ -87,8 +88,19 @@ export const config = {
   memberAccountEmail: "your-email@company.com",
   memberAccountName: "invoice-extractor",
   managementAccountId: "YOUR_MGMT_ACCOUNT_ID",
-  region: "eu-central-1",
+
+  // Deploy region. For the email path this MUST support SES inbound receiving
+  // (e.g. us-east-1, us-west-2, eu-west-1). eu-central-1 does NOT.
+  region: "eu-west-1",
   projectPrefix: "invoice-extractor",
+
+  // Bedrock extraction model — a cross-region inference profile whose geo prefix
+  // (us./eu./jp./au./global.) matches `region`.
+  bedrockModelId: "eu.anthropic.claude-sonnet-4-6",
+
+  maxUploadBytes: 10 * 1024 * 1024,   // max invoice attachment size (bytes)
+  dataRetentionDays: 90,              // DynamoDB TTL / attachment retention
+  extractReservedConcurrency: 5,      // cap on concurrent Bedrock calls (cost control)
 };
 ```
 
@@ -98,66 +110,74 @@ cd infra
 npx cdk deploy InvoiceExtractorStack --context stacks=InvoiceExtractorStack
 ```
 
-4. **Access the UI**:
-   - The deployment outputs a CloudFront URL
-   - Open in browser and start uploading invoices
+4. **Create an admin user & sign in**:
+   - Create a user in the Cognito user pool (stack output `UserPoolId`) — self-signup is disabled
+   - Open the CloudFront URL (output `FrontendUrl`), sign in via the Cognito hosted UI, and you land on the dashboard
 
 ## Usage
 
-### Upload Invoice
-1. Navigate to the web UI
-2. Click "Choose File" and select a PDF invoice
-3. Click "Upload"
-4. Wait for processing (typically 5-15 seconds)
+### Sign in
+The admin console is protected by Amazon Cognito. Open the CloudFront URL and sign in via the
+hosted UI; the app stores the returned id token and sends it as a bearer token on every API call.
 
-### Review Extracted Data
-- View list of processed invoices
-- Click an invoice to see:
-  - PDF preview
-  - Extracted JSON data
-  - Confidence score
-  - Any warnings
+### Dashboard
+- KPI cards: total ingested, success rate, completed / failed / pending, average confidence
+- 30-day ingestion trend (ingested vs completed vs failed)
+- Recent failures, each linking straight to the record
 
-### Get Oracle Fusion Format
+### Audit (browse DynamoDB)
+- Filter by status and search by vendor / subject / sender / invoice number
+- Open any record for full metadata, the extracted JSON, a PDF download, and delete
+
+### Ingest invoices
+- **Email**: send to the SES-verified address (lands in S3 `raw/` and is processed automatically)
+- **Upload**: use the Upload action in the console (presigned PUT to S3 `uploads/`)
+
+### Export to NetSuite
+For any invoice, build the NetSuite vendor-bill payload (authenticated):
 ```bash
-curl https://your-api-url/invoices/{messageId}/{attachmentId}/oracle-fusion
+curl -H "Authorization: Bearer <id_token>" \
+  https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite
 ```
+Returns `{ netsuiteFormat, warnings, validation, originalExtraction }`. See the
+[NetSuite Integration Guide](NETSUITE-INTEGRATION.md) to enable live push.
 
-Returns Oracle Fusion-compatible JSON ready for import.
+## NetSuite Integration
 
-## Oracle Fusion Integration
-
-The system includes built-in Oracle Fusion Cloud Payables compatibility:
+Extracted invoices map to NetSuite Accounts Payable **vendor bills**. The transform, OAuth 2.0
+(M2M) client, SuiteQL resolver, and idempotent upsert are implemented; the API is **export-only**
+today (it builds + validates the payload), and live push is a credentials + sandbox-validation step.
 
 ### Features
-- Automatic transformation to `payablesInterfaceInvoices` format
-- Configurable supplier mapping
-- Default accounting distribution
-- Validation before import
+- Transform extracted JSON → NetSuite REST `vendorBill` payload (expense sublist)
+- Configurable crosswalks (vendor / GL account / currency / department / class / terms → internal ids)
+- OAuth 2.0 M2M (JWT client-assertion) client, SuiteQL resolver, idempotent `eid:` upsert
+- Validation + gross-vs-net reconciliation before import
 
 ### Configuration
 
-Edit `backend/oracle-fusion-config.json`:
+Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
 
 ```json
 {
-  "source": "INVOICE_EXTRACTOR",
-  "businessUnit": "Your Business Unit",
-  "supplierMapping": {
-    "Vendor Name": {
-      "supplierNumber": "VENDOR-001",
-      "supplierSite": "MAIN"
-    }
-  },
-  "defaultDistribution": {
-    "account": "5000",
-    "costCenter": "100",
-    "department": "IT"
+  "subsidiaryId": "",
+  "apAccountId": "",
+  "defaults": { "departmentId": "", "classId": "", "locationId": "", "taxCodeId": "" },
+  "crosswalks": {
+    "vendorsByTaxId": { "VAT123456": "4521" },
+    "vendorsByName": {},
+    "accountsByCode": { "5000": "212" },
+    "currenciesByCode": { "USD": "1", "EUR": "4" },
+    "departmentsByCode": {},
+    "classesByCode": {},
+    "termsByName": { "Net 30": "5" }
   }
 }
 ```
 
-See [Oracle Fusion Integration Guide](ORACLE-FUSION-INTEGRATION.md) for complete documentation.
+NetSuite OAuth 2.0 credentials live in AWS Secrets Manager (`NETSUITE_SECRET_ARN`), not in this file.
+
+See [NetSuite Integration Guide](NETSUITE-INTEGRATION.md) for setup, field mapping, and the sandbox-validation checklist.
 
 ## Deployment Guide
 
@@ -172,49 +192,77 @@ npx cdk deploy InvoiceExtractorStack
 
 ### Multi-Account Deployment (Organizations)
 
-See [DEPLOYMENT-NOTES.md](DEPLOYMENT-NOTES.md) for detailed instructions.
+For an AWS Organizations setup, set `managementAccountId` / `memberAccount*` in
+`infra/lib/config.ts`, then deploy the helper stacks before the workload stack. The
+`stacks` context selects which stack(s) to act on (see `infra/bin/app.ts`):
+
+```bash
+cd infra
+# (optional) create the member/workload account under the org
+npx cdk deploy OrgAccountStack --context stacks=OrgAccountStack
+# bootstrap the member account for CDK
+npx cdk deploy MemberBootstrapStack --context stacks=MemberBootstrapStack
+# deploy the workload into the member account
+npx cdk deploy InvoiceExtractorStack --context stacks=InvoiceExtractorStack
+```
 
 ## Configuration
 
-### Environment Variables
+### `infra/lib/config.ts`
 
-**Extract Lambda**:
-- `BEDROCK_MODEL_ID`: AI model (default: `anthropic.claude-3-5-sonnet-20240620-v1:0`)
+All deploy-time choices live in one file and are threaded into the stack and the Lambda
+environment variables:
 
-**API Lambda**:
-- `MAX_UPLOAD_BYTES`: Max file size (default: 10MB)
+| Field | Purpose |
+|---|---|
+| `region` | AWS region. Must support SES inbound receiving if you use the email path (eu-central-1 does not). |
+| `projectPrefix` | Prefix for all resource names (lowercase, DNS-safe). |
+| `bedrockModelId` | Bedrock model id (cross-region inference profile); its geo prefix must match `region`. |
+| `maxUploadBytes` | Max invoice attachment size (default 10 MiB). |
+| `dataRetentionDays` | DynamoDB TTL + attachment retention in days (default 90). |
+| `extractReservedConcurrency` | Cap on concurrent Bedrock invocations (cost control; tune to your account quota). |
+| `managementAccountId` / `memberAccount*` | AWS Organizations multi-account settings. |
 
 ### Cost Controls
 
 - **CloudWatch Logs**: 2-week retention
-- **DynamoDB TTL**: 90 days (configurable)
+- **DynamoDB TTL**: `dataRetentionDays` (default 90)
 - **S3 Lifecycle**: Transition to IA after 30 days
-- **Lambda Reserved Concurrency**: Limit extraction Lambda to control Bedrock costs
+- **Reserved Concurrency**: `extractReservedConcurrency` caps Bedrock spend
 
 ### Bedrock Model Access
 
-Ensure Claude 3.5 Sonnet access is enabled:
-1. Go to AWS Bedrock Console
+Ensure Claude Sonnet 4.6 access is enabled:
+1. Go to AWS Bedrock Console (in the deployment region, e.g. eu-west-1)
 2. Navigate to "Model access"
-3. Enable "Claude 3.5 Sonnet" (Anthropic)
+3. Enable "Claude Sonnet 4.6" (Anthropic)
+4. Confirm the cross-region inference profile is usable (the default model id is the EU geo profile `eu.anthropic.claude-sonnet-4-6`)
 
 ## API Reference
 
 ### Endpoints
+
+All endpoints require a Cognito JWT: `Authorization: Bearer <id_token>`.
 
 **List Invoices**
 ```
 GET /invoices?limit=25&nextToken=...
 ```
 
+**Dashboard Stats**
+```
+GET /stats
+```
+Returns totals, success rate, average confidence, a 30-day trend, and recent failures.
+
 **Get Invoice Detail**
 ```
 GET /invoices/{messageId}/{attachmentId}
 ```
 
-**Get Oracle Fusion Format**
+**Get NetSuite Format**
 ```
-GET /invoices/{messageId}/{attachmentId}/oracle-fusion
+GET /invoices/{messageId}/{attachmentId}/netsuite
 ```
 
 **Download PDF**
@@ -262,7 +310,7 @@ Body: { "filename": "invoice.pdf", "fileSize": 123456 }
   ],
   "meta": {
     "confidenceScore": 0.95,
-    "extractionModel": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "extractionModel": "eu.anthropic.claude-sonnet-4-6",
     "warnings": []
   }
 }
@@ -271,7 +319,7 @@ Body: { "filename": "invoice.pdf", "fileSize": 123456 }
 Notes:
 - `invoice.totalAmount` **includes tax** (gross).
 - `lineItems.unitPrice` and `lineItems.amount` are **pre-tax** (net).
-- `invoice.invoiceType` is "Standard" or "Prepayment" (for proforma invoices).
+- `invoice.invoiceType` is "Standard" or "Proforma".
 - Vendor names are preserved in original language/script (Japanese, Chinese, etc.).
 
 ## Monitoring
@@ -307,35 +355,37 @@ Common issues:
 
 ### Upload Fails
 
-- Check file size (max 10MB by default)
-- Ensure PDF format (not image or other format)
+- Check file size (default 10 MB; configurable via `maxUploadBytes` in `config.ts`)
+- Ensure PDF format (uploads must be PDF; the email path also accepts PNG/JPEG)
 - Check S3 bucket permissions
 
-### Oracle Fusion Transformation Errors
+### NetSuite Transformation Errors
 
-- Verify supplier mapping in `oracle-fusion-config.json`
-- Check business unit name matches Oracle exactly
-- Ensure all required fields are extracted
+- Verify the crosswalks in `netsuite-config.json` resolve vendor / account / currency to NetSuite internal ids
+- Check `subsidiaryId` / `apAccountId` match the target NetSuite account
+- Ensure all required fields are extracted (entity, tranDate, at least one expense line)
 
 ## Security
 
-- **No public S3 access**: All buckets use CloudFront OAI
-- **IAM least privilege**: Separate roles per Lambda
-- **SSL enforced**: All S3 buckets require SSL
-- **CORS configured**: API allows only necessary origins
-- **No authentication**: Add API Gateway authorizer for production
+- **Authentication**: Amazon Cognito user pool + JWT authorizer on every API route (invite-only, optional TOTP MFA)
+- **No public S3 access**: All buckets use CloudFront OAI; SSL enforced
+- **IAM least privilege**: Separate roles per Lambda; NetSuite credentials in Secrets Manager
+- **CORS**: API restricted to the CloudFront origin
+- **Data protection**: DynamoDB PITR, S3 versioning, and model-output PII kept out of logs
+- **Cost/abuse controls**: reserved concurrency on the Bedrock Lambda + email attachment validation
 
 ## Cost Estimate
 
 For 1,000 invoices/month:
 
 - **Lambda**: ~$5 (execution time)
-- **Bedrock (Claude 3.5 Sonnet)**: ~$15-25 (input/output tokens)
+- **Bedrock (Claude Sonnet 4.6)**: ~$15-25 (input/output tokens)
 - **DynamoDB**: ~$1 (on-demand)
 - **S3**: ~$1 (storage + requests)
 - **CloudFront**: ~$1 (data transfer)
+- **KMS + Secrets Manager**: ~$1-2
 
-**Total**: ~$23-33/month
+**Total**: ~$25-35/month
 
 ## Contributing
 
@@ -349,5 +399,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - [Project Structure](PROJECT-STRUCTURE.md)
 - [Bedrock Setup](BEDROCK-SETUP.md)
-- [Oracle Fusion Integration](ORACLE-FUSION-INTEGRATION.md)
-- [Oracle Fusion Quickstart](ORACLE-FUSION-QUICKSTART.md)
+- [NetSuite Integration](NETSUITE-INTEGRATION.md)

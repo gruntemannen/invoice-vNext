@@ -1,11 +1,10 @@
 /* Minimal PWA service worker for static assets. */
-const CACHE_NAME = "invoice-extractor-pwa-v2";
+const CACHE_NAME = "invoice-admin-pwa-v3";
 const ASSETS = [
   "/",
   "/index.html",
   "/styles.css",
   "/app.js",
-  "/config.json",
   "/favicon.svg",
   "/manifest.json",
 ];
@@ -36,6 +35,25 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+
+  // Runtime config is injected at deploy time and must never go stale.
+  // Network-first, fall back to cache only when offline.
+  if (url.pathname === "/config.json") {
+    event.respondWith(
+      (async () => {
+        try {
+          const res = await fetch(req, { cache: "no-store" });
+          const cache = await caches.open(CACHE_NAME);
+          cache.put(req, res.clone()).catch(() => {});
+          return res;
+        } catch {
+          const cached = await caches.match(req);
+          return cached ?? Response.error();
+        }
+      })()
+    );
+    return;
+  }
 
   // For navigations: network-first (fresh HTML), fallback to cache.
   if (req.mode === "navigate") {

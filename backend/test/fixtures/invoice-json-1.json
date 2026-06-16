@@ -5,7 +5,7 @@
     "from": "ap@acme.com",
     "subject": "Invoice INV-1001",
     "attachmentKey": "attachments/example-message-1/attachment.pdf",
-    "extractionModel": "amazon.nova-lite-v1:0",
+    "extractionModel": "eu.anthropic.claude-sonnet-4-6",
     "confidenceScore": 0.8,
     "warnings": []
   },

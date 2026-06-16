@@ -44,10 +44,10 @@ async function invokeOnce(modelId: string, prompt: string, documents: DocumentIn
   const response = await client.send(command);
   const text = parseResponse(response.body);
 
+  // Do not log response content — it contains extracted invoice PII/financial data.
   log.info("Bedrock response", {
     modelId,
     responseLength: text?.length ?? 0,
-    responseSnippet: text?.slice(0, 300) ?? "empty",
   });
 
   if (!text) {

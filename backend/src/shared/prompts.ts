@@ -14,7 +14,7 @@ Return ONLY valid JSON in this exact format:
 
 {
   "vendor": { "name": "seller name", "taxId": "VAT number or null", "address": "address or null" },
-  "invoice": { "invoiceNumber": "number", "purchaseOrderNumber": "PO number or null", "invoiceType": "Standard or Prepayment", "invoiceDate": "YYYY-MM-DD", "dueDate": "YYYY-MM-DD or null", "currency": "JPY/EUR/USD/etc", "totalAmount": 0.00, "taxAmount": 0.00 },
+  "invoice": { "invoiceNumber": "number", "purchaseOrderNumber": "PO number or null", "invoiceType": "Standard or Proforma", "invoiceDate": "YYYY-MM-DD", "dueDate": "YYYY-MM-DD or null", "currency": "JPY/EUR/USD/etc", "totalAmount": 0.00, "taxAmount": 0.00 },
   "lineItems": [{ "description": "item description", "quantity": 1, "unitPrice": 0.00, "amount": 0.00 }]
 }
 
@@ -30,7 +30,7 @@ Rules:
 - totalAmount = final amount including tax.
 - taxAmount = VAT/consumption tax amount.
 - lineItems amounts = pre-tax amounts.
-- For Proforma invoices, set invoiceType to "Prepayment".
+- For Proforma invoices, set invoiceType to "Proforma".
 - purchaseOrderNumber = only the PO code (no labels), null if not present.
 `;
 };

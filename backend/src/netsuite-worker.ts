@@ -1,6 +1,7 @@
 import { SQSEvent } from "aws-lambda";
 import { asNetSuitePushRequest, getAccessToken, upsertNetSuiteRecord } from "./shared/netsuite";
 import { loadNetSuiteSecret } from "./shared/netsuite-secret";
+import { environmentByName, getNetSuiteRuntimeSettings } from "./shared/netsuite-settings";
 import {
   getNetSuiteTransaction,
   markTransactionFailed,
@@ -36,14 +37,17 @@ export const handler = async (event: SQSEvent) => {
         throw new RetryableNetSuiteError("NetSuite live push is disabled; transaction remains replayable.");
       }
 
-      const secret = await loadNetSuiteSecret(NETSUITE_SECRET_ARN);
-      const token = await getAccessToken(secret);
       const request = asNetSuitePushRequest(transaction.requestPayload, transaction.externalId);
+      const runtimeSettings = await getNetSuiteRuntimeSettings(TABLE_NAME);
+      const endpoint = environmentByName(runtimeSettings, request.environment);
+      const secret = await loadNetSuiteSecret(endpoint.secretArn || NETSUITE_SECRET_ARN);
+      const token = await getAccessToken(secret, endpoint);
       const result = await upsertNetSuiteRecord(
         secret,
         token,
         request,
-        transaction.externalId
+        transaction.externalId,
+        endpoint
       );
 
       await markTransactionSucceeded(TABLE_NAME, transactionId, result);

@@ -23,6 +23,9 @@ const state = {
   loadingMore: false,
   // detail drawer
   currentDetail: null,
+  // configuration
+  netSuiteSettings: null,
+  netSuiteSettingsLoaded: false,
 };
 
 const TOKEN_KEY = "invoice_admin_id_token";
@@ -326,7 +329,7 @@ function toast(message, kind = "info") {
    NAVIGATION
    ===================================================================== */
 
-const VIEW_TITLES = { dashboard: "Dashboard", audit: "Audit", upload: "Upload" };
+const VIEW_TITLES = { dashboard: "Dashboard", audit: "Audit", upload: "Upload", config: "Configuration" };
 
 function switchView(view) {
   document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
@@ -340,6 +343,7 @@ function switchView(view) {
 
   if (view === "dashboard") loadStats();
   if (view === "audit" && state.invoices.length === 0) loadInvoices(true);
+  if (view === "config" && !state.netSuiteSettingsLoaded) loadNetSuiteSettings();
 }
 
 /* ========================================================================
@@ -785,6 +789,207 @@ async function logNetSuiteTransaction(messageId, attachmentId) {
   }
 }
 
+/* ========================================================================
+   CONFIGURATION
+   ===================================================================== */
+
+const NS_ENVS = [
+  ["test", "Test"],
+  ["prod", "Prod"],
+];
+
+const NS_FIELDS = [
+  ["accountId", "Account ID"],
+  ["restApiBaseUrl", "REST API base URL"],
+  ["tokenEndpointUrl", "OAuth token endpoint"],
+  ["secretArn", "Secret ARN/name"],
+  ["oauthScope", "OAuth scope"],
+  ["recordApiPath", "Record API path"],
+  ["suiteqlPath", "SuiteQL path"],
+  ["vendorBillRecordId", "Vendor bill record"],
+  ["vendorPrepaymentRecordId", "Vendor prepayment record"],
+  ["requestTimeoutMs", "Timeout ms", "number"],
+];
+
+function defaultNetSuiteEnv(label) {
+  return {
+    label,
+    accountId: "",
+    restApiBaseUrl: "",
+    tokenEndpointUrl: "",
+    secretArn: "",
+    oauthScope: "rest_webservices",
+    recordApiPath: "/record/v1",
+    suiteqlPath: "/query/v1/suiteql",
+    vendorBillRecordId: "vendorBill",
+    vendorPrepaymentRecordId: "vendorPrepayment",
+    requestTimeoutMs: 30000,
+    suiteTaxEnabled: false,
+    allowTranId: true,
+  };
+}
+
+function normalizeNetSuiteSettings(raw) {
+  const settings = raw || {};
+  return {
+    activeEnvironment: settings.activeEnvironment === "prod" ? "prod" : "test",
+    environments: {
+      test: Object.assign(defaultNetSuiteEnv("Test"), settings.environments?.test || {}),
+      prod: Object.assign(defaultNetSuiteEnv("Prod"), settings.environments?.prod || {}),
+    },
+    updatedAt: settings.updatedAt,
+    updatedBy: settings.updatedBy,
+  };
+}
+
+async function loadNetSuiteSettings() {
+  const errBox = $("config-error");
+  errBox.classList.add("hidden");
+  $("netsuite-config-status").textContent = "Loading...";
+  try {
+    const res = await apiFetch("/config/netsuite");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || `Configuration request failed (${res.status})`);
+    state.netSuiteSettings = normalizeNetSuiteSettings(data);
+    state.netSuiteSettingsLoaded = true;
+    renderNetSuiteSettings();
+    $("netsuite-config-status").textContent = state.netSuiteSettings.updatedAt
+      ? `Last saved ${fmtDate(state.netSuiteSettings.updatedAt)}`
+      : "";
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    errBox.textContent = "Could not load NetSuite configuration.";
+    errBox.classList.remove("hidden");
+    $("netsuite-config-status").textContent = "";
+  }
+}
+
+function renderNetSuiteSettings() {
+  const settings = normalizeNetSuiteSettings(state.netSuiteSettings);
+  $("netsuite-active-env").value = settings.activeEnvironment;
+  $("netsuite-config-envs").innerHTML = NS_ENVS.map(([env, label]) =>
+    renderNetSuiteEnvironment(env, settings.environments[env] || defaultNetSuiteEnv(label))
+  ).join("");
+
+  NS_ENVS.forEach(([env]) => {
+    $(`ns-${env}-defaults`).onclick = () => applyNetSuiteEndpointDefaults(env);
+  });
+}
+
+function renderNetSuiteEnvironment(env, values) {
+  const fields = NS_FIELDS.map(([key, label, type]) => {
+    const value = values[key] ?? "";
+    return `
+      <label class="field">
+        <span>${escapeHtml(label)}</span>
+        <input id="${escapeHtml(nsFieldId(env, key))}" type="${type || "text"}" value="${escapeHtml(value)}" />
+      </label>
+    `;
+  }).join("");
+
+  return `
+    <div class="config-env">
+      <div class="config-env-head">
+        <h3>${escapeHtml(values.label || env)}</h3>
+        <button id="ns-${escapeHtml(env)}-defaults" class="button secondary small" type="button">Use account defaults</button>
+      </div>
+      <div class="form-grid">
+        ${fields}
+        <label class="field check-row">
+          <input id="${escapeHtml(nsFieldId(env, "suiteTaxEnabled"))}" type="checkbox" ${values.suiteTaxEnabled ? "checked" : ""} />
+          <span>SuiteTax enabled</span>
+        </label>
+        <label class="field check-row">
+          <input id="${escapeHtml(nsFieldId(env, "allowTranId"))}" type="checkbox" ${values.allowTranId !== false ? "checked" : ""} />
+          <span>Allow tranId</span>
+        </label>
+      </div>
+    </div>
+  `;
+}
+
+function nsFieldId(env, key) {
+  return `ns-${env}-${key}`;
+}
+
+function deriveNetSuiteEndpointDefaults(accountId) {
+  const clean = String(accountId || "").trim().replace(/_/g, "-").toLowerCase();
+  if (!clean) return { restApiBaseUrl: "", tokenEndpointUrl: "" };
+  const restApiBaseUrl = `https://${clean}.suitetalk.api.netsuite.com/services/rest`;
+  return {
+    restApiBaseUrl,
+    tokenEndpointUrl: `${restApiBaseUrl}/auth/oauth2/v1/token`,
+  };
+}
+
+function applyNetSuiteEndpointDefaults(env) {
+  const accountId = $(nsFieldId(env, "accountId")).value;
+  const derived = deriveNetSuiteEndpointDefaults(accountId);
+  if (derived.restApiBaseUrl) $(nsFieldId(env, "restApiBaseUrl")).value = derived.restApiBaseUrl;
+  if (derived.tokenEndpointUrl) $(nsFieldId(env, "tokenEndpointUrl")).value = derived.tokenEndpointUrl;
+  $(nsFieldId(env, "recordApiPath")).value = $(nsFieldId(env, "recordApiPath")).value || "/record/v1";
+  $(nsFieldId(env, "suiteqlPath")).value = $(nsFieldId(env, "suiteqlPath")).value || "/query/v1/suiteql";
+  $(nsFieldId(env, "oauthScope")).value = $(nsFieldId(env, "oauthScope")).value || "rest_webservices";
+  $(nsFieldId(env, "vendorBillRecordId")).value = $(nsFieldId(env, "vendorBillRecordId")).value || "vendorBill";
+  $(nsFieldId(env, "vendorPrepaymentRecordId")).value =
+    $(nsFieldId(env, "vendorPrepaymentRecordId")).value || "vendorPrepayment";
+}
+
+function collectNetSuiteSettings() {
+  const environments = {};
+  NS_ENVS.forEach(([env, label]) => {
+    const current = { label };
+    NS_FIELDS.forEach(([key, , type]) => {
+      const raw = $(nsFieldId(env, key)).value.trim();
+      current[key] = type === "number" ? Number(raw || 0) : raw;
+    });
+    current.suiteTaxEnabled = $(nsFieldId(env, "suiteTaxEnabled")).checked;
+    current.allowTranId = $(nsFieldId(env, "allowTranId")).checked;
+    environments[env] = current;
+  });
+  return {
+    activeEnvironment: $("netsuite-active-env").value === "prod" ? "prod" : "test",
+    environments,
+  };
+}
+
+async function saveNetSuiteSettings() {
+  const saveBtn = $("netsuite-save");
+  const spinner = $("netsuite-config-spinner");
+  const status = $("netsuite-config-status");
+  const errBox = $("config-error");
+  try {
+    saveBtn.disabled = true;
+    spinner.classList.remove("hidden");
+    status.textContent = "Saving...";
+    errBox.classList.add("hidden");
+
+    const res = await apiFetch("/config/netsuite", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(collectNetSuiteSettings()),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || `Save failed (${res.status})`);
+    state.netSuiteSettings = normalizeNetSuiteSettings(data);
+    state.netSuiteSettingsLoaded = true;
+    renderNetSuiteSettings();
+    status.textContent = `Saved ${fmtDate(state.netSuiteSettings.updatedAt)}`;
+    toast("NetSuite configuration saved.", "success");
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    errBox.textContent = "Could not save NetSuite configuration.";
+    errBox.classList.remove("hidden");
+    status.textContent = "";
+    toast("Configuration save failed.", "error");
+  } finally {
+    saveBtn.disabled = false;
+    spinner.classList.add("hidden");
+  }
+}
+
 async function deleteInvoice(messageId, attachmentId) {
   if (!window.confirm("Delete this invoice and its uploaded PDF? This cannot be undone.")) return;
   try {
@@ -972,6 +1177,7 @@ function wireEvents() {
     const active = document.querySelector(".nav-item.active");
     const view = active ? active.dataset.view : "dashboard";
     if (view === "audit") loadInvoices(true);
+    else if (view === "config") loadNetSuiteSettings();
     else loadStats();
   };
 
@@ -998,6 +1204,7 @@ function wireEvents() {
 
   // Upload
   $("upload-btn").onclick = uploadInvoice;
+  $("netsuite-save").onclick = saveNetSuiteSettings;
   const dz = $("dropzone");
   const fileInput = $("file-input");
   ["dragenter", "dragover"].forEach((ev) =>

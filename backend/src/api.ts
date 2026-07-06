@@ -12,6 +12,12 @@ import {
   type NetSuiteConfig,
 } from "./shared/netsuite";
 import { loadNetSuiteConfig } from "./shared/netsuite-config";
+import {
+  activeNetSuiteEnvironment,
+  getNetSuiteRuntimeSettings,
+  saveNetSuiteRuntimeSettings,
+  type NetSuiteRuntimeSettings,
+} from "./shared/netsuite-settings";
 import { assessInvoiceFlow } from "./shared/flow";
 import {
   canReplay,
@@ -46,6 +52,12 @@ export const handler = async (
   }
   if (path === "/upload" && event.requestContext.http.method === "POST") {
     return createUpload(event);
+  }
+  if (path === "/config/netsuite" && event.requestContext.http.method === "GET") {
+    return getNetSuiteSettings();
+  }
+  if (path === "/config/netsuite" && event.requestContext.http.method === "POST") {
+    return updateNetSuiteSettings(event);
   }
   if (path === "/netsuite/transactions" && event.requestContext.http.method === "GET") {
     return listNetSuiteTransactionLog(event);
@@ -139,11 +151,15 @@ async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
   }
 
   try {
-    const preview = buildNetSuitePreview(item);
+    const preview = await buildNetSuitePreview(item);
 
     return jsonResponse({
       netsuiteFormat: preview.bill,
       netSuiteRequest: preview.request,
+      netSuiteEnvironment: {
+        activeEnvironment: preview.runtimeSettings.activeEnvironment,
+        endpoint: preview.activeEnvironment,
+      },
       warnings: preview.warnings,
       configurationHints: preview.configurationHints,
       validation: preview.validation,
@@ -173,7 +189,7 @@ async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2
   }
 
   try {
-    const preview = buildNetSuitePreview(item);
+    const preview = await buildNetSuitePreview(item);
     let status: NetSuiteTransactionStatus = "QUEUED";
     let eventMessage = "Transaction logged and queued for NetSuite push.";
 
@@ -236,6 +252,22 @@ async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2
     });
     return jsonResponse({ message: "Failed to log NetSuite transaction" }, 500);
   }
+}
+
+async function getNetSuiteSettings() {
+  return jsonResponse(await getNetSuiteRuntimeSettings(TABLE_NAME));
+}
+
+async function updateNetSuiteSettings(event: APIGatewayProxyEventV2) {
+  let body: unknown;
+  try {
+    body = event.body ? JSON.parse(event.body) : {};
+  } catch {
+    return jsonResponse({ message: "Invalid request body" }, 400);
+  }
+
+  const settings = await saveNetSuiteRuntimeSettings(TABLE_NAME, body, actorFromEvent(event));
+  return jsonResponse(settings);
 }
 
 async function listNetSuiteTransactionLog(event: APIGatewayProxyEventV2) {
@@ -412,17 +444,22 @@ async function findByAttachmentId(messageId: string, attachmentId: string) {
   return res.Items?.[0] ?? null;
 }
 
-function buildNetSuitePreview(item: any): {
+async function buildNetSuitePreview(item: any): Promise<{
   config: NetSuiteConfig;
+  runtimeSettings: NetSuiteRuntimeSettings;
+  activeEnvironment: ReturnType<typeof activeNetSuiteEnvironment>;
   bill: ReturnType<typeof transformToNetSuite>["bill"];
   request: ReturnType<typeof transformToNetSuite>["request"];
   warnings: string[];
   configurationHints: ReturnType<typeof buildNetSuiteConfigurationHints>;
   validation: ReturnType<typeof validateNetSuiteRequest>;
   flow: ReturnType<typeof assessInvoiceFlow>;
-} {
+}> {
   const config = loadNetSuiteConfig();
+  const runtimeSettings = await getNetSuiteRuntimeSettings(TABLE_NAME);
+  const activeEnvironment = activeNetSuiteEnvironment(runtimeSettings);
   const { bill, request, warnings } = transformToNetSuite(item.extractedJson, config);
+  request.environment = runtimeSettings.activeEnvironment;
   const configurationHints = buildNetSuiteConfigurationHints(item.extractedJson, config);
   const validation = validateNetSuiteRequest(request, config);
   const flow = assessInvoiceFlow(item.extractedJson, {
@@ -433,7 +470,7 @@ function buildNetSuitePreview(item: any): {
     netSuiteValidationErrors: validation.errors,
   });
 
-  return { config, bill, request, warnings, configurationHints, validation, flow };
+  return { config, runtimeSettings, activeEnvironment, bill, request, warnings, configurationHints, validation, flow };
 }
 
 async function enqueueNetSuiteTransaction(transactionId: string) {
@@ -476,6 +513,11 @@ function jsonResponse(body: any, statusCode = 200): APIGatewayProxyResultV2 {
     },
     body: JSON.stringify(body),
   };
+}
+
+function actorFromEvent(event: APIGatewayProxyEventV2): string | undefined {
+  const claims = (event.requestContext as any)?.authorizer?.jwt?.claims ?? {};
+  return claims.email || claims["cognito:username"] || claims.sub;
 }
 
 function withDerivedFlow(item: any) {

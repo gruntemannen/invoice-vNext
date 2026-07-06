@@ -780,6 +780,82 @@ h3 {
   font-size: 13.5px;
 }
 
+/* --------------------------- Configuration ---------------------------- */
+.config-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.config-envs {
+  display: grid;
+  gap: 18px;
+}
+.config-env {
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.config-env:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+.config-env-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.config-env-head h3 {
+  font-size: 15px;
+  font-weight: 700;
+}
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12.5px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.inline-field {
+  min-width: 150px;
+}
+.field input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--text);
+}
+.field input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 40px;
+  color: var(--text);
+}
+.check-row input {
+  width: 16px;
+  height: 16px;
+}
+.config-status-row {
+  margin-top: 16px;
+}
+
 /* ------------------------------ Drawer -------------------------------- */
 .drawer-overlay {
   position: fixed;

@@ -43,6 +43,9 @@
           <button class="nav-item" data-view="upload">
             <span class="nav-ico" aria-hidden="true">↥</span> Upload
           </button>
+          <button class="nav-item" data-view="config">
+            <span class="nav-ico" aria-hidden="true">Cfg</span> Config
+          </button>
         </nav>
 
         <div class="sidebar-foot">
@@ -167,6 +170,39 @@
                   <div id="upload-spinner" class="spinner small hidden" aria-label="Working"></div>
                   <div id="upload-status" class="status-text"></div>
                 </div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ============ CONFIGURATION ============ -->
+          <section id="view-config" class="view hidden">
+            <div id="config-error" class="banner error hidden"></div>
+
+            <div class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>NetSuite configuration</h2>
+                  <p class="muted">Endpoint settings for Test and Prod.</p>
+                </div>
+                <div class="config-actions">
+                  <label class="field inline-field">
+                    <span>Active</span>
+                    <select id="netsuite-active-env" class="select">
+                      <option value="test">Test</option>
+                      <option value="prod">Prod</option>
+                    </select>
+                  </label>
+                  <button id="netsuite-save" class="button">Save</button>
+                </div>
+              </div>
+
+              <div id="netsuite-config-envs" class="config-envs">
+                <div class="empty">Loading configuration...</div>
+              </div>
+
+              <div class="status-row config-status-row" aria-live="polite">
+                <div id="netsuite-config-spinner" class="spinner small hidden" aria-label="Working"></div>
+                <div id="netsuite-config-status" class="status-text"></div>
               </div>
             </div>
           </section>

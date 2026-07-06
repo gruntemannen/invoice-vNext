@@ -223,7 +223,14 @@ Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
 }
 ```
 
-NetSuite OAuth 2.0 credentials live in AWS Secrets Manager (`NETSUITE_SECRET_ARN`), not in this file.
+NetSuite environment endpoints are configured in the admin console under **Config**. Test and
+Prod each have their own account id, REST base URL, OAuth token endpoint, optional Secrets
+Manager ARN/name override, OAuth scope, REST paths, record ids, timeout, SuiteTax flag, and
+`tranId` option. These runtime settings are stored in DynamoDB so they can be changed without a
+deployment. If an environment-specific secret is blank, the worker falls back to
+`NETSUITE_SECRET_ARN`.
+
+NetSuite OAuth 2.0 credentials live in AWS Secrets Manager, not in `netsuite-config.json`.
 
 See [NetSuite Integration Guide](NETSUITE-INTEGRATION.md) for setup, field mapping, and the sandbox-validation checklist.
 

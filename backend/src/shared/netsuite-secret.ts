@@ -2,13 +2,14 @@ import { GetSecretValueCommand, SecretsManagerClient } from "@aws-sdk/client-sec
 import type { NetSuiteSecret } from "./netsuite";
 
 const secrets = new SecretsManagerClient({});
-let cached: NetSuiteSecret | null = null;
+const cache = new Map<string, NetSuiteSecret>();
 
 export async function loadNetSuiteSecret(secretArn: string): Promise<NetSuiteSecret> {
-  if (cached) return cached;
   if (!secretArn) {
     throw new Error("NETSUITE_SECRET_ARN is not configured");
   }
+  const cached = cache.get(secretArn);
+  if (cached) return cached;
 
   const res = await secrets.send(new GetSecretValueCommand({ SecretId: secretArn }));
   const raw = res.SecretString;
@@ -23,12 +24,13 @@ export async function loadNetSuiteSecret(secretArn: string): Promise<NetSuiteSec
     }
   }
 
-  cached = {
+  const secret: NetSuiteSecret = {
     accountId: String(parsed.accountId),
     clientId: String(parsed.clientId),
     certificateId: String(parsed.certificateId),
     privateKeyPem: String(parsed.privateKeyPem),
     alg: parsed.alg,
   };
-  return cached;
+  cache.set(secretArn, secret);
+  return secret;
 }

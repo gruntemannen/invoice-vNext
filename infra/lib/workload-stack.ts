@@ -554,6 +554,13 @@ export class InvoiceExtractorStack extends cdk.Stack {
     });
 
     httpApi.addRoutes({
+      path: "/config/netsuite",
+      methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("NetSuiteConfigIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
       path: "/invoices/{messageId}/{attachmentId}",
       methods: [apigwv2.HttpMethod.GET],
       integration: new apigwv2Integrations.HttpLambdaIntegration("DetailIntegration", apiFn),

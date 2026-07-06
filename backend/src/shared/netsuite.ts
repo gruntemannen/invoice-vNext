@@ -54,6 +54,22 @@ export interface NetSuiteSecret {
   alg: "PS256" | "RS256" | "ES256";
 }
 
+export type NetSuiteEnvironmentName = "test" | "prod";
+
+export interface NetSuiteConnectionOptions {
+  accountId?: string;
+  restApiBaseUrl?: string;
+  tokenEndpointUrl?: string;
+  recordApiPath?: string;
+  suiteqlPath?: string;
+  oauthScope?: string;
+  requestTimeoutMs?: number;
+  vendorBillRecordId?: string;
+  vendorPrepaymentRecordId?: string;
+  suiteTaxEnabled?: boolean;
+  allowTranId?: boolean;
+}
+
 /**
  * Non-secret configuration: defaults + crosswalks that map the extractor's
  * human-readable codes/names to NetSuite internal ids.
@@ -243,6 +259,7 @@ export interface NetSuiteDocumentClassification {
  */
 export interface NetSuitePushRequest {
   schemaVersion: "netsuite-ap-v1";
+  environment?: NetSuiteEnvironmentName;
   recordType: NetSuiteRecordType;
   restRecordId: NetSuiteRecordType;
   operation: "upsertByExternalId";
@@ -1058,6 +1075,10 @@ export function validateNetSuiteRequest(
 
 const CLIENT_ASSERTION_TYPE =
   "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+const DEFAULT_OAUTH_SCOPE = "rest_webservices";
+const DEFAULT_RECORD_API_PATH = "/record/v1";
+const DEFAULT_SUITEQL_PATH = "/query/v1/suiteql";
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 function base64url(input: Buffer | string): string {
   const buf = typeof input === "string" ? Buffer.from(input, "utf8") : input;
@@ -1068,12 +1089,81 @@ function base64url(input: Buffer | string): string {
     .replace(/=+$/g, "");
 }
 
-function tokenEndpoint(accountId: string): string {
-  return `https://${accountId}.suitetalk.api.netsuite.com/services/rest/auth/oauth2/v1/token`;
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
 }
 
-function restBase(accountId: string): string {
-  return `https://${accountId}.suitetalk.api.netsuite.com/services/rest`;
+function leadingSlash(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+function connectionAccountId(secret: NetSuiteSecret, options?: NetSuiteConnectionOptions): string {
+  return String(options?.accountId || secret.accountId).trim();
+}
+
+export function deriveNetSuiteConnectionDefaults(accountId: string): {
+  restApiBaseUrl: string;
+  tokenEndpointUrl: string;
+} {
+  const cleanAccountId = String(accountId ?? "").trim().replace(/_/g, "-").toLowerCase();
+  if (!cleanAccountId) {
+    return { restApiBaseUrl: "", tokenEndpointUrl: "" };
+  }
+  const restApiBaseUrl = `https://${cleanAccountId}.suitetalk.api.netsuite.com/services/rest`;
+  return {
+    restApiBaseUrl,
+    tokenEndpointUrl: `${restApiBaseUrl}/auth/oauth2/v1/token`,
+  };
+}
+
+function tokenEndpoint(secret: NetSuiteSecret, options?: NetSuiteConnectionOptions): string {
+  if (options?.tokenEndpointUrl) return options.tokenEndpointUrl;
+  return deriveNetSuiteConnectionDefaults(connectionAccountId(secret, options)).tokenEndpointUrl;
+}
+
+function restBase(secret: NetSuiteSecret, options?: NetSuiteConnectionOptions): string {
+  if (options?.restApiBaseUrl) return trimTrailingSlash(options.restApiBaseUrl);
+  return deriveNetSuiteConnectionDefaults(connectionAccountId(secret, options)).restApiBaseUrl;
+}
+
+function oauthScope(options?: NetSuiteConnectionOptions): string[] {
+  const raw = options?.oauthScope || DEFAULT_OAUTH_SCOPE;
+  return raw
+    .split(/[,\s]+/)
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+}
+
+function recordApiPath(options?: NetSuiteConnectionOptions): string {
+  return leadingSlash(options?.recordApiPath || DEFAULT_RECORD_API_PATH);
+}
+
+function suiteqlPath(options?: NetSuiteConnectionOptions): string {
+  return leadingSlash(options?.suiteqlPath || DEFAULT_SUITEQL_PATH);
+}
+
+function recordIdFor(request: NetSuitePushRequest, options?: NetSuiteConnectionOptions): string {
+  if (request.recordType === "vendorPrepayment") {
+    return options?.vendorPrepaymentRecordId || request.restRecordId;
+  }
+  return options?.vendorBillRecordId || request.restRecordId;
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
+): Promise<Response> {
+  if (!timeoutMs || timeoutMs <= 0) return fetch(url, init);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /** Map our alg union to the node:crypto sign algorithm + optional RSA-PSS opts. */
@@ -1101,17 +1191,17 @@ function signerFor(alg: NetSuiteSecret["alg"]): {
 }
 
 /** Build and sign the JWT client assertion. */
-function buildClientAssertion(secret: NetSuiteSecret): string {
+function buildClientAssertion(secret: NetSuiteSecret, options?: NetSuiteConnectionOptions): string {
   const now = Math.floor(Date.now() / 1000);
   const header = {
     alg: secret.alg,
     typ: "JWT",
     kid: secret.certificateId,
   };
-  const aud = tokenEndpoint(secret.accountId);
+  const aud = tokenEndpoint(secret, options);
   const claims = {
     iss: secret.clientId,
-    scope: ["rest_webservices"],
+    scope: oauthScope(options),
     aud,
     iat: now,
     exp: now + 180, // a few minutes; NetSuite caps assertion lifetime
@@ -1160,26 +1250,30 @@ const tokenCache = new Map<string, CachedToken>();
  * Cached in module scope until ~30s before expiry. NetSuite tokens are typically
  * valid ~1h; we honor the returned expires_in.
  */
-export async function getAccessToken(secret: NetSuiteSecret): Promise<string> {
-  const cacheKey = `${secret.accountId}:${secret.clientId}`;
+export async function getAccessToken(
+  secret: NetSuiteSecret,
+  options?: NetSuiteConnectionOptions
+): Promise<string> {
+  const endpoint = tokenEndpoint(secret, options);
+  const cacheKey = `${connectionAccountId(secret, options)}:${secret.clientId}:${endpoint}:${oauthScope(options).join(" ")}`;
   const cached = tokenCache.get(cacheKey);
   const now = Date.now();
   if (cached && cached.expiresAt - 30_000 > now) {
     return cached.token;
   }
 
-  const assertion = buildClientAssertion(secret);
+  const assertion = buildClientAssertion(secret, options);
   const body = new URLSearchParams({
     grant_type: "client_credentials",
     client_assertion_type: CLIENT_ASSERTION_TYPE,
     client_assertion: assertion,
   });
 
-  const res = await fetch(tokenEndpoint(secret.accountId), {
+  const res = await fetchWithTimeout(endpoint, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: body.toString(),
-  });
+  }, options?.requestTimeoutMs);
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -1218,9 +1312,10 @@ export interface SuiteQLResult {
 export async function suiteql(
   secret: NetSuiteSecret,
   token: string,
-  q: string
+  q: string,
+  options?: NetSuiteConnectionOptions
 ): Promise<SuiteQLResult> {
-  const res = await fetch(`${restBase(secret.accountId)}/query/v1/suiteql`, {
+  const res = await fetchWithTimeout(`${restBase(secret, options)}${suiteqlPath(options)}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${token}`,
@@ -1228,7 +1323,7 @@ export async function suiteql(
       prefer: "transient",
     },
     body: JSON.stringify({ q }),
-  });
+  }, options?.requestTimeoutMs);
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -1321,21 +1416,22 @@ export async function upsertNetSuiteRecord(
   secret: NetSuiteSecret,
   token: string,
   request: NetSuitePushRequest,
-  externalId: string = request.externalId
+  externalId: string = request.externalId,
+  options?: NetSuiteConnectionOptions
 ): Promise<UpsertResult> {
   const safeEid = sanitizeIdPart(externalId).slice(0, EXTERNAL_ID_MAX);
-  const url = `${restBase(secret.accountId)}/record/v1/${request.restRecordId}/eid:${encodeURIComponent(
+  const url = `${restBase(secret, options)}${recordApiPath(options)}/${recordIdFor(request, options)}/eid:${encodeURIComponent(
     safeEid
   )}`;
 
-  const res = await fetch(url, {
+  const res = await fetchWithTimeout(url, {
     method: "PUT",
     headers: {
       authorization: `Bearer ${token}`,
       "content-type": "application/json",
     },
     body: JSON.stringify(request.payload),
-  });
+  }, options?.requestTimeoutMs);
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");

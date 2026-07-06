@@ -105,6 +105,19 @@ keeps the invoice in review.
 
 Edit `backend/netsuite-config.json`. It contains non-secret values only.
 
+Configure NetSuite endpoints in the admin console under **Config**. The UI stores Test and
+Prod runtime settings in DynamoDB:
+
+- account id, REST API base URL, OAuth token endpoint
+- optional per-environment Secrets Manager ARN/name
+- OAuth scope, Record API path, SuiteQL path
+- vendor bill and vendor prepayment record ids
+- request timeout, SuiteTax enabled, and `tranId` allowed options
+
+The "Use account defaults" action derives the standard account-specific REST host from the
+account id; sandbox ids with underscores are converted to NetSuite's lower-case hyphen host
+format. Explicit endpoint fields always win.
+
 Required before live vendor-bill push:
 
 - `vendorsByTaxId` or `vendorsByName`
@@ -121,7 +134,9 @@ Required before live proforma/prepayment push:
 - NetSuite role permissions for Vendor Prepayment create/edit
 - optional `prepaymentAccountId` if the default prepayment account is not enough
 
-Credentials live in Secrets Manager under `NETSUITE_SECRET_ARN`, not in the config file.
+Credentials live in Secrets Manager under the environment secret configured in **Config**, or
+fall back to `NETSUITE_SECRET_ARN` when that field is blank. Private keys and client
+credentials are never stored in DynamoDB or `netsuite-config.json`.
 
 ## Durable Outbox And Replay
 

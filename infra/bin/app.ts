@@ -34,6 +34,8 @@ if (shouldDeploy("InvoiceExtractorStack")) {
     maxUploadBytes: config.maxUploadBytes,
     dataRetentionDays: config.dataRetentionDays,
     extractReservedConcurrency: config.extractReservedConcurrency,
+    viesLookupEnabled: config.viesLookupEnabled,
+    viesRequestTimeoutMs: config.viesRequestTimeoutMs,
     netSuiteLivePushEnabled: config.netSuiteLivePushEnabled,
   });
 }

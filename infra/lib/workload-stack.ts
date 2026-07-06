@@ -31,6 +31,8 @@ interface InvoiceExtractorStackProps extends cdk.StackProps {
   maxUploadBytes: number;
   dataRetentionDays: number;
   extractReservedConcurrency: number;
+  viesLookupEnabled: boolean;
+  viesRequestTimeoutMs: number;
   netSuiteLivePushEnabled: boolean;
 }
 
@@ -201,6 +203,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
         ATTACHMENT_BUCKET: attachmentBucket.bucketName,
         TABLE_NAME: table.tableName,
         BEDROCK_MODEL_ID: bedrockModelId,
+        VIES_LOOKUP_ENABLED: String(props.viesLookupEnabled),
+        VIES_TIMEOUT_MS: String(props.viesRequestTimeoutMs),
       },
       logRetention: lambdaLogRetention,
     });

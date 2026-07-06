@@ -23,6 +23,7 @@ Invoice Extractor is a production-ready, serverless application that:
 - **Secure by Default**: JWT-protected API, least-privilege IAM, DynamoDB PITR, S3 versioning, a Bedrock concurrency cap, and CloudWatch alarms
 - **Confidence Scoring**: Automatic quality assessment of extracted data
 - **AP Control Flow**: Captures buyer/legal entity, PO, service period, payment terms, vendor bank details, duplicate fingerprints, and review flags before NetSuite booking
+- **VAT Enrichment**: Validates supported EU/Northern Ireland vendor VAT IDs with VIES and records returned registry details/match status
 - **Durable NetSuite Outbox**: Logs every NetSuite push request and attempt in DynamoDB before calling NetSuite, with replay endpoints for outages
 - **Multi-Account Architecture**: Designed for AWS Organizations with separate workload accounts
 - **Cost Optimized**: Pay-per-use serverless architecture
@@ -61,9 +62,10 @@ The flow is designed for a centralized AP inbox rather than entity-specific mail
 1. SES stores every inbound email in `raw/`; the ingest Lambda extracts invoice attachments and preserves sender/subject/source metadata.
 2. Claude extracts vendor, buyer/legal entity, invoice header, PO, service period, payment terms, vendor bank details, and line items.
 3. The extractor computes a duplicate key from vendor + invoice number + currency + gross total and queries a sparse DynamoDB `duplicate` index for prior records.
-4. Each invoice gets a `reviewStatus` of `READY_FOR_NETSUITE` or `NEEDS_REVIEW`, plus AP-readable control flags such as low confidence, potential duplicate, PO match required, non-standard document, missing buyer entity, or bank details captured for vendor-master verification.
-5. The NetSuite preview endpoint builds the vendor-bill or vendor-prepayment payload, validates required NetSuite refs, and folds mapping/validation warnings into the same flow decision.
-6. The NetSuite transaction endpoint writes a durable DynamoDB outbox record before any push is queued. Worker attempts append status events to that record, and retryable failures can be replayed after an outage.
+4. EU/Northern Ireland vendor VAT numbers are validated against the European Commission VIES REST API when a supported VAT ID is extracted. Results are stored on `vendor.vatValidation`; invalid VATs or VIES name/address mismatches hold the invoice for review, while lookup outages are metadata-only.
+5. Each invoice gets a `reviewStatus` of `READY_FOR_NETSUITE` or `NEEDS_REVIEW`, plus AP-readable control flags such as low confidence, potential duplicate, PO match required, non-standard document, missing buyer entity, or bank details captured for vendor-master verification.
+6. The NetSuite preview endpoint builds the vendor-bill or vendor-prepayment payload, validates required NetSuite refs, and folds mapping/validation warnings into the same flow decision.
+7. The NetSuite transaction endpoint writes a durable DynamoDB outbox record before any push is queued. Worker attempts append status events to that record, and retryable failures can be replayed after an outage.
 
 Live auto-booking should stay disabled until vendor, subsidiary, currency, expense-account, PO, and bank-detail controls are populated and validated in a NetSuite sandbox.
 

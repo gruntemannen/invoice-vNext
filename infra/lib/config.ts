@@ -27,6 +27,12 @@ export const config = {
   // therefore cost) if the ingestion paths are flooded. Tune to your Bedrock account quota.
   extractReservedConcurrency: 5,
 
+  // Validate EU/Northern Ireland vendor VAT numbers against the European Commission VIES
+  // REST API during extraction. Lookup errors are recorded as metadata and do not fail
+  // invoice processing.
+  viesLookupEnabled: true,
+  viesRequestTimeoutMs: 6000,
+
   // Live NetSuite pushes are disabled by default. When false, API requests still create a
   // durable transaction log record that can be replayed after credentials/config are ready.
   netSuiteLivePushEnabled: false,

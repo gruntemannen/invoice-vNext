@@ -292,6 +292,19 @@ function renderControlFlags(flags) {
     .join("")}</div>`;
 }
 
+function renderVatValidation(d) {
+  const validation = d.vendorVatValidation ?? d.extractedJson?.vendor?.vatValidation;
+  const taxId = d.vendorTaxId ?? d.extractedJson?.vendor?.taxId;
+  if (!validation && !taxId) return "—";
+  if (!validation) return escapeHtml(taxId);
+
+  const status = validation.status || (validation.valid ? "VALID" : "—");
+  const cls = status === "VALID" ? "ok" : status === "INVALID" ? "fail" : "pending";
+  const number = validation.normalizedVat || taxId || "";
+  const match = validation.matches?.traderName === "INVALID" ? " name mismatch" : "";
+  return `<span class="badge ${cls}">${escapeHtml(status)}</span> ${escapeHtml(number)}${escapeHtml(match)}`;
+}
+
 function escapeHtml(str) {
   if (str == null) return "";
   return String(str)
@@ -595,6 +608,8 @@ function filteredInvoices() {
     if (!term) return true;
     const hay = [
       it.vendorName,
+      it.vendorTaxId,
+      it.vendorVatStatus,
       it.buyerName,
       it.subject,
       it.from,
@@ -650,6 +665,7 @@ const DETAIL_FIELDS = [
   ["Status", (d) => `<span class="badge ${statusClass(d.status)}">${escapeHtml(d.status || "—")}</span>`],
   ["Review", (d) => `<span class="badge ${reviewClass(d.reviewStatus)}">${escapeHtml(fmtReviewStatus(d.reviewStatus))}</span>`],
   ["Vendor", (d) => escapeHtml(d.vendorName || "—")],
+  ["Vendor VAT", renderVatValidation],
   ["Buyer", (d) => escapeHtml(d.buyerName || d.extractedJson?.buyer?.name || "—")],
   ["Invoice #", (d) => escapeHtml(d.invoiceNumber || "—")],
   ["PO", (d) => escapeHtml(d.purchaseOrderNumber || d.extractedJson?.invoice?.purchaseOrderNumber || "—")],

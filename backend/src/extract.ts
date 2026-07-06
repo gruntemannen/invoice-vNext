@@ -5,6 +5,7 @@ import { invokeBedrock, DocumentInput } from "./shared/bedrock";
 import { buildExtractionPrompt, buildRepairPrompt } from "./shared/prompts";
 import { calculateConfidence } from "./shared/confidence";
 import { assessInvoiceFlow, buildDuplicateKey, summarizeDuplicateMatch } from "./shared/flow";
+import { enrichExtractionWithVatLookup } from "./shared/vies";
 import { log } from "./shared/logger";
 import { emitMetric } from "./shared/metrics";
 
@@ -13,6 +14,9 @@ const TABLE_NAME = process.env.TABLE_NAME ?? "";
 // Region-agnostic default so a misconfigured/test env doesn't silently pick an EU profile;
 // the CDK always sets BEDROCK_MODEL_ID from config.ts.
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID ?? "global.anthropic.claude-sonnet-4-6";
+const VIES_LOOKUP_ENABLED = process.env.VIES_LOOKUP_ENABLED !== "false";
+const VIES_API_BASE_URL = process.env.VIES_API_BASE_URL;
+const VIES_TIMEOUT_MS = Number(process.env.VIES_TIMEOUT_MS ?? "6000");
 
 export const handler = async (event: SQSEvent) => {
   for (const record of event.Records) {
@@ -79,11 +83,26 @@ export const handler = async (event: SQSEvent) => {
         extractedTextSnippet: "(PDF processed visually by AI)",
       };
 
-      // 7. Calculate confidence
+      // 7. Enrich/validate EU vendor VAT information. External lookup errors
+      // are metadata-only so an EU service outage does not block extraction.
+      const vatValidation = await enrichExtractionWithVatLookup(normalized, warnings, {
+        enabled: VIES_LOOKUP_ENABLED,
+        baseUrl: VIES_API_BASE_URL,
+        timeoutMs: Number.isFinite(VIES_TIMEOUT_MS) && VIES_TIMEOUT_MS > 0 ? VIES_TIMEOUT_MS : 6000,
+      });
+      if (vatValidation?.status === "ERROR") {
+        log.warn("VIES VAT lookup failed", {
+          messageId,
+          vat: vatValidation.normalizedVat,
+          error: vatValidation.message,
+        });
+      }
+
+      // 8. Calculate confidence
       const confidence = calculateConfidence(normalized);
       normalized.meta.confidenceScore = confidence;
 
-      // 8. Find likely duplicates before marking this invoice ready for review/export.
+      // 9. Find likely duplicates before marking this invoice ready for review/export.
       const duplicateKey = buildDuplicateKey(normalized);
       let duplicateMatches: ReturnType<typeof summarizeDuplicateMatch>[] = [];
       if (duplicateKey) {
@@ -112,7 +131,7 @@ export const handler = async (event: SQSEvent) => {
       normalized.meta.duplicateCount = duplicateMatches.length;
       normalized.meta.duplicateMatches = duplicateMatches;
 
-      // 9. Save to database
+      // 10. Save to database
       const updates: Record<string, any> = {
         status: "COMPLETED",
         reviewStatus: flow.reviewStatus,
@@ -123,6 +142,10 @@ export const handler = async (event: SQSEvent) => {
         extractedJson: normalized,
         confidence,
         vendorName: normalized.vendor?.name ?? null,
+        vendorTaxId: normalized.vendor?.taxId ?? null,
+        vendorVatStatus: normalized.vendor?.vatValidation?.status ?? null,
+        vendorVatValid: normalized.vendor?.vatValidation?.valid ?? null,
+        vendorVatValidation: normalized.vendor?.vatValidation ?? null,
         buyerName: normalized.buyer?.name ?? null,
         invoiceNumber: normalized.invoice?.invoiceNumber ?? null,
         purchaseOrderNumber: normalized.invoice?.purchaseOrderNumber ?? null,

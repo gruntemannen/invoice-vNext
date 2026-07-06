@@ -8,6 +8,20 @@ The integration is scaffolded: transform, validation, OAuth 2.0 client, SuiteQL 
 durable outbox, replay, and idempotent upsert are implemented. Live push stays disabled
 until credentials and sandbox validation are complete.
 
+## Vendor VAT Enrichment
+
+During extraction, supported EU/Northern Ireland vendor VAT numbers are checked against the
+European Commission VIES REST API. The enrichment:
+
+- parses prefixed VAT IDs such as `DE123456789` and maps Greece `GR` to VIES `EL`
+- can infer a country from the vendor address when the model extracted only local VAT digits
+- sends extracted vendor name/address fields for VIES approximate matching
+- stores the result on `extractedJson.vendor.vatValidation`
+- raises review warnings only for invalid VATs or explicit VIES match mismatches
+
+VIES lookup outages/timeouts are logged and stored as metadata, but they do not fail extraction
+or prevent later NetSuite replay.
+
 ## How It Works
 
 ```text

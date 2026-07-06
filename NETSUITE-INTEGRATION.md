@@ -22,6 +22,38 @@ European Commission VIES REST API. The enrichment:
 VIES lookup outages/timeouts are logged and stored as metadata, but they do not fail extraction
 or prevent later NetSuite replay.
 
+## Vendor Master Sync
+
+When a logged NetSuite AP transaction is processed with live push enabled, the worker now performs
+a conservative vendor-master compare before creating/updating the AP record:
+
+1. Use the resolved vendor internal id from the transaction payload.
+2. Fetch the NetSuite `vendor` record through the REST Record API.
+3. Compare mapped extracted/VIES fields against the current vendor record.
+4. PATCH only fields that are blank in NetSuite, unless `vendorSync.missingOnly` is explicitly
+   set to `false`.
+5. Store the sync result on the durable NetSuite transaction as `vendorSyncResult`.
+
+The default map only fills standard `companyName` and `email`. VAT and bank details vary by
+NetSuite account, so map those to account-specific entity/custom fields in
+`vendorSync.fields` before enabling live updates, for example:
+
+```json
+"vendorSync": {
+  "enabled": true,
+  "recordId": "vendor",
+  "missingOnly": true,
+  "fields": {
+    "name": "companyName",
+    "email": "email",
+    "taxId": "custentity_vendor_vat_id",
+    "iban": "custentity_vendor_iban",
+    "bic": "custentity_vendor_bic",
+    "vatValidationStatus": "custentity_vies_status"
+  }
+}
+```
+
 ## How It Works
 
 ```text
@@ -140,6 +172,7 @@ format. Explicit endpoint fields always win.
 Required before live vendor-bill push:
 
 - `vendorsByTaxId` or `vendorsByName`
+- review `vendorSync.fields` for the target account; keep only fields that are writable on the NetSuite vendor REST record
 - `currenciesByCode`
 - `accountsByCode` or `defaults.expenseAccountId`
 - `apAccountId` when the account requires an AP account

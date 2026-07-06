@@ -102,6 +102,7 @@ export interface NetSuiteConfig {
    * by entity code, tax id, name, email domain, or address.
    */
   defaultBusinessUnitKey?: string;
+  vendorSync?: NetSuiteVendorSyncConfig;
   defaults?: {
     expenseAccountId?: string;
     departmentId?: string;
@@ -130,6 +131,51 @@ export interface NetSuiteConfig {
 }
 
 export type NetSuiteCustomFieldValue = string | number | boolean | NetSuiteRef;
+
+export type NetSuiteVendorSyncSourceField =
+  | "name"
+  | "email"
+  | "taxId"
+  | "address"
+  | "iban"
+  | "bic"
+  | "bankName"
+  | "vatValidationStatus"
+  | "vatRequestIdentifier";
+
+export interface NetSuiteVendorSyncConfig {
+  /** Compare/update vendor master data before pushing the AP transaction. */
+  enabled?: boolean;
+  /** NetSuite REST record id for vendors; usually "vendor". */
+  recordId?: string;
+  /** Only fill blank NetSuite fields. Keep true unless AP explicitly wants overwrites. */
+  missingOnly?: boolean;
+  /**
+   * Map extracted/VIES source fields to NetSuite vendor fields. Defaults cover
+   * conservative standard fields only; VAT/bank fields should be configured to
+   * account-specific custom/entity field ids.
+   */
+  fields?: Partial<Record<NetSuiteVendorSyncSourceField, string>>;
+}
+
+export interface NetSuiteVendorSyncPlan {
+  vendorId: string;
+  recordId: string;
+  missingOnly: boolean;
+  source: Partial<Record<NetSuiteVendorSyncSourceField, string>>;
+  fields: Partial<Record<NetSuiteVendorSyncSourceField, string>>;
+}
+
+export interface NetSuiteVendorSyncResult {
+  status: "SKIPPED" | "NO_CHANGES" | "UPDATED";
+  vendorId?: string;
+  recordId?: string;
+  comparedFields?: string[];
+  updatedFields?: string[];
+  message?: string;
+  responseStatus?: number;
+  responseBody?: unknown;
+}
 
 export interface NetSuiteBusinessUnitRoute {
   /** NetSuite internal id for the business-unit custom segment, if used. */
@@ -280,6 +326,7 @@ export interface NetSuitePushRequest {
   externalId: string;
   document: NetSuiteDocumentClassification;
   businessUnitRouting?: NetSuiteBusinessUnitRoutingResult;
+  vendorSync?: NetSuiteVendorSyncPlan;
   payload: NetSuiteRecordPayload;
 }
 
@@ -598,6 +645,73 @@ function applyBusinessUnitSegment(
   target[config.businessUnitSegmentFieldId] = { id: route.businessUnitId };
 }
 
+const DEFAULT_VENDOR_SYNC_FIELDS: Partial<Record<NetSuiteVendorSyncSourceField, string>> = {
+  name: "companyName",
+  email: "email",
+};
+
+function buildVendorSyncPlan(
+  vendor: any,
+  vendorId: string | undefined,
+  config: NetSuiteConfig
+): NetSuiteVendorSyncPlan | undefined {
+  if (!vendorId || config.vendorSync?.enabled === false) return undefined;
+
+  const configuredFields = cleanVendorSyncFields(config.vendorSync?.fields);
+  const fields = config.vendorSync?.fields ? configuredFields : DEFAULT_VENDOR_SYNC_FIELDS;
+  const source = cleanVendorSyncSource({
+    name: vendor?.name,
+    email: vendor?.email,
+    taxId: vendor?.taxId,
+    address: vendor?.address,
+    iban: firstString(vendor?.bankDetails?.ibans),
+    bic: vendor?.bankDetails?.bic,
+    bankName: vendor?.bankDetails?.bankName,
+    vatValidationStatus: vendor?.vatValidation?.status,
+    vatRequestIdentifier: vendor?.vatValidation?.requestIdentifier,
+  });
+
+  const mappedSourceKeys = Object.keys(fields).filter(
+    (key) => fields[key as NetSuiteVendorSyncSourceField] && source[key as NetSuiteVendorSyncSourceField]
+  );
+  if (mappedSourceKeys.length === 0) return undefined;
+
+  return {
+    vendorId,
+    recordId: config.vendorSync?.recordId || "vendor",
+    missingOnly: config.vendorSync?.missingOnly !== false,
+    source,
+    fields,
+  };
+}
+
+function cleanVendorSyncFields(
+  fields: NetSuiteVendorSyncConfig["fields"] | undefined
+): Partial<Record<NetSuiteVendorSyncSourceField, string>> {
+  if (!fields) return {};
+  return Object.fromEntries(
+    Object.entries(fields).filter(([, fieldId]) => typeof fieldId === "string" && fieldId.trim() !== "")
+  ) as Partial<Record<NetSuiteVendorSyncSourceField, string>>;
+}
+
+function cleanVendorSyncSource(
+  source: Partial<Record<NetSuiteVendorSyncSourceField, unknown>>
+): Partial<Record<NetSuiteVendorSyncSourceField, string>> {
+  return Object.fromEntries(
+    Object.entries(source)
+      .map(([key, value]) => [key, String(value ?? "").trim()])
+      .filter(([, value]) => value !== "")
+  ) as Partial<Record<NetSuiteVendorSyncSourceField, string>>;
+}
+
+function firstString(values: unknown): string | undefined {
+  if (Array.isArray(values)) {
+    return values.map((value) => String(value ?? "").trim()).find(Boolean);
+  }
+  const value = String(values ?? "").trim();
+  return value || undefined;
+}
+
 function configKey(value: unknown): string {
   return String(value ?? "")
     .trim()
@@ -835,6 +949,7 @@ export function transformToNetSuite(
       `Vendor not resolved (taxId="${taxId}", name="${vendorName}"); entity left unset - resolve via crosswalk or SuiteQL before push.`
     );
   }
+  const vendorSync = buildVendorSyncPlan(vendor, entity?.id, config);
 
   // --- Currency -----------------------------------------------------------
   let currency: NetSuiteRef | undefined;
@@ -1036,6 +1151,7 @@ export function transformToNetSuite(
       externalId,
       document,
       businessUnitRouting,
+      vendorSync,
       payload: prepayment,
     };
 
@@ -1072,6 +1188,7 @@ export function transformToNetSuite(
     externalId,
     document,
     businessUnitRouting,
+    vendorSync,
     payload: bill,
   };
 
@@ -1429,6 +1546,118 @@ export async function suiteql(
 }
 
 // ===========================================================================
+// Vendor master compare/fill helper
+// ===========================================================================
+
+export async function syncNetSuiteVendorMaster(
+  secret: NetSuiteSecret,
+  token: string,
+  plan: NetSuiteVendorSyncPlan | undefined,
+  options?: NetSuiteConnectionOptions
+): Promise<NetSuiteVendorSyncResult> {
+  if (!plan) {
+    return { status: "SKIPPED", message: "No vendor sync plan was attached to this transaction." };
+  }
+
+  const comparedFields: string[] = [];
+  const patch: Record<string, string> = {};
+  const recordId = plan.recordId || "vendor";
+  const vendorUrl = `${restBase(secret, options)}${recordApiPath(options)}/${encodeURIComponent(
+    recordId
+  )}/${encodeURIComponent(plan.vendorId)}`;
+
+  const getRes = await fetchWithTimeout(vendorUrl, {
+    method: "GET",
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: "application/json",
+    },
+  }, options?.requestTimeoutMs);
+
+  if (!getRes.ok) {
+    const text = await getRes.text().catch(() => "");
+    throw new Error(`vendor fetch failed: ${getRes.status} ${text.slice(0, 500)}`);
+  }
+
+  const current = await getRes.json().catch(() => ({}));
+  for (const [sourceKey, fieldId] of Object.entries(plan.fields)) {
+    if (!fieldId) continue;
+    const value = plan.source[sourceKey as NetSuiteVendorSyncSourceField];
+    if (!value) continue;
+    comparedFields.push(fieldId);
+
+    if (!plan.missingOnly || isMissingNetSuiteValue(readPath(current, fieldId))) {
+      patch[fieldId] = value;
+    }
+  }
+
+  const updatedFields = Object.keys(patch);
+  if (updatedFields.length === 0) {
+    return {
+      status: "NO_CHANGES",
+      vendorId: plan.vendorId,
+      recordId,
+      comparedFields,
+      message: "NetSuite vendor already has the mapped values or no mapped source values were present.",
+    };
+  }
+
+  const patchRes = await fetchWithTimeout(vendorUrl, {
+    method: "PATCH",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      accept: "application/json",
+    },
+    body: JSON.stringify(patch),
+  }, options?.requestTimeoutMs);
+
+  if (!patchRes.ok) {
+    const text = await patchRes.text().catch(() => "");
+    throw new Error(`vendor update failed: ${patchRes.status} ${text.slice(0, 500)}`);
+  }
+
+  const responseText = await patchRes.text().catch(() => "");
+  return {
+    status: "UPDATED",
+    vendorId: plan.vendorId,
+    recordId,
+    comparedFields,
+    updatedFields,
+    responseStatus: patchRes.status,
+    responseBody: responseText ? safeParseJson(responseText) : null,
+  };
+}
+
+function readPath(value: unknown, path: string): unknown {
+  return path.split(".").reduce((acc: any, part) => {
+    if (acc === null || acc === undefined) return undefined;
+    return acc[part];
+  }, value as any);
+}
+
+function isMissingNetSuiteValue(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value === "string") return value.trim() === "";
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    if ("id" in obj || "refName" in obj) {
+      return !String(obj.id ?? obj.refName ?? "").trim();
+    }
+  }
+  return false;
+}
+
+function safeParseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+// ===========================================================================
 // Idempotent upsert
 // ===========================================================================
 
@@ -1571,6 +1800,12 @@ export const exampleNetSuiteConfig: NetSuiteConfig = {
   prepaymentAccountId: undefined,
   businessUnitSegmentFieldId: undefined,
   defaultBusinessUnitKey: undefined,
+  vendorSync: {
+    enabled: true,
+    recordId: "vendor",
+    missingOnly: true,
+    fields: DEFAULT_VENDOR_SYNC_FIELDS,
+  },
   defaults: {
     expenseAccountId: undefined,
     departmentId: undefined,

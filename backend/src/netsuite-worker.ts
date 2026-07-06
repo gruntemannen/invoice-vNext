@@ -1,5 +1,10 @@
 import { SQSEvent } from "aws-lambda";
-import { asNetSuitePushRequest, getAccessToken, upsertNetSuiteRecord } from "./shared/netsuite";
+import {
+  asNetSuitePushRequest,
+  getAccessToken,
+  syncNetSuiteVendorMaster,
+  upsertNetSuiteRecord,
+} from "./shared/netsuite";
 import { loadNetSuiteSecret } from "./shared/netsuite-secret";
 import { environmentByName, getNetSuiteRuntimeSettings } from "./shared/netsuite-settings";
 import {
@@ -42,6 +47,7 @@ export const handler = async (event: SQSEvent) => {
       const endpoint = environmentByName(runtimeSettings, request.environment);
       const secret = await loadNetSuiteSecret(endpoint.secretArn || NETSUITE_SECRET_ARN);
       const token = await getAccessToken(secret, endpoint);
+      const vendorSync = await syncNetSuiteVendorMaster(secret, token, request.vendorSync, endpoint);
       const result = await upsertNetSuiteRecord(
         secret,
         token,
@@ -50,9 +56,16 @@ export const handler = async (event: SQSEvent) => {
         endpoint
       );
 
-      await markTransactionSucceeded(TABLE_NAME, transactionId, result);
+      await markTransactionSucceeded(TABLE_NAME, transactionId, { ...result, vendorSync });
       emitMetric("NetSuitePushSuccess", 1, "Count");
-      log.info("NetSuite transaction succeeded", { transactionId, externalId: transaction.externalId });
+      if (vendorSync.status === "UPDATED") {
+        emitMetric("NetSuiteVendorSyncUpdated", 1, "Count");
+      }
+      log.info("NetSuite transaction succeeded", {
+        transactionId,
+        externalId: transaction.externalId,
+        vendorSyncStatus: vendorSync.status,
+      });
     } catch (err: any) {
       const message = err?.message ?? String(err);
       const retryable = isRetryableNetSuiteError(err);

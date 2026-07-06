@@ -1,11 +1,27 @@
 {
-  "_README": "NetSuite AP push config (mirrors NetSuiteConfig in backend/src/shared/netsuite.ts). NON-SECRET values only. Credentials live in Secrets Manager. Standard invoices map to vendorBill. Proforma invoices map to vendorPrepayment, so prepaymentPaymentAccountId must be the NetSuite bank/credit-card account used to fund the prepayment; prepaymentAccountId optionally overrides the prepayment asset account. Single-subsidiary scaffold: leave subsidiaryId empty/null for non-OneWorld; set it only for a true default OneWorld subsidiary. apAccountId = AP account internal id. defaults.expenseAccountId = line fallback/suspense account. businessUnitSegmentFieldId can be a custom segment field such as cseg_business_unit. Recipient routing maps buyer tax ID/name/entity code/email domain/address text to keys in businessUnits, which can set subsidiary, department, class, location, and custom fields. defaultBusinessUnitKey is used only after all recipient mapping options miss. Empty objects mean nothing resolves and the transform emits warnings/placeholders.",
+  "_README": "NetSuite AP push config (mirrors NetSuiteConfig in backend/src/shared/netsuite.ts). NON-SECRET values only. Credentials live in Secrets Manager. Standard invoices map to vendorBill. Proforma invoices map to vendorPrepayment, so prepaymentPaymentAccountId must be the NetSuite bank/credit-card account used to fund the prepayment; prepaymentAccountId optionally overrides the prepayment asset account. Single-subsidiary scaffold: leave subsidiaryId empty/null for non-OneWorld; set it only for a true default OneWorld subsidiary. apAccountId = AP account internal id. defaults.expenseAccountId = line fallback/suspense account. businessUnitSegmentFieldId can be a custom segment field such as cseg_business_unit. Recipient routing maps buyer tax ID/name/entity code/email domain/address text to keys in businessUnits, which can set subsidiary, department, class, location, and custom fields. defaultBusinessUnitKey is used only after all recipient mapping options miss. vendorSync compares extracted/VIES vendor data to the NetSuite vendor master and fills mapped blank fields before AP push. Empty objects mean nothing resolves and the transform emits warnings/placeholders.",
   "subsidiaryId": null,
   "apAccountId": null,
   "prepaymentPaymentAccountId": null,
   "prepaymentAccountId": null,
   "businessUnitSegmentFieldId": null,
   "defaultBusinessUnitKey": null,
+  "vendorSync": {
+    "enabled": true,
+    "recordId": "vendor",
+    "missingOnly": true,
+    "fields": {
+      "name": "companyName",
+      "email": "email",
+      "taxId": null,
+      "address": null,
+      "iban": null,
+      "bic": null,
+      "bankName": null,
+      "vatValidationStatus": null,
+      "vatRequestIdentifier": null
+    }
+  },
   "defaults": {
     "expenseAccountId": null,
     "departmentId": null,

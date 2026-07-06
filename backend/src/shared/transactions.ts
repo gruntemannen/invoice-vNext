@@ -44,6 +44,7 @@ export interface NetSuiteTransaction {
   lastError?: string;
   netSuiteLocation?: string | null;
   netSuiteStatus?: number;
+  vendorSyncResult?: unknown;
   gsi1pk: "NETSUITE_TRANSACTION";
   gsi1sk: string;
   transactionStatusPk: string;
@@ -237,7 +238,7 @@ export async function markTransactionInFlight(tableName: string, transactionId: 
 export async function markTransactionSucceeded(
   tableName: string,
   transactionId: string,
-  result: { status?: number; location?: string | null; body?: unknown }
+  result: { status?: number; location?: string | null; body?: unknown; vendorSync?: unknown }
 ) {
   const now = new Date().toISOString();
   await updateTransaction(tableName, transactionId, {
@@ -247,13 +248,14 @@ export async function markTransactionSucceeded(
     transactionStatusSk: `${now}#${transactionId}`,
     netSuiteStatus: result.status,
     netSuiteLocation: result.location,
+    vendorSyncResult: result.vendorSync,
     lastError: null,
     event: {
       at: now,
       type: "ATTEMPT_SUCCEEDED",
       status: "SUCCEEDED",
       message: "NetSuite upsert succeeded.",
-      details: { status: result.status, location: result.location },
+      details: { status: result.status, location: result.location, vendorSync: result.vendorSync },
     },
   });
 }
@@ -296,6 +298,7 @@ export function summarizeTransaction(item: NetSuiteTransaction) {
     lastError: item.lastError,
     netSuiteLocation: item.netSuiteLocation,
     netSuiteStatus: item.netSuiteStatus,
+    vendorSyncResult: item.vendorSyncResult,
   };
 }
 
@@ -315,6 +318,7 @@ async function updateTransaction(
     lastError?: string | null;
     netSuiteStatus?: number;
     netSuiteLocation?: string | null;
+    vendorSyncResult?: unknown;
     attemptCountIncrement?: number;
     replayCountIncrement?: number;
     event: TransactionEvent;
@@ -363,6 +367,11 @@ async function updateTransaction(
     names["#netSuiteLocation"] = "netSuiteLocation";
     values[":netSuiteLocation"] = update.netSuiteLocation;
     setParts.push("#netSuiteLocation = :netSuiteLocation");
+  }
+  if (update.vendorSyncResult !== undefined) {
+    names["#vendorSyncResult"] = "vendorSyncResult";
+    values[":vendorSyncResult"] = stripUndefined(update.vendorSyncResult);
+    setParts.push("#vendorSyncResult = :vendorSyncResult");
   }
   if (update.attemptCountIncrement) {
     names["#attemptCount"] = "attemptCount";

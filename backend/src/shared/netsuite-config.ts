@@ -1,4 +1,9 @@
-import { exampleNetSuiteConfig, type NetSuiteBusinessUnitRoute, type NetSuiteConfig } from "./netsuite";
+import {
+  exampleNetSuiteConfig,
+  type NetSuiteBusinessUnitRoute,
+  type NetSuiteConfig,
+  type NetSuiteVendorSyncConfig,
+} from "./netsuite";
 
 function blankToUndefined<T>(value: T): T | undefined {
   return value === "" || value === null ? undefined : value;
@@ -37,6 +42,24 @@ function normalizeCustomFields(input: any): Record<string, any> | undefined {
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
+function normalizeStringFields(input: any): Record<string, string> | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const entries = Object.entries(input)
+    .filter(([, value]) => typeof value === "string" && value.trim() !== "")
+    .map(([key, value]) => [key, String(value).trim()]);
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function normalizeVendorSync(input: any): NetSuiteVendorSyncConfig | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  return {
+    enabled: input.enabled === false ? false : true,
+    recordId: blankToUndefined(input.recordId),
+    missingOnly: input.missingOnly === false ? false : true,
+    fields: normalizeStringFields(input.fields),
+  };
+}
+
 export function loadNetSuiteConfig(): NetSuiteConfig {
   let raw: any;
   try {
@@ -57,6 +80,7 @@ export function loadNetSuiteConfig(): NetSuiteConfig {
     prepaymentAccountId: blankToUndefined(raw.prepaymentAccountId),
     businessUnitSegmentFieldId: blankToUndefined(raw.businessUnitSegmentFieldId),
     defaultBusinessUnitKey: blankToUndefined(raw.defaultBusinessUnitKey),
+    vendorSync: normalizeVendorSync(raw.vendorSync),
     defaults: {
       expenseAccountId: blankToUndefined(defaults.expenseAccountId),
       departmentId: blankToUndefined(defaults.departmentId),

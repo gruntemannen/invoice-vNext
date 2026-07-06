@@ -201,6 +201,7 @@ Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
   "prepaymentPaymentAccountId": "",
   "prepaymentAccountId": "",
   "businessUnitSegmentFieldId": "",
+  "defaultBusinessUnitKey": "",
   "defaults": { "expenseAccountId": "", "departmentId": "", "classId": "", "locationId": "", "taxCodeId": "" },
   "crosswalks": {
     "vendorsByTaxId": { "VAT123456": "4521" },
@@ -222,6 +223,10 @@ Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
   "businessUnits": {}
 }
 ```
+
+Recipient company names map through `crosswalks.businessUnitsByName` to entries in
+`businessUnits`. Set `defaultBusinessUnitKey` when unmapped recipients should still route to
+a controlled NetSuite fallback business unit.
 
 NetSuite environment endpoints are configured in the admin console under **Config**. Test and
 Prod each have their own account id, REST base URL, OAuth token endpoint, optional Secrets

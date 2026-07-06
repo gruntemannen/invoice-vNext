@@ -86,6 +86,10 @@ a key in `businessUnits`:
 - `businessUnitsByEmailDomain`
 - `businessUnitsByAddressContains`
 
+Company-name mapping is also exposed in code as `mapCompanyNameToBusinessUnit(companyName, config)`.
+It resolves through `crosswalks.businessUnitsByName`, then falls back to `defaultBusinessUnitKey`
+when that fallback is configured.
+
 Each `businessUnits.<key>` route can set:
 
 - `businessUnitId`
@@ -98,8 +102,9 @@ Each `businessUnits.<key>` route can set:
 - `customLineFields`
 
 If `businessUnitSegmentFieldId` is configured, `businessUnitId` is emitted as `{ id }` on the
-transaction body and expense lines. Missing recipient routing emits a NetSuite warning and
-keeps the invoice in review.
+transaction body and expense lines. `defaultBusinessUnitKey` is used only after entity code,
+tax id, company name, email domain, and address matching all miss. Missing recipient routing
+with no fallback emits a NetSuite warning and keeps the invoice in review.
 
 ## Configuration
 

@@ -97,6 +97,11 @@ export interface NetSuiteConfig {
    * on the transaction body and expense lines as { id }.
    */
   businessUnitSegmentFieldId?: string;
+  /**
+   * Optional fallback route key used when a recipient/company cannot be mapped
+   * by entity code, tax id, name, email domain, or address.
+   */
+  defaultBusinessUnitKey?: string;
   defaults?: {
     expenseAccountId?: string;
     departmentId?: string;
@@ -138,9 +143,18 @@ export interface NetSuiteBusinessUnitRoute {
   customLineFields?: Record<string, NetSuiteCustomFieldValue>;
 }
 
+export type NetSuiteBusinessUnitMatchKind =
+  | "buyer.entityCode"
+  | "buyer.taxId"
+  | "buyer.name"
+  | "buyer.emailDomain"
+  | "buyer.address"
+  | "company.name"
+  | "fallback.defaultBusinessUnitKey";
+
 export interface NetSuiteBusinessUnitRoutingResult extends NetSuiteBusinessUnitRoute {
   businessUnitKey: string;
-  matchedBy: "buyer.entityCode" | "buyer.taxId" | "buyer.name" | "buyer.emailDomain" | "buyer.address";
+  matchedBy: NetSuiteBusinessUnitMatchKind;
   matchedValue: string;
 }
 
@@ -411,6 +425,10 @@ function lookupCrosswalk(map: Record<string, string> | undefined, value: unknown
   return found?.[1];
 }
 
+function businessUnitKeyForCompanyName(companyName: unknown, config: NetSuiteConfig): string | undefined {
+  return lookupCrosswalk(config.crosswalks.businessUnitsByName, companyName);
+}
+
 function emailDomain(email: unknown): string {
   const match = String(email ?? "").trim().toLowerCase().match(/@([^@\s>]+)>?$/);
   return match?.[1] ?? "";
@@ -440,7 +458,7 @@ function resolveBusinessUnitRouting(
     {
       matchedBy: "buyer.name",
       value: String(buyer?.name ?? "").trim(),
-      routeKey: lookupCrosswalk(cw.businessUnitsByName, buyer?.name),
+      routeKey: businessUnitKeyForCompanyName(buyer?.name, config),
     },
     {
       matchedBy: "buyer.emailDomain",
@@ -464,28 +482,97 @@ function resolveBusinessUnitRouting(
   }
 
   const match = checks.find((candidate) => candidate.value && candidate.routeKey);
-  if (!match?.routeKey) {
-    if (buyer?.name || buyer?.taxId || buyer?.entityCode || buyer?.email || buyer?.address) {
-      warnings.push(
-        "Invoice recipient did not match any NetSuite business-unit routing crosswalk; subsidiary/business-unit dimensions require review."
-      );
-    }
-    return undefined;
+  if (match?.routeKey) {
+    return businessUnitRoutingFromKey(
+      match.routeKey,
+      match.matchedBy,
+      match.value,
+      config,
+      warnings
+    );
   }
 
-  const configuredRoute = config.businessUnits?.[match.routeKey];
-  const route: NetSuiteBusinessUnitRoute = configuredRoute ?? { businessUnitId: match.routeKey };
-  if (!configuredRoute) {
+  const fallback = defaultBusinessUnitRouting(
+    String(buyer?.name || buyer?.entityCode || buyer?.taxId || buyer?.email || buyer?.address || "").trim(),
+    config,
+    warnings
+  );
+  if (fallback) return fallback;
+
+  if (buyer?.name || buyer?.taxId || buyer?.entityCode || buyer?.email || buyer?.address) {
     warnings.push(
-      `Recipient matched business unit key "${match.routeKey}", but businessUnits.${match.routeKey} is not configured; only the key is recorded.`
+      "Invoice recipient did not match any NetSuite business-unit routing crosswalk and no defaultBusinessUnitKey is configured; subsidiary/business-unit dimensions require review."
+    );
+  }
+  return undefined;
+}
+
+export function mapCompanyNameToBusinessUnit(
+  companyName: unknown,
+  config: NetSuiteConfig,
+  options: {
+    allowFallback?: boolean;
+    matchedBy?: NetSuiteBusinessUnitMatchKind;
+    warnings?: string[];
+  } = {}
+): NetSuiteBusinessUnitRoutingResult | undefined {
+  const name = String(companyName ?? "").trim();
+  const routeKey = businessUnitKeyForCompanyName(name, config);
+  if (routeKey) {
+    return businessUnitRoutingFromKey(
+      routeKey,
+      options.matchedBy ?? "company.name",
+      name,
+      config,
+      options.warnings
+    );
+  }
+
+  if (options.allowFallback === false) return undefined;
+  return defaultBusinessUnitRouting(name, config, options.warnings);
+}
+
+function defaultBusinessUnitRouting(
+  unmatchedValue: string,
+  config: NetSuiteConfig,
+  warnings?: string[]
+): NetSuiteBusinessUnitRoutingResult | undefined {
+  const fallbackKey = String(config.defaultBusinessUnitKey ?? "").trim();
+  if (!fallbackKey) return undefined;
+
+  warnings?.push(
+    `Recipient/company "${unmatchedValue || "<blank>"}" did not match a NetSuite business-unit crosswalk; using defaultBusinessUnitKey "${fallbackKey}".`
+  );
+
+  return businessUnitRoutingFromKey(
+    fallbackKey,
+    "fallback.defaultBusinessUnitKey",
+    unmatchedValue,
+    config,
+    warnings
+  );
+}
+
+function businessUnitRoutingFromKey(
+  routeKey: string,
+  matchedBy: NetSuiteBusinessUnitMatchKind,
+  matchedValue: string,
+  config: NetSuiteConfig,
+  warnings?: string[]
+): NetSuiteBusinessUnitRoutingResult {
+  const configuredRoute = config.businessUnits?.[routeKey];
+  const route: NetSuiteBusinessUnitRoute = configuredRoute ?? { businessUnitId: routeKey };
+  if (!configuredRoute) {
+    warnings?.push(
+      `Recipient matched business unit key "${routeKey}", but businessUnits.${routeKey} is not configured; only the key is recorded.`
     );
   }
 
   return {
     ...route,
-    businessUnitKey: match.routeKey,
-    matchedBy: match.matchedBy,
-    matchedValue: match.value,
+    businessUnitKey: routeKey,
+    matchedBy,
+    matchedValue,
   };
 }
 
@@ -613,6 +700,13 @@ export function buildNetSuiteConfigurationHints(
         locationId: "<locationInternalId>",
         businessUnitId: "<businessUnitSegmentInternalId>",
       },
+    });
+    hints.push({
+      path: "defaultBusinessUnitKey",
+      value: "",
+      reason: "Optional fallback route key to use when a recipient/company cannot be mapped by name, tax id, entity code, email domain, or address.",
+      requiredForLivePush: false,
+      example: "_fallback",
     });
   }
 
@@ -1476,6 +1570,7 @@ export const exampleNetSuiteConfig: NetSuiteConfig = {
   prepaymentPaymentAccountId: undefined,
   prepaymentAccountId: undefined,
   businessUnitSegmentFieldId: undefined,
+  defaultBusinessUnitKey: undefined,
   defaults: {
     expenseAccountId: undefined,
     departmentId: undefined,

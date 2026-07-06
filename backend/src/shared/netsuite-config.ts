@@ -56,6 +56,7 @@ export function loadNetSuiteConfig(): NetSuiteConfig {
     prepaymentPaymentAccountId: blankToUndefined(raw.prepaymentPaymentAccountId),
     prepaymentAccountId: blankToUndefined(raw.prepaymentAccountId),
     businessUnitSegmentFieldId: blankToUndefined(raw.businessUnitSegmentFieldId),
+    defaultBusinessUnitKey: blankToUndefined(raw.defaultBusinessUnitKey),
     defaults: {
       expenseAccountId: blankToUndefined(defaults.expenseAccountId),
       departmentId: blankToUndefined(defaults.departmentId),

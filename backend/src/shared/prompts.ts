@@ -37,6 +37,7 @@ Return ONLY valid JSON in this exact format:
     "invoiceNumber": "number",
     "purchaseOrderNumber": "PO number or null",
     "invoiceType": "Standard, Proforma, CreditNote, Reminder, Statement, or Other",
+    "transactionIntent": "VendorBill or VendorPrepayment",
     "invoiceDate": "YYYY-MM-DD",
     "dueDate": "YYYY-MM-DD or null",
     "currency": "ISO code such as EUR/USD/CHF/JPY",
@@ -76,6 +77,7 @@ Rules:
 - taxAmount = VAT/consumption tax amount.
 - lineItems amounts = pre-tax amounts.
 - For Proforma invoices, set invoiceType to "Proforma". For reminders/dunning notices/Mahnung, set "Reminder". For vendor statements, set "Statement".
+- Treat Proforma invoices as prepayment requests: set transactionIntent to "VendorPrepayment". Standard payable invoices should use "VendorBill".
 - purchaseOrderNumber = only the PO code (no labels), null if not present.
 - Extract PO numbers from labels such as PO, P.O., Auftrag, Bestellnummer, purchase order, or order number.
 - Capture IBAN/BIC/SWIFT values exactly as printed. If multiple IBANs are shown, include them all.
@@ -90,7 +92,7 @@ REQUIRED FORMAT:
 {
   "vendor": { "name": "...", "taxId": "...", "address": "...", "email": null, "bankDetails": { "ibans": [], "bic": null, "bankName": null, "accountName": null, "accountNumber": null } },
   "buyer": { "name": "...", "taxId": "...", "address": "...", "email": null, "entityCode": null },
-  "invoice": { "invoiceNumber": "...", "purchaseOrderNumber": "...", "invoiceType": "...", "invoiceDate": "...", "dueDate": "...", "currency": "...", "paymentTerms": null, "description": null, "servicePeriod": { "startDate": null, "endDate": null }, "remittanceReference": null, "netAmount": 0, "taxAmount": 0, "totalAmount": 0 },
+  "invoice": { "invoiceNumber": "...", "purchaseOrderNumber": "...", "invoiceType": "...", "transactionIntent": "VendorBill", "invoiceDate": "...", "dueDate": "...", "currency": "...", "paymentTerms": null, "description": null, "servicePeriod": { "startDate": null, "endDate": null }, "remittanceReference": null, "netAmount": 0, "taxAmount": 0, "totalAmount": 0 },
   "lineItems": [{ "lineNumber": 1, "description": "...", "amount": 0, "quantity": 1, "unitPrice": 0, "taxRate": null, "account": null, "department": null, "costCenter": null, "project": null }]
 }
 

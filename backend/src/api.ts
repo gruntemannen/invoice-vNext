@@ -5,7 +5,11 @@ import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } fro
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
-import { transformToNetSuite, validateNetSuiteVendorBill, type NetSuiteConfig } from "./shared/netsuite";
+import {
+  transformToNetSuite,
+  validateNetSuiteRequest,
+  type NetSuiteConfig,
+} from "./shared/netsuite";
 import { loadNetSuiteConfig } from "./shared/netsuite-config";
 import { assessInvoiceFlow } from "./shared/flow";
 import {
@@ -99,6 +103,7 @@ async function listInvoices(event: APIGatewayProxyEventV2) {
       invoiceNumber: item.invoiceNumber,
       purchaseOrderNumber: item.purchaseOrderNumber,
       invoiceType: item.invoiceType,
+      netSuiteTransactionIntent: item.netSuiteTransactionIntent ?? item.extractedJson?.invoice?.transactionIntent,
       currency: item.currency,
       totalAmount: item.totalAmount,
       duplicateCount: item.duplicateCount ?? item.extractedJson?.meta?.duplicateCount ?? 0,
@@ -137,6 +142,7 @@ async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
 
     return jsonResponse({
       netsuiteFormat: preview.bill,
+      netSuiteRequest: preview.request,
       warnings: preview.warnings,
       validation: preview.validation,
       flow: preview.flow,
@@ -181,8 +187,8 @@ async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2
       invoiceMessageId: item.messageId,
       invoiceAttachmentKey: item.attachmentKey,
       invoiceAttachmentId: item.attachmentId,
-      externalId: preview.bill.externalId,
-      requestPayload: preview.bill,
+      externalId: preview.request.externalId,
+      requestPayload: preview.request,
       validation: preview.validation,
       flow: preview.flow,
       warnings: preview.warnings,
@@ -406,13 +412,14 @@ async function findByAttachmentId(messageId: string, attachmentId: string) {
 function buildNetSuitePreview(item: any): {
   config: NetSuiteConfig;
   bill: ReturnType<typeof transformToNetSuite>["bill"];
+  request: ReturnType<typeof transformToNetSuite>["request"];
   warnings: string[];
-  validation: ReturnType<typeof validateNetSuiteVendorBill>;
+  validation: ReturnType<typeof validateNetSuiteRequest>;
   flow: ReturnType<typeof assessInvoiceFlow>;
 } {
   const config = loadNetSuiteConfig();
-  const { bill, warnings } = transformToNetSuite(item.extractedJson, config);
-  const validation = validateNetSuiteVendorBill(bill, config);
+  const { bill, request, warnings } = transformToNetSuite(item.extractedJson, config);
+  const validation = validateNetSuiteRequest(request, config);
   const flow = assessInvoiceFlow(item.extractedJson, {
     confidence: item.confidence,
     warnings: item.warnings ?? item.extractedJson?.meta?.warnings ?? [],
@@ -421,7 +428,7 @@ function buildNetSuitePreview(item: any): {
     netSuiteValidationErrors: validation.errors,
   });
 
-  return { config, bill, warnings, validation, flow };
+  return { config, bill, request, warnings, validation, flow };
 }
 
 async function enqueueNetSuiteTransaction(transactionId: string) {

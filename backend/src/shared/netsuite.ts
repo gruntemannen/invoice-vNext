@@ -5,7 +5,7 @@
  *   "true push, single-subsidiary, scaffold now / wire creds later."
  *
  * This module:
- *   - Transforms extracted invoice JSON -> NetSuite REST vendorBill payload.
+ *   - Transforms extracted invoice JSON -> NetSuite REST AP transaction payload.
  *   - Resolves header/line references via configurable crosswalks.
  *   - Implements an OAuth 2.0 M2M (client-credentials + JWT client-assertion)
  *     token client, a SuiteQL resolver helper, and an idempotent upsert by
@@ -68,6 +68,19 @@ export interface NetSuiteSecret {
 export interface NetSuiteConfig {
   subsidiaryId?: string;
   apAccountId?: string;
+  /**
+   * NetSuite vendor prepayment funding account (bank or credit card account).
+   * Required before a proforma invoice can be pushed as a vendorPrepayment.
+   */
+  prepaymentPaymentAccountId?: string;
+  /** Optional vendor prepayment asset account override. */
+  prepaymentAccountId?: string;
+  /**
+   * Optional custom segment field used for recipient -> business-unit routing,
+   * e.g. "cseg_business_unit". If set, the resolved businessUnitId is emitted
+   * on the transaction body and expense lines as { id }.
+   */
+  businessUnitSegmentFieldId?: string;
   defaults?: {
     expenseAccountId?: string;
     departmentId?: string;
@@ -86,7 +99,33 @@ export interface NetSuiteConfig {
     subsidiariesByTaxId?: Record<string, string>;
     subsidiariesByName?: Record<string, string>;
     purchaseOrdersByNumber?: Record<string, string>;
+    businessUnitsByTaxId?: Record<string, string>;
+    businessUnitsByName?: Record<string, string>;
+    businessUnitsByEntityCode?: Record<string, string>;
+    businessUnitsByEmailDomain?: Record<string, string>;
+    businessUnitsByAddressContains?: Record<string, string>;
   };
+  businessUnits?: Record<string, NetSuiteBusinessUnitRoute>;
+}
+
+export type NetSuiteCustomFieldValue = string | number | boolean | NetSuiteRef;
+
+export interface NetSuiteBusinessUnitRoute {
+  /** NetSuite internal id for the business-unit custom segment, if used. */
+  businessUnitId?: string;
+  businessUnitName?: string;
+  subsidiaryId?: string;
+  departmentId?: string;
+  classId?: string;
+  locationId?: string;
+  customBodyFields?: Record<string, NetSuiteCustomFieldValue>;
+  customLineFields?: Record<string, NetSuiteCustomFieldValue>;
+}
+
+export interface NetSuiteBusinessUnitRoutingResult extends NetSuiteBusinessUnitRoute {
+  businessUnitKey: string;
+  matchedBy: "buyer.entityCode" | "buyer.taxId" | "buyer.name" | "buyer.emailDomain" | "buyer.address";
+  matchedValue: string;
 }
 
 // ===========================================================================
@@ -160,6 +199,57 @@ export interface VendorBill {
   // the two models applies depending on whether SuiteTax is installed. We emit
   // neither at the header today; reconciliation is surfaced as a warning instead.
   expense?: ExpenseSublist;
+}
+
+/**
+ * NetSuite vendor prepayment payload. Proforma invoices are treated as
+ * prepayment requests rather than AP vendor bills because they normally precede
+ * delivery/final invoicing and should debit a prepayment asset account instead
+ * of booking AP expense immediately.
+ */
+export interface VendorPrepayment {
+  externalId: string;
+  tranId?: string;
+  tranDate?: string;
+  memo?: string;
+  entity?: NetSuiteRef; // the vendor/payee
+  subsidiary?: NetSuiteRef;
+  currency?: NetSuiteRef;
+  /** Funding bank or credit-card account. Required by NetSuite. */
+  account?: NetSuiteRef;
+  /** Optional prepayment asset account override. */
+  prepaymentAccount?: NetSuiteRef;
+  payment: number;
+  department?: NetSuiteRef;
+  class?: NetSuiteRef;
+  location?: NetSuiteRef;
+  purchaseOrder?: NetSuiteRef;
+}
+
+export type NetSuiteRecordType = "vendorBill" | "vendorPrepayment";
+export type NetSuiteTransactionIntent = "vendor_bill" | "vendor_prepayment";
+export type NetSuiteRecordPayload = VendorBill | VendorPrepayment;
+
+export interface NetSuiteDocumentClassification {
+  invoiceType?: string;
+  transactionIntent: NetSuiteTransactionIntent;
+  isProforma: boolean;
+}
+
+/**
+ * Durable push envelope stored in the transaction ledger. The envelope lets the
+ * worker route different NetSuite records while keeping the actual REST body
+ * clean under `payload`.
+ */
+export interface NetSuitePushRequest {
+  schemaVersion: "netsuite-ap-v1";
+  recordType: NetSuiteRecordType;
+  restRecordId: NetSuiteRecordType;
+  operation: "upsertByExternalId";
+  externalId: string;
+  document: NetSuiteDocumentClassification;
+  businessUnitRouting?: NetSuiteBusinessUnitRoutingResult;
+  payload: NetSuiteRecordPayload;
 }
 
 // ===========================================================================
@@ -256,6 +346,146 @@ function buildMemo(invoice: any): string {
   return parts.join(" | ").slice(0, 999);
 }
 
+function isProformaInvoice(invoice: any): boolean {
+  const invoiceType = String(invoice?.invoiceType ?? "").trim();
+  const intent = String(invoice?.transactionIntent ?? "").trim();
+  return /pro\s*forma|proforma/i.test(invoiceType) || /prepayment/i.test(intent);
+}
+
+function classifyDocument(invoice: any): NetSuiteDocumentClassification {
+  const proforma = isProformaInvoice(invoice);
+  return {
+    invoiceType: invoice?.invoiceType ? String(invoice.invoiceType) : undefined,
+    transactionIntent: proforma ? "vendor_prepayment" : "vendor_bill",
+    isProforma: proforma,
+  };
+}
+
+function asRef(id: string | undefined): NetSuiteRef | undefined {
+  return id ? { id } : undefined;
+}
+
+function normalizeLookup(value: unknown): string {
+  const text =
+    value && typeof value === "object"
+      ? Object.values(value as Record<string, unknown>).join(" ")
+      : String(value ?? "");
+  return text
+    .normalize("NFKD")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function lookupCrosswalk(map: Record<string, string> | undefined, value: unknown): string | undefined {
+  const raw = String(value ?? "").trim();
+  if (!raw || !map) return undefined;
+  if (map[raw]) return map[raw];
+  const wanted = normalizeLookup(raw);
+  const found = Object.entries(map).find(([key]) => normalizeLookup(key) === wanted);
+  return found?.[1];
+}
+
+function emailDomain(email: unknown): string {
+  const match = String(email ?? "").trim().toLowerCase().match(/@([^@\s>]+)>?$/);
+  return match?.[1] ?? "";
+}
+
+function resolveBusinessUnitRouting(
+  buyer: any,
+  config: NetSuiteConfig,
+  warnings: string[]
+): NetSuiteBusinessUnitRoutingResult | undefined {
+  const cw = config.crosswalks;
+  const checks: Array<{
+    matchedBy: NetSuiteBusinessUnitRoutingResult["matchedBy"];
+    value: string;
+    routeKey?: string;
+  }> = [
+    {
+      matchedBy: "buyer.entityCode",
+      value: String(buyer?.entityCode ?? "").trim(),
+      routeKey: lookupCrosswalk(cw.businessUnitsByEntityCode, buyer?.entityCode),
+    },
+    {
+      matchedBy: "buyer.taxId",
+      value: String(buyer?.taxId ?? "").trim(),
+      routeKey: lookupCrosswalk(cw.businessUnitsByTaxId, buyer?.taxId),
+    },
+    {
+      matchedBy: "buyer.name",
+      value: String(buyer?.name ?? "").trim(),
+      routeKey: lookupCrosswalk(cw.businessUnitsByName, buyer?.name),
+    },
+    {
+      matchedBy: "buyer.emailDomain",
+      value: emailDomain(buyer?.email),
+      routeKey: lookupCrosswalk(cw.businessUnitsByEmailDomain, emailDomain(buyer?.email)),
+    },
+  ];
+
+  const address = normalizeLookup(buyer?.address);
+  if (address && cw.businessUnitsByAddressContains) {
+    const addressMatch = Object.entries(cw.businessUnitsByAddressContains).find(([needle]) =>
+      address.includes(normalizeLookup(needle))
+    );
+    if (addressMatch) {
+      checks.push({
+        matchedBy: "buyer.address",
+        value: addressMatch[0],
+        routeKey: addressMatch[1],
+      });
+    }
+  }
+
+  const match = checks.find((candidate) => candidate.value && candidate.routeKey);
+  if (!match?.routeKey) {
+    if (buyer?.name || buyer?.taxId || buyer?.entityCode || buyer?.email || buyer?.address) {
+      warnings.push(
+        "Invoice recipient did not match any NetSuite business-unit routing crosswalk; subsidiary/business-unit dimensions require review."
+      );
+    }
+    return undefined;
+  }
+
+  const configuredRoute = config.businessUnits?.[match.routeKey];
+  const route: NetSuiteBusinessUnitRoute = configuredRoute ?? { businessUnitId: match.routeKey };
+  if (!configuredRoute) {
+    warnings.push(
+      `Recipient matched business unit key "${match.routeKey}", but businessUnits.${match.routeKey} is not configured; only the key is recorded.`
+    );
+  }
+
+  return {
+    ...route,
+    businessUnitKey: match.routeKey,
+    matchedBy: match.matchedBy,
+    matchedValue: match.value,
+  };
+}
+
+function refCustomFields(
+  fields: Record<string, NetSuiteCustomFieldValue> | undefined
+): Record<string, NetSuiteCustomFieldValue> {
+  return fields ? { ...fields } : {};
+}
+
+function applyCustomFields(target: Record<string, unknown>, fields?: Record<string, NetSuiteCustomFieldValue>) {
+  for (const [fieldId, value] of Object.entries(refCustomFields(fields))) {
+    if (value === undefined || value === null || value === "") continue;
+    target[fieldId] = value;
+  }
+}
+
+function applyBusinessUnitSegment(
+  target: Record<string, unknown>,
+  config: NetSuiteConfig,
+  route?: NetSuiteBusinessUnitRoutingResult
+) {
+  if (!route?.businessUnitId || !config.businessUnitSegmentFieldId) return;
+  target[config.businessUnitSegmentFieldId] = { id: route.businessUnitId };
+}
+
 /**
  * Placeholder internal id used when a reference cannot be resolved through a
  * crosswalk and no default is configured. It is intentionally non-numeric and
@@ -266,7 +496,7 @@ function buildMemo(invoice: any): string {
 export const UNRESOLVED_PLACEHOLDER = "__UNRESOLVED__";
 
 /**
- * Transform an extracted invoice into a NetSuite vendor bill payload.
+ * Transform an extracted invoice into a NetSuite AP transaction payload.
  *
  * Mapping summary:
  *   invoice.invoiceNumber -> tranId + externalId (via buildExternalId)
@@ -291,7 +521,7 @@ export const UNRESOLVED_PLACEHOLDER = "__UNRESOLVED__";
 export function transformToNetSuite(
   extracted: any,
   config: NetSuiteConfig
-): { bill: VendorBill; warnings: string[] } {
+): { bill: NetSuiteRecordPayload; request: NetSuitePushRequest; warnings: string[] } {
   const warnings: string[] = [];
   const cw = config.crosswalks;
 
@@ -301,6 +531,14 @@ export function transformToNetSuite(
   const lineItems: any[] = Array.isArray(extracted?.lineItems) ? extracted.lineItems : [];
 
   const externalId = buildExternalId(extracted);
+  const document = classifyDocument(invoice);
+  const businessUnitRouting = resolveBusinessUnitRouting(buyer, config, warnings);
+
+  if (document.isProforma) {
+    warnings.push(
+      "Proforma invoice classified as a NetSuite vendor prepayment request, not a vendor bill."
+    );
+  }
 
   // --- Vendor (entity) resolution: prefer taxId, then name ----------------
   let entity: NetSuiteRef | undefined;
@@ -344,7 +582,9 @@ export function transformToNetSuite(
   let subsidiary: NetSuiteRef | undefined;
   const buyerTaxId: string = buyer?.taxId ?? "";
   const buyerName: string = buyer?.name ?? "";
-  if (buyerTaxId && cw.subsidiariesByTaxId?.[buyerTaxId]) {
+  if (businessUnitRouting?.subsidiaryId) {
+    subsidiary = { id: businessUnitRouting.subsidiaryId };
+  } else if (buyerTaxId && cw.subsidiariesByTaxId?.[buyerTaxId]) {
     subsidiary = { id: cw.subsidiariesByTaxId[buyerTaxId] };
   } else if (buyerName && cw.subsidiariesByName?.[buyerName]) {
     subsidiary = { id: cw.subsidiariesByName[buyerName] };
@@ -372,7 +612,8 @@ export function transformToNetSuite(
   }
 
   // --- Lines (NET amounts) -> expense sublist -----------------------------
-  const sourceLines = buildExpenseSourceLines(lineItems, invoice, warnings);
+  const isVendorPrepayment = document.transactionIntent === "vendor_prepayment";
+  const sourceLines = isVendorPrepayment ? [] : buildExpenseSourceLines(lineItems, invoice, warnings);
   const items: ExpenseLine[] = sourceLines.map((line, index) => {
     const lineNo = toNumber(line?.lineNumber) || index + 1;
     const amount = round2(toNumber(line?.amount));
@@ -402,8 +643,8 @@ export function transformToNetSuite(
     const deptCode: string = line?.department ?? "";
     if (deptCode && cw.departmentsByCode[deptCode]) {
       department = { id: cw.departmentsByCode[deptCode] };
-    } else if (config.defaults?.departmentId) {
-      department = { id: config.defaults.departmentId };
+    } else if (businessUnitRouting?.departmentId || config.defaults?.departmentId) {
+      department = { id: businessUnitRouting?.departmentId ?? config.defaults?.departmentId ?? "" };
     } else if (deptCode) {
       warnings.push(`Line ${lineNo}: department "${deptCode}" not in crosswalk; left unset.`);
     }
@@ -416,16 +657,16 @@ export function transformToNetSuite(
     const classCode: string = line?.costCenter ?? line?.project ?? "";
     if (classCode && cw.classesByCode[classCode]) {
       cls = { id: cw.classesByCode[classCode] };
-    } else if (config.defaults?.classId) {
-      cls = { id: config.defaults.classId };
+    } else if (businessUnitRouting?.classId || config.defaults?.classId) {
+      cls = { id: businessUnitRouting?.classId ?? config.defaults?.classId ?? "" };
     } else if (classCode) {
       warnings.push(`Line ${lineNo}: class "${classCode}" not in crosswalk; left unset.`);
     }
 
     // Location default (extractor has no location concept today)
     let location: NetSuiteRef | undefined;
-    if (config.defaults?.locationId) {
-      location = { id: config.defaults.locationId };
+    if (businessUnitRouting?.locationId || config.defaults?.locationId) {
+      location = { id: businessUnitRouting?.locationId ?? config.defaults?.locationId ?? "" };
     }
 
     // Per-line tax code (SuiteTax only — see ExpenseLine TODO)
@@ -442,10 +683,12 @@ export function transformToNetSuite(
     if (cls) expenseLine.class = cls;
     if (location) expenseLine.location = location;
     if (taxCode) expenseLine.taxCode = taxCode;
+    applyBusinessUnitSegment(expenseLine as unknown as Record<string, unknown>, config, businessUnitRouting);
+    applyCustomFields(expenseLine as unknown as Record<string, unknown>, businessUnitRouting?.customLineFields);
     return expenseLine;
   });
 
-  if (items.length === 0) {
+  if (!isVendorPrepayment && items.length === 0) {
     warnings.push("No line items found; vendor bill has an empty expense sublist.");
   }
 
@@ -453,7 +696,7 @@ export function transformToNetSuite(
   const netSum = round2(items.reduce((acc, l) => acc + l.amount, 0));
   const taxAmount = round2(toNumber(invoice?.taxAmount));
   const totalAmount = round2(toNumber(invoice?.totalAmount));
-  if (totalAmount > 0 && round2(netSum + taxAmount) !== totalAmount) {
+  if (!isVendorPrepayment && totalAmount > 0 && round2(netSum + taxAmount) !== totalAmount) {
     warnings.push(
       `Reconciliation mismatch: sum(line net)=${netSum} + tax=${taxAmount} = ${round2(
         netSum + taxAmount
@@ -461,19 +704,69 @@ export function transformToNetSuite(
     );
   }
 
+  const invoiceNumber: string = invoice?.invoiceNumber ?? "";
+  const tranDate: string = invoice?.invoiceDate ?? "";
+  const memo = buildMemo(invoice);
+
+  if (isVendorPrepayment) {
+    const prepayment: VendorPrepayment = {
+      externalId,
+      payment: totalAmount,
+    };
+
+    if (invoiceNumber) prepayment.tranId = invoiceNumber;
+    if (tranDate) prepayment.tranDate = tranDate;
+    if (memo) prepayment.memo = memo;
+    if (entity) prepayment.entity = entity;
+    if (subsidiary) prepayment.subsidiary = subsidiary;
+    if (currency) prepayment.currency = currency;
+    if (config.prepaymentPaymentAccountId) {
+      prepayment.account = { id: config.prepaymentPaymentAccountId };
+    }
+    if (config.prepaymentAccountId) {
+      prepayment.prepaymentAccount = { id: config.prepaymentAccountId };
+    }
+    if (businessUnitRouting?.departmentId || config.defaults?.departmentId) {
+      prepayment.department = asRef(businessUnitRouting?.departmentId ?? config.defaults?.departmentId);
+    }
+    if (businessUnitRouting?.classId || config.defaults?.classId) {
+      prepayment.class = asRef(businessUnitRouting?.classId ?? config.defaults?.classId);
+    }
+    if (businessUnitRouting?.locationId || config.defaults?.locationId) {
+      prepayment.location = asRef(businessUnitRouting?.locationId ?? config.defaults?.locationId);
+    }
+    const poId = poNumber ? cw.purchaseOrdersByNumber?.[poNumber] : undefined;
+    if (poId) prepayment.purchaseOrder = { id: poId };
+    applyBusinessUnitSegment(prepayment as unknown as Record<string, unknown>, config, businessUnitRouting);
+    applyCustomFields(
+      prepayment as unknown as Record<string, unknown>,
+      businessUnitRouting?.customBodyFields
+    );
+
+    const request: NetSuitePushRequest = {
+      schemaVersion: "netsuite-ap-v1",
+      recordType: "vendorPrepayment",
+      restRecordId: "vendorPrepayment",
+      operation: "upsertByExternalId",
+      externalId,
+      document,
+      businessUnitRouting,
+      payload: prepayment,
+    };
+
+    return { bill: prepayment, request, warnings };
+  }
+
   const bill: VendorBill = { externalId };
 
-  const invoiceNumber: string = invoice?.invoiceNumber ?? "";
   // TODO(sandbox): tranId may be read-only/auto-numbered — drop if rejected.
   if (invoiceNumber) bill.tranId = invoiceNumber;
 
-  const tranDate: string = invoice?.invoiceDate ?? "";
   if (tranDate) bill.tranDate = tranDate;
 
   const dueDate: string = invoice?.dueDate ?? "";
   if (dueDate) bill.dueDate = dueDate;
 
-  const memo = buildMemo(invoice);
   if (memo) bill.memo = memo;
 
   if (entity) bill.entity = entity;
@@ -481,10 +774,23 @@ export function transformToNetSuite(
   if (currency) bill.currency = currency;
   if (terms) bill.terms = terms;
   if (account) bill.account = account;
+  applyBusinessUnitSegment(bill as unknown as Record<string, unknown>, config, businessUnitRouting);
+  applyCustomFields(bill as unknown as Record<string, unknown>, businessUnitRouting?.customBodyFields);
 
   bill.expense = { items };
 
-  return { bill, warnings };
+  const request: NetSuitePushRequest = {
+    schemaVersion: "netsuite-ap-v1",
+    recordType: "vendorBill",
+    restRecordId: "vendorBill",
+    operation: "upsertByExternalId",
+    externalId,
+    document,
+    businessUnitRouting,
+    payload: bill,
+  };
+
+  return { bill, request, warnings };
 }
 
 // ===========================================================================
@@ -532,6 +838,44 @@ export function validateNetSuiteVendorBill(
   });
 
   return { valid: errors.length === 0, errors };
+}
+
+export function validateNetSuiteVendorPrepayment(
+  prepayment: VendorPrepayment,
+  config?: NetSuiteConfig
+): { valid: boolean; errors: string[] } {
+  const errors: string[] = [];
+
+  if (!prepayment.entity?.id) {
+    errors.push("entity (vendor/payee) is required");
+  }
+  if (!prepayment.tranDate) {
+    errors.push("tranDate is required");
+  }
+  if (!(typeof prepayment.payment === "number" && prepayment.payment > 0)) {
+    errors.push("payment amount is required for vendor prepayment");
+  }
+  if (!prepayment.account?.id) {
+    errors.push("account (prepayment funding bank/credit-card account) is required");
+  }
+  if (config?.subsidiaryId && !prepayment.subsidiary?.id) {
+    errors.push("subsidiary is required when config.subsidiaryId is set");
+  }
+  if (prepayment.entity?.id === UNRESOLVED_PLACEHOLDER) {
+    errors.push("entity ref is an unresolved placeholder");
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+export function validateNetSuiteRequest(
+  request: NetSuitePushRequest,
+  config?: NetSuiteConfig
+): { valid: boolean; errors: string[] } {
+  if (request.recordType === "vendorPrepayment") {
+    return validateNetSuiteVendorPrepayment(request.payload as VendorPrepayment, config);
+  }
+  return validateNetSuiteVendorBill(request.payload as VendorBill, config);
 }
 
 // ===========================================================================
@@ -733,6 +1077,35 @@ export interface UpsertResult {
   body: unknown;
 }
 
+export function asNetSuitePushRequest(
+  payload: unknown,
+  externalId: string
+): NetSuitePushRequest {
+  const maybe = payload as Partial<NetSuitePushRequest> | undefined;
+  if (
+    maybe &&
+    typeof maybe === "object" &&
+    maybe.schemaVersion === "netsuite-ap-v1" &&
+    (maybe.recordType === "vendorBill" || maybe.recordType === "vendorPrepayment") &&
+    maybe.payload
+  ) {
+    return maybe as NetSuitePushRequest;
+  }
+
+  return {
+    schemaVersion: "netsuite-ap-v1",
+    recordType: "vendorBill",
+    restRecordId: "vendorBill",
+    operation: "upsertByExternalId",
+    externalId,
+    document: {
+      transactionIntent: "vendor_bill",
+      isProforma: false,
+    },
+    payload: payload as VendorBill,
+  };
+}
+
 /**
  * Idempotently create-or-update a vendor bill by external id.
  *
@@ -751,8 +1124,33 @@ export async function upsertVendorBill(
   bill: VendorBill,
   externalId: string
 ): Promise<UpsertResult> {
+  return upsertNetSuiteRecord(
+    secret,
+    token,
+    {
+      schemaVersion: "netsuite-ap-v1",
+      recordType: "vendorBill",
+      restRecordId: "vendorBill",
+      operation: "upsertByExternalId",
+      externalId,
+      document: {
+        transactionIntent: "vendor_bill",
+        isProforma: false,
+      },
+      payload: bill,
+    },
+    externalId
+  );
+}
+
+export async function upsertNetSuiteRecord(
+  secret: NetSuiteSecret,
+  token: string,
+  request: NetSuitePushRequest,
+  externalId: string = request.externalId
+): Promise<UpsertResult> {
   const safeEid = sanitizeIdPart(externalId).slice(0, EXTERNAL_ID_MAX);
-  const url = `${restBase(secret.accountId)}/record/v1/vendorBill/eid:${encodeURIComponent(
+  const url = `${restBase(secret.accountId)}/record/v1/${request.restRecordId}/eid:${encodeURIComponent(
     safeEid
   )}`;
 
@@ -762,12 +1160,14 @@ export async function upsertVendorBill(
       authorization: `Bearer ${token}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify(bill),
+    body: JSON.stringify(request.payload),
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`Vendor bill upsert failed: ${res.status} ${text.slice(0, 500)}`);
+    throw new Error(
+      `${request.recordType} upsert failed: ${res.status} ${text.slice(0, 500)}`
+    );
   }
 
   let body: unknown = null;
@@ -803,6 +1203,9 @@ export async function upsertVendorBill(
 export const exampleNetSuiteConfig: NetSuiteConfig = {
   subsidiaryId: undefined,
   apAccountId: undefined,
+  prepaymentPaymentAccountId: undefined,
+  prepaymentAccountId: undefined,
+  businessUnitSegmentFieldId: undefined,
   defaults: {
     expenseAccountId: undefined,
     departmentId: undefined,
@@ -821,5 +1224,11 @@ export const exampleNetSuiteConfig: NetSuiteConfig = {
     subsidiariesByTaxId: {},
     subsidiariesByName: {},
     purchaseOrdersByNumber: {},
+    businessUnitsByTaxId: {},
+    businessUnitsByName: {},
+    businessUnitsByEntityCode: {},
+    businessUnitsByEmailDomain: {},
+    businessUnitsByAddressContains: {},
   },
+  businessUnits: {},
 };

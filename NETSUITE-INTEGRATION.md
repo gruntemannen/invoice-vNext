@@ -1,139 +1,189 @@
 # NetSuite Integration
 
-This system pushes emailed/uploaded invoices into **Oracle NetSuite** as Accounts Payable
-**Vendor Bills**. The integration is **scaffolded**: the transform, validation, OAuth 2.0
-client, SuiteQL resolver, and idempotent upsert are implemented and the API exposes an
-**export-only** preview today; turning on live push is a credentials + sandbox-validation
-step (see the checklist below).
+This system pushes emailed/uploaded invoices into Oracle NetSuite as AP transactions.
+Standard payable invoices map to `vendorBill`; proforma invoices map to
+`vendorPrepayment` because they are prepayment requests, not final AP vendor bills.
 
-> Decision of record: **true push, single-subsidiary, scaffold now / wire creds later.**
+The integration is scaffolded: transform, validation, OAuth 2.0 client, SuiteQL resolver,
+durable outbox, replay, and idempotent upsert are implemented. Live push stays disabled
+until credentials and sandbox validation are complete.
 
-## How it works
+## How It Works
 
+```text
+PDF/email/upload
+  -> Bedrock extraction
+  -> DynamoDB invoice record
+  -> transformToNetSuite()
+  -> NetSuite push envelope
+       recordType: vendorBill | vendorPrepayment
+       payload: clean NetSuite REST body
+  -> durable transaction outbox
+  -> optional live worker push by externalId
 ```
-PDF → Bedrock (Claude Sonnet 4.6, reads the PDF directly) → extracted JSON (DynamoDB)
-     → transformToNetSuite() → vendorBill payload → (export preview today)
-                                                  → (live: OAuth2 token → PUT eid:{externalId})
-```
 
-- **Endpoint (export-only):** `GET /invoices/{messageId}/{attachmentId}/netsuite`
-  returns `{ netsuiteFormat, warnings, validation, flow, originalExtraction }`. It builds and
-  validates the vendor-bill payload, folds validation/mapping issues into the AP `flow`
-  decision, but does **not** call NetSuite.
-- **Transaction endpoint:** `POST /invoices/{messageId}/{attachmentId}/netsuite/transactions`
-  writes a durable DynamoDB outbox record before any push is queued. If live push is enabled
-  and the invoice is ready, it queues a NetSuite worker message; otherwise the transaction is
-  held for review/configuration and can be replayed later.
-- **Replay endpoints:** `GET /netsuite/transactions`, `POST /netsuite/transactions/{transactionId}/replay`,
-  and `POST /netsuite/transactions/replay?status=FAILED_RETRYABLE` support outage recovery.
-- **Module:** [`backend/src/shared/netsuite.ts`](backend/src/shared/netsuite.ts) — pure,
-  dependency-free (global `fetch` + `node:crypto`). Key exports: `transformToNetSuite`,
-  `validateNetSuiteVendorBill`, `buildExternalId`, `getAccessToken`, `suiteql`,
-  `upsertVendorBill`, `exampleNetSuiteConfig`.
-- **Config:** [`backend/netsuite-config.json`](backend/netsuite-config.json) — non-secret
-  crosswalks + defaults (see below).
-- **Secret:** the CDK provisions a Secrets Manager secret `"<projectPrefix>/netsuite"`
-  (`NETSUITE_SECRET_ARN` env on the API Lambda) for the OAuth 2.0 credentials.
+- `GET /invoices/{messageId}/{attachmentId}/netsuite` returns
+  `{ netsuiteFormat, netSuiteRequest, warnings, validation, flow, originalExtraction }`.
+- `netsuiteFormat` is the clean REST body.
+- `netSuiteRequest` is the durable schema envelope with `schemaVersion`, `recordType`,
+  `externalId`, document classification, business-unit routing, and payload.
+- `POST /invoices/{messageId}/{attachmentId}/netsuite/transactions` writes the transaction
+  ledger record before any NetSuite call is queued.
+- Replay endpoints support outage recovery:
+  `GET /netsuite/transactions`,
+  `POST /netsuite/transactions/{transactionId}/replay`, and
+  `POST /netsuite/transactions/replay?status=FAILED_RETRYABLE`.
 
-## Field mapping (extracted JSON → vendorBill)
+Key module: `backend/src/shared/netsuite.ts`
+
+Key exports: `transformToNetSuite`, `validateNetSuiteRequest`, `buildExternalId`,
+`getAccessToken`, `suiteql`, `upsertNetSuiteRecord`, `exampleNetSuiteConfig`.
+
+## Standard Invoices -> vendorBill
 
 | Extracted | vendorBill | Notes |
 |---|---|---|
-| `vendor.taxId` / `vendor.name` | `entity` `{id}` | resolved via `vendorsByTaxId` then `vendorsByName`; unresolved → warning |
+| `vendor.taxId` / `vendor.name` | `entity` `{ id }` | resolved through `vendorsByTaxId`, then `vendorsByName` |
 | `invoice.invoiceNumber` | `tranId` + `externalId` | `externalId` is the idempotency key |
-| `invoice.invoiceDate` | `tranDate` | |
-| `invoice.currency` | `currency` `{id}` | via `currenciesByCode` |
-| `invoice.dueDate` / `paymentTerms` | `dueDate` / `terms` `{id}` | terms via `termsByName` |
-| `invoice.description` / PO / service period | `memo` | preserves review context without inventing unsupported fields |
-| `buyer.taxId` / `buyer.name` / config | `subsidiary` `{id}` | resolved via `subsidiariesByTaxId`, `subsidiariesByName`, then `subsidiaryId` fallback |
-| `invoice.purchaseOrderNumber` | review warning | `purchaseOrdersByNumber` can map the PO id, but PO-backed bills should use a PO conversion / three-way-match flow |
-| `lineItems[]` (NET) | `expense.items[]` | `account`/`department`/`class`/`taxCode` resolved via crosswalks; a summary line is created from `netAmount` when no lines are extracted |
+| `invoice.invoiceDate` | `tranDate` | required |
+| `invoice.currency` | `currency` `{ id }` | via `currenciesByCode` |
+| `invoice.dueDate` / `paymentTerms` | `dueDate` / `terms` `{ id }` | terms via `termsByName` |
+| `buyer.*` | `subsidiary` and business dimensions | routed through recipient/business-unit mapping |
+| `invoice.purchaseOrderNumber` | warning or PO ref context | PO-backed bills should use a PO match/conversion flow |
+| `lineItems[]` net amounts | `expense.items[]` | GL, department, class, location, and tax code are crosswalked |
 
-`invoice.totalAmount` is **gross**; line amounts are **net**. The transform posts net lines
-and emits a **reconciliation warning** if `sum(net) + taxAmount != totalAmount`.
+`invoice.totalAmount` is gross. Expense lines are net. The transform warns when
+`sum(line net) + taxAmount != totalAmount`.
 
-## AP flow controls
+## Proformas -> vendorPrepayment
 
-Extraction stores AP review metadata on each invoice record:
+Proforma invoices are classified as prepayments when `invoice.invoiceType = "Proforma"` or
+`invoice.transactionIntent = "VendorPrepayment"`.
 
-- `reviewStatus`: `READY_FOR_NETSUITE` or `NEEDS_REVIEW`
-- `controlFlags`: low confidence, missing required fields, potential duplicate, PO match required,
-  non-standard document type, buyer/entity routing gap, and bank details captured for vendor-master verification
-- `duplicateKey`: hash of vendor + invoice number + currency + gross total, indexed by DynamoDB GSI `duplicate`
-- `autoBookEligible`: true only for high-confidence records with no warning/blocking flags
+| Extracted/config | vendorPrepayment | Notes |
+|---|---|---|
+| `vendor.taxId` / `vendor.name` | `entity` `{ id }` | same vendor resolution as vendor bills |
+| `invoice.totalAmount` | `payment` | required prepayment amount |
+| `invoice.invoiceDate` | `tranDate` | required |
+| `prepaymentPaymentAccountId` | `account` `{ id }` | required NetSuite funding bank/credit-card account |
+| `prepaymentAccountId` | `prepaymentAccount` `{ id }` | optional prepayment asset account override |
+| `purchaseOrdersByNumber` | `purchaseOrder` `{ id }` | optional PO link |
+| recipient route | `subsidiary`, `department`, `class`, `location`, custom segment | same business-unit mapping as bills |
 
-The NetSuite preview recalculates `flow` with transform warnings and validation errors included, so
-unresolved vendor/subsidiary/currency/account mappings keep the invoice in review even when extraction was successful.
+Because this is a cash/prepayment workflow, proformas stay in AP review unless the NetSuite
+schema and configuration are complete.
 
-## Durable outbox and replay
+## Recipient -> Business-Unit Routing
 
-NetSuite pushes use a database-first outbox:
+The buyer/recipient is matched before payload validation. Crosswalks map recipient details to
+a key in `businessUnits`:
 
-1. The API builds the vendor-bill payload and writes a `NETSUITE_TRANSACTION` item to DynamoDB.
-2. Only after the transaction is logged does the API enqueue the NetSuite worker.
-3. The worker marks the transaction `IN_FLIGHT`, calls NetSuite by idempotent `externalId`, then records `SUCCEEDED`, `FAILED_RETRYABLE`, or `FAILED_PERMANENT`.
-4. Every attempt appends an event to the transaction record with timestamp, status, and error/location details.
-5. Retryable outage failures remain queryable and replayable even if the SQS message later lands in the NetSuite DLQ.
+- `businessUnitsByEntityCode`
+- `businessUnitsByTaxId`
+- `businessUnitsByName`
+- `businessUnitsByEmailDomain`
+- `businessUnitsByAddressContains`
+
+Each `businessUnits.<key>` route can set:
+
+- `businessUnitId`
+- `businessUnitName`
+- `subsidiaryId`
+- `departmentId`
+- `classId`
+- `locationId`
+- `customBodyFields`
+- `customLineFields`
+
+If `businessUnitSegmentFieldId` is configured, `businessUnitId` is emitted as `{ id }` on the
+transaction body and expense lines. Missing recipient routing emits a NetSuite warning and
+keeps the invoice in review.
+
+## Configuration
+
+Edit `backend/netsuite-config.json`. It contains non-secret values only.
+
+Required before live vendor-bill push:
+
+- `vendorsByTaxId` or `vendorsByName`
+- `currenciesByCode`
+- `accountsByCode` or `defaults.expenseAccountId`
+- `apAccountId` when the account requires an AP account
+- subsidiary/business-unit routing for OneWorld
+
+Required before live proforma/prepayment push:
+
+- all vendor-bill basics that still apply
+- `prepaymentPaymentAccountId`
+- NetSuite Vendor Prepayments feature enabled
+- NetSuite role permissions for Vendor Prepayment create/edit
+- optional `prepaymentAccountId` if the default prepayment account is not enough
+
+Credentials live in Secrets Manager under `NETSUITE_SECRET_ARN`, not in the config file.
+
+## Durable Outbox And Replay
+
+NetSuite pushes are database-first:
+
+1. The API builds the NetSuite push envelope.
+2. The API writes a `NETSUITE_TRANSACTION` item to DynamoDB.
+3. Only after the transaction is logged does the API enqueue the NetSuite worker.
+4. The worker marks the transaction `IN_FLIGHT`, calls NetSuite by idempotent `externalId`,
+   then records `SUCCEEDED`, `FAILED_RETRYABLE`, or `FAILED_PERMANENT`.
+5. Retryable outage failures remain queryable and replayable even if SQS later DLQs the message.
 
 Transaction statuses:
 
 - `HELD_FOR_REVIEW`: extracted or mapped data is not ready for NetSuite.
-- `HELD_FOR_CONFIGURATION`: live push is disabled; the transaction is logged for later replay.
-- `QUEUED`: logged and queued for the NetSuite worker.
+- `HELD_FOR_CONFIGURATION`: live push is disabled; transaction is logged for later replay.
+- `QUEUED`: logged and queued.
 - `IN_FLIGHT`: worker attempt is active.
 - `SUCCEEDED`: NetSuite upsert completed.
 - `FAILED_RETRYABLE`: outage/rate-limit/network/server failure; safe to replay.
 - `FAILED_PERMANENT`: validation/auth/client failure that needs correction before replay.
 
-Live push is controlled by `infra/lib/config.ts` (`netSuiteLivePushEnabled`). Keep it `false`
-until sandbox validation and NetSuite credentials are complete; transaction logging still works.
+## NetSuite Account Setup
 
-## NetSuite account setup (for live push)
-
-1. **Enable features:** Setup → Company → Enable Features → SuiteCloud → **REST Web Services**
-   and **OAuth 2.0** (accept the SuiteCloud Terms of Service).
-2. **Integration record:** Setup → Integration → Manage Integrations → New. Enable OAuth 2.0
-   client credentials; upload the **public certificate** (note the **Certificate ID**).
-3. **Role:** create a least-privilege role with **REST Web Services** (Full) and
-   **"Log in using OAuth 2.0 Access Tokens"** (Full) — **NOT** the Token-Based Authentication
-   permission (that is OAuth 1.0/TBA and will not authorize this flow). Add Vendor Bill
-   create/edit + vendor/account/currency view.
-4. **Secret value** (`NETSUITE_SECRET_ARN`): JSON
+1. Enable REST Web Services and OAuth 2.0.
+2. Create an integration record with OAuth 2.0 client credentials and upload the public
+   certificate.
+3. Create a least-privilege role with REST Web Services and "Log in using OAuth 2.0 Access
+   Tokens". Do not use the older Token-Based Authentication permission for this flow.
+4. Grant create/edit permissions for Vendor Bill and Vendor Prepayment, plus view permissions
+   for vendor/account/currency/subsidiary/dimensions.
+5. Store the secret JSON:
    `{ "accountId": "...", "clientId": "...", "certificateId": "...", "privateKeyPem": "...", "alg": "PS256" }`.
-5. **Config** (`netsuite-config.json`): populate the crosswalks (`vendorsByTaxId`,
-   `vendorsByName`, `subsidiariesByTaxId`, `subsidiariesByName`, `accountsByCode`,
-   `currenciesByCode`, `departmentsByCode`, `classesByCode`, `termsByName`,
-   `purchaseOrdersByNumber`) and `subsidiaryId` / `apAccountId` / `defaults.expenseAccountId`
-   with the target account's internal ids.
-   Use the `suiteql()` helper to look ids up.
+6. Populate `netsuite-config.json` with target-account internal ids. Use the `suiteql()`
+   helper to look ids up.
 
 ## Idempotency
 
-Live push uses `PUT .../record/v1/vendorBill/eid:{externalId}` (upsert by external id), so SQS
-redeliveries / retries with the same `externalId` update rather than duplicate the bill. Pair
-this with a DynamoDB conditional state transition when wiring the worker.
+Live push uses:
 
-## Sandbox-validation checklist (before enabling live push)
+```text
+PUT /record/v1/{recordType}/eid:{externalId}
+```
 
-These were flagged uncertain by research and **must be confirmed against the target account**
-(see `TODO(sandbox)` markers in `netsuite.ts`):
+The durable transaction envelope records `recordType`, so replay uses the same NetSuite record
+type originally built for the invoice.
 
-- [ ] **Tax engine** — per-line `taxCode` is honored only under **SuiteTax**; on legacy tax it
-      is ignored/rejected. Decide tax-exclusive posting vs SuiteTax.
-- [ ] **Expense sublist over REST** — exposure depends on Accounting Preferences; if AP only
-      accepts the `item` sublist over REST, switch line mapping.
-- [ ] **`tranId`** — may be read-only/auto-numbered; if rejected, rely on `externalId` only.
-- [ ] **Subsidiary/entity routing** — in a OneWorld account `subsidiary` is required and
-      the vendor/accounts must be shared with it. Populate `subsidiariesByTaxId/name` for
-      the buyer legal entities, or set `subsidiaryId` only for a true single-subsidiary flow.
-- [ ] **PO-backed invoices** — if `purchaseOrderNumber` is present, validate whether the
-      account should convert/match the PO before saving a bill rather than posting a direct
-      expense vendor bill.
-- [ ] **Vendor bank verification** — extraction captures IBAN/BIC values, but live push
-      should compare them against the NetSuite vendor master before auto-booking.
-- [ ] **Duplicate behavior** — validate the DynamoDB `duplicate` index and AP handling for
-      same vendor/invoice/amount retries, corrected invoices, and reminders.
-- [ ] **Source PDF attach** — REST cannot upload file bytes; attaching the original PDF needs a
-      companion **SuiteScript RESTlet** (File Cabinet create + `record.attach`).
-- [ ] **Auto-post gating** — hold low-confidence extractions for human review rather than
-      auto-creating bills (a wrong vendor posts the liability against the wrong party).
+## Sandbox Validation Checklist
+
+- [ ] Confirm `vendorBill` `expense.items` is writable over REST in the target account.
+- [ ] Confirm `vendorPrepayment` REST support, Vendor Prepayments feature, default prepayment
+      account, and role permissions.
+- [ ] Confirm `prepaymentPaymentAccountId` is a valid bank/credit-card funding account in the
+      transaction currency.
+- [ ] Confirm whether `tranId` is writable or auto-numbered.
+- [ ] Confirm SuiteTax versus legacy tax behavior before sending per-line `taxCode`.
+- [ ] Populate and validate recipient/business-unit routing.
+- [ ] Confirm vendor, accounts, departments, classes, locations, and custom segments are shared
+      with the resolved subsidiary in OneWorld.
+- [ ] Decide whether PO invoices should be transformed from/matched to purchase orders instead
+      of directly posted as expense bills.
+- [ ] Compare extracted IBAN/BIC against the NetSuite vendor master before auto-booking.
+- [ ] Validate duplicate handling for same vendor/invoice/amount retries, corrected invoices,
+      reminders, and proformas.
+- [ ] Build a companion SuiteScript RESTlet if original PDF attachment is required; REST Record
+      API alone cannot upload file bytes.
+- [ ] Keep `netSuiteLivePushEnabled` false until sandbox validation and credentials are complete.

@@ -10,7 +10,7 @@ Invoice Extractor is a production-ready, serverless application that:
 - Ingests PDF invoices from **email** (Amazon SES) and **web upload**
 - Extracts structured JSON using Claude Sonnet 4.6 on Amazon Bedrock (reads PDFs directly)
 - Stores results in DynamoDB with confidence scoring
-- Pushes invoices to **NetSuite** as Accounts Payable vendor bills (export-only scaffold today; OAuth 2.0 push-ready)
+- Pushes invoices to **NetSuite** as Accounts Payable vendor bills or vendor prepayments (export-only scaffold today; OAuth 2.0 push-ready)
 - Provides a **Cognito-authenticated admin console** for ingestion stats, success rates, and audit
 
 ## Key Features
@@ -18,7 +18,7 @@ Invoice Extractor is a production-ready, serverless application that:
 - **AI-Powered Extraction**: Uses Claude Sonnet 4.6 for accurate invoice data extraction directly from PDFs (no OCR needed)
 - **Email + Web Ingestion**: Accepts invoices via Amazon SES email receiving or direct web upload
 - **Multi-Language Support**: Works with invoices in any language (Japanese, Chinese, Korean, European languages, etc.)
-- **NetSuite Integration**: Transforms extracted data into a NetSuite REST vendor bill — export-only today, with an OAuth 2.0 (M2M) push scaffold included
+- **NetSuite Integration**: Transforms extracted data into NetSuite REST vendor bills or vendor prepayments — export-only today, with an OAuth 2.0 (M2M) push scaffold included
 - **Admin Console**: Cognito-authenticated dashboard with ingestion stats, success rates, and a DynamoDB audit view
 - **Secure by Default**: JWT-protected API, least-privilege IAM, DynamoDB PITR, S3 versioning, a Bedrock concurrency cap, and CloudWatch alarms
 - **Confidence Scoring**: Automatic quality assessment of extracted data
@@ -42,7 +42,7 @@ Processing                                                ▼
                                                           ▲
 Access  (Cognito JWT on every route)                      │
   Admin UI (CloudFront PWA) ─▶ API Lambda ────────────────┘
-                                  └─▶ NetSuite vendor bill (export-only)
+                                  └─▶ NetSuite AP transaction (export-only)
 ```
 
 ### How It Works
@@ -52,7 +52,7 @@ Access  (Cognito JWT on every route)                      │
 3. The Extract Lambda sends the PDF directly to Claude Sonnet 4.6
 4. Claude visually analyzes the document and extracts structured data
 5. Results are validated, confidence-scored, checked for likely duplicates, and stored in DynamoDB with review flags
-6. Admins sign in to the console (Cognito) to review stats/audit, inspect control flags, download the PDF, and preview the NetSuite vendor bill payload
+6. Admins sign in to the console (Cognito) to review stats/audit, inspect control flags, download the PDF, and preview the NetSuite AP transaction payload
 
 ### AP review flow
 
@@ -62,7 +62,7 @@ The flow is designed for a centralized AP inbox rather than entity-specific mail
 2. Claude extracts vendor, buyer/legal entity, invoice header, PO, service period, payment terms, vendor bank details, and line items.
 3. The extractor computes a duplicate key from vendor + invoice number + currency + gross total and queries a sparse DynamoDB `duplicate` index for prior records.
 4. Each invoice gets a `reviewStatus` of `READY_FOR_NETSUITE` or `NEEDS_REVIEW`, plus AP-readable control flags such as low confidence, potential duplicate, PO match required, non-standard document, missing buyer entity, or bank details captured for vendor-master verification.
-5. The NetSuite preview endpoint builds the vendor-bill payload, validates required NetSuite refs, and folds mapping/validation warnings into the same flow decision.
+5. The NetSuite preview endpoint builds the vendor-bill or vendor-prepayment payload, validates required NetSuite refs, and folds mapping/validation warnings into the same flow decision.
 6. The NetSuite transaction endpoint writes a durable DynamoDB outbox record before any push is queued. Worker attempts append status events to that record, and retryable failures can be replayed after an outage.
 
 Live auto-booking should stay disabled until vendor, subsidiary, currency, expense-account, PO, and bank-detail controls are populated and validated in a NetSuite sandbox.
@@ -150,12 +150,12 @@ hosted UI; the app stores the returned id token and sends it as a bearer token o
 - **Upload**: use the Upload action in the console (presigned PUT to S3 `uploads/`)
 
 ### Export to NetSuite
-For any invoice, build the NetSuite vendor-bill payload (authenticated):
+For any invoice, build the NetSuite payload and request envelope (authenticated):
 ```bash
 curl -H "Authorization: Bearer <id_token>" \
   https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite
 ```
-Returns `{ netsuiteFormat, warnings, validation, flow, originalExtraction }`. See the
+Returns `{ netsuiteFormat, netSuiteRequest, warnings, validation, flow, originalExtraction }`. See the
 [NetSuite Integration Guide](NETSUITE-INTEGRATION.md) to enable live push.
 
 ### Log and replay NetSuite transactions
@@ -179,14 +179,15 @@ Bulk replay is available with `POST /netsuite/transactions/replay?status=FAILED_
 
 ## NetSuite Integration
 
-Extracted invoices map to NetSuite Accounts Payable **vendor bills**. The transform, OAuth 2.0
-(M2M) client, SuiteQL resolver, and idempotent upsert are implemented; the API is **export-only**
-today (it builds + validates the payload), and live push is a credentials + sandbox-validation step.
+Extracted invoices map to NetSuite AP transactions. Standard invoices become **vendor bills**;
+proforma invoices become **vendor prepayments** because they are prepayment requests rather than
+final AP bills. The transform, OAuth 2.0 (M2M) client, SuiteQL resolver, durable outbox, replay,
+and idempotent upsert are implemented; live push remains a credentials + sandbox-validation step.
 
 ### Features
-- Transform extracted JSON → NetSuite REST `vendorBill` payload (expense sublist)
-- Configurable crosswalks (vendor / subsidiary / PO / GL account / currency / department / class / terms → internal ids)
-- OAuth 2.0 M2M (JWT client-assertion) client, SuiteQL resolver, idempotent `eid:` upsert
+- Transform extracted JSON to NetSuite REST `vendorBill` or `vendorPrepayment`
+- Configurable crosswalks for vendor, subsidiary, PO, GL account, currency, department, class, terms, and recipient-to-business-unit routing
+- OAuth 2.0 M2M (JWT client-assertion) client, SuiteQL resolver, idempotent `eid:` upsert, and replayable transaction ledger
 - Validation + gross-vs-net reconciliation before import
 
 ### Configuration
@@ -197,6 +198,9 @@ Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
 {
   "subsidiaryId": "",
   "apAccountId": "",
+  "prepaymentPaymentAccountId": "",
+  "prepaymentAccountId": "",
+  "businessUnitSegmentFieldId": "",
   "defaults": { "expenseAccountId": "", "departmentId": "", "classId": "", "locationId": "", "taxCodeId": "" },
   "crosswalks": {
     "vendorsByTaxId": { "VAT123456": "4521" },
@@ -208,8 +212,14 @@ Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
     "termsByName": { "Net 30": "5" },
     "subsidiariesByTaxId": {},
     "subsidiariesByName": {},
-    "purchaseOrdersByNumber": {}
-  }
+    "purchaseOrdersByNumber": {},
+    "businessUnitsByTaxId": {},
+    "businessUnitsByName": {},
+    "businessUnitsByEntityCode": {},
+    "businessUnitsByEmailDomain": {},
+    "businessUnitsByAddressContains": {}
+  },
+  "businessUnits": {}
 }
 ```
 
@@ -349,6 +359,7 @@ Body: { "filename": "invoice.pdf", "fileSize": 123456 }
     "invoiceNumber": "INV-001",
     "purchaseOrderNumber": "PO-12345",
     "invoiceType": "Standard",
+    "transactionIntent": "VendorBill",
     "invoiceDate": "2025-01-15",
     "dueDate": "2025-02-15",
     "currency": "USD",
@@ -374,7 +385,7 @@ Body: { "filename": "invoice.pdf", "fileSize": 123456 }
 Notes:
 - `invoice.totalAmount` **includes tax** (gross).
 - `lineItems.unitPrice` and `lineItems.amount` are **pre-tax** (net).
-- `invoice.invoiceType` is "Standard" or "Proforma".
+- `invoice.invoiceType` is "Standard" or "Proforma"; proformas set `invoice.transactionIntent` to "VendorPrepayment".
 - Vendor names are preserved in original language/script (Japanese, Chinese, etc.).
 
 ## Monitoring
@@ -418,7 +429,9 @@ Common issues:
 
 - Verify the crosswalks in `netsuite-config.json` resolve vendor / account / currency to NetSuite internal ids
 - Check `subsidiaryId` / `apAccountId` match the target NetSuite account
-- Ensure all required fields are extracted (entity, tranDate, at least one expense line)
+- Populate recipient-to-business-unit crosswalks when buyer details should drive subsidiary, department, class, location, or custom segment routing
+- Set `prepaymentPaymentAccountId` before pushing proforma invoices as NetSuite vendor prepayments
+- Ensure all required fields are extracted (entity, tranDate, and either vendor-bill expense lines or vendor-prepayment payment amount)
 
 ## Security
 

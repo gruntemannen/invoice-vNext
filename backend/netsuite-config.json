@@ -1,7 +1,10 @@
 {
-  "_README": "NetSuite vendor-bill push config (mirrors NetSuiteConfig in backend/src/shared/netsuite.ts). This file holds NON-SECRET values only. Credentials (accountId, clientId, certificateId, privateKeyPem, alg) live in a secrets store and are loaded at runtime as NetSuiteSecret. Single-subsidiary scaffold: leave subsidiaryId empty/null for a non-OneWorld account; set it to the subsidiary internal id for OneWorld. apAccountId = AP account internal id. defaults.expenseAccountId = line-level fallback/suspense expense account. Other defaults are internal ids applied to every line when crosswalks miss (departmentId, classId, locationId, taxCodeId; taxCodeId is SuiteTax-only). Crosswalks map extracted values to NetSuite internal ids: vendorsByTaxId/name, subsidiariesByTaxId/name for buyer legal-entity routing, accountsByCode, currenciesByCode, departmentsByCode, classesByCode, termsByName, and purchaseOrdersByNumber for PO review/matching. Empty objects mean nothing resolves and the transform emits warnings/placeholders.",
+  "_README": "NetSuite AP push config (mirrors NetSuiteConfig in backend/src/shared/netsuite.ts). NON-SECRET values only. Credentials live in Secrets Manager. Standard invoices map to vendorBill. Proforma invoices map to vendorPrepayment, so prepaymentPaymentAccountId must be the NetSuite bank/credit-card account used to fund the prepayment; prepaymentAccountId optionally overrides the prepayment asset account. Single-subsidiary scaffold: leave subsidiaryId empty/null for non-OneWorld; set it only for a true default OneWorld subsidiary. apAccountId = AP account internal id. defaults.expenseAccountId = line fallback/suspense account. businessUnitSegmentFieldId can be a custom segment field such as cseg_business_unit. Recipient routing maps buyer tax ID/name/entity code/email domain/address text to keys in businessUnits, which can set subsidiary, department, class, location, and custom fields. Empty objects mean nothing resolves and the transform emits warnings/placeholders.",
   "subsidiaryId": null,
   "apAccountId": null,
+  "prepaymentPaymentAccountId": null,
+  "prepaymentAccountId": null,
+  "businessUnitSegmentFieldId": null,
   "defaults": {
     "expenseAccountId": null,
     "departmentId": null,
@@ -19,6 +22,23 @@
     "termsByName": {},
     "subsidiariesByTaxId": {},
     "subsidiariesByName": {},
-    "purchaseOrdersByNumber": {}
+    "purchaseOrdersByNumber": {},
+    "businessUnitsByTaxId": {},
+    "businessUnitsByName": {},
+    "businessUnitsByEntityCode": {},
+    "businessUnitsByEmailDomain": {},
+    "businessUnitsByAddressContains": {}
+  },
+  "businessUnits": {
+    "_example": {
+      "businessUnitId": null,
+      "businessUnitName": "Example Business Unit",
+      "subsidiaryId": null,
+      "departmentId": null,
+      "classId": null,
+      "locationId": null,
+      "customBodyFields": {},
+      "customLineFields": {}
+    }
   }
 }

@@ -127,6 +127,7 @@ export const handler = async (event: SQSEvent) => {
         invoiceNumber: normalized.invoice?.invoiceNumber ?? null,
         purchaseOrderNumber: normalized.invoice?.purchaseOrderNumber ?? null,
         invoiceType: normalized.invoice?.invoiceType ?? null,
+        netSuiteTransactionIntent: normalized.invoice?.transactionIntent ?? null,
         currency: normalized.invoice?.currency ?? null,
         totalAmount: normalized.invoice?.totalAmount ?? null,
         duplicateCount: duplicateMatches.length,
@@ -265,6 +266,9 @@ function normalizeExtraction(raw: any): any {
           raw.purchase_order
         ),
       invoiceType: normalizeInvoiceType(firstPresent(srcInvoice.invoiceType, srcInvoice.type, raw.invoiceType, raw.invoice_type, raw.type)),
+      transactionIntent: normalizeTransactionIntent(
+        firstPresent(srcInvoice.transactionIntent, srcInvoice.netSuiteTransactionIntent, raw.transactionIntent)
+      ),
       invoiceDate: firstPresent(srcInvoice.invoiceDate, raw.invoiceDate, raw.invoice_date, raw.date),
       dueDate: firstPresent(srcInvoice.dueDate, raw.dueDate, raw.due_date),
       currency: normalizeCurrency(firstPresent(srcInvoice.currency, raw.currency)),
@@ -322,6 +326,14 @@ function normalizeInvoiceType(value: any): string | null {
   if (/pro\s*forma|proforma/i.test(s)) return "Proforma";
   if (/rechnung|invoice|vat\s*invoice|standard/i.test(s)) return "Standard";
   return s;
+}
+
+function normalizeTransactionIntent(value: any): "VendorBill" | "VendorPrepayment" | null {
+  const s = String(value ?? "").trim();
+  if (!s) return null;
+  if (/prepayment|pre\s*payment|vendor\s*prepayment/i.test(s)) return "VendorPrepayment";
+  if (/bill|invoice|vendor\s*bill/i.test(s)) return "VendorBill";
+  return null;
 }
 
 function normalizeServicePeriod(value: any): any {
@@ -451,6 +463,12 @@ function reconcileExtraction(extracted: any, warnings: string[]) {
       extracted.invoice.invoiceType = "Proforma";
       warnings.push("tagged_proforma");
     }
+    if (extracted.invoice.transactionIntent !== "VendorPrepayment") {
+      extracted.invoice.transactionIntent = "VendorPrepayment";
+      warnings.push("tagged_proforma_prepayment");
+    }
+  } else if (!extracted.invoice.transactionIntent) {
+    extracted.invoice.transactionIntent = "VendorBill";
   }
 
   // Clean up PO number if it contains labels or garbage

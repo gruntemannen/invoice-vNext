@@ -154,7 +154,15 @@ export function assessInvoiceFlow(
   }
 
   const invoiceType = String(invoice.invoiceType ?? "").toLowerCase();
-  if (/proforma|pro\s*forma|credit|reminder|dunning|mahnung|statement/.test(invoiceType)) {
+  const transactionIntent = String(invoice.transactionIntent ?? "").toLowerCase();
+  if (/proforma|pro\s*forma/.test(invoiceType) || /prepayment/.test(transactionIntent)) {
+    flags.push({
+      code: "proforma_prepayment",
+      severity: "warning",
+      message:
+        "Proforma invoice is treated as a NetSuite vendor prepayment request, not a vendor bill.",
+    });
+  } else if (/credit|reminder|dunning|mahnung|statement/.test(invoiceType)) {
     flags.push({
       code: "non_standard_document",
       severity: "warning",

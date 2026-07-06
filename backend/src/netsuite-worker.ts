@@ -1,5 +1,5 @@
 import { SQSEvent } from "aws-lambda";
-import { getAccessToken, upsertVendorBill, type VendorBill } from "./shared/netsuite";
+import { asNetSuitePushRequest, getAccessToken, upsertNetSuiteRecord } from "./shared/netsuite";
 import { loadNetSuiteSecret } from "./shared/netsuite-secret";
 import {
   getNetSuiteTransaction,
@@ -38,10 +38,11 @@ export const handler = async (event: SQSEvent) => {
 
       const secret = await loadNetSuiteSecret(NETSUITE_SECRET_ARN);
       const token = await getAccessToken(secret);
-      const result = await upsertVendorBill(
+      const request = asNetSuitePushRequest(transaction.requestPayload, transaction.externalId);
+      const result = await upsertNetSuiteRecord(
         secret,
         token,
-        transaction.requestPayload as VendorBill,
+        request,
         transaction.externalId
       );
 

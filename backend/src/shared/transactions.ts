@@ -25,7 +25,7 @@ export interface NetSuiteTransaction {
   transactionId: string;
   entityType: "NETSUITE_TRANSACTION";
   integration: "NETSUITE";
-  operation: "UPSERT_VENDOR_BILL";
+  operation: "UPSERT_NETSUITE_RECORD";
   status: NetSuiteTransactionStatus;
   invoiceMessageId: string;
   invoiceAttachmentKey: string;
@@ -87,7 +87,7 @@ export async function createNetSuiteTransaction(
     transactionId,
     entityType: "NETSUITE_TRANSACTION",
     integration: "NETSUITE",
-    operation: "UPSERT_VENDOR_BILL",
+    operation: "UPSERT_NETSUITE_RECORD",
     status: input.status,
     invoiceMessageId: input.invoiceMessageId,
     invoiceAttachmentKey: input.invoiceAttachmentKey,

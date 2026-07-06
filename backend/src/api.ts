@@ -6,6 +6,7 @@ import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
 import {
+  buildNetSuiteConfigurationHints,
   transformToNetSuite,
   validateNetSuiteRequest,
   type NetSuiteConfig,
@@ -144,6 +145,7 @@ async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
       netsuiteFormat: preview.bill,
       netSuiteRequest: preview.request,
       warnings: preview.warnings,
+      configurationHints: preview.configurationHints,
       validation: preview.validation,
       flow: preview.flow,
       originalExtraction: item.extractedJson,
@@ -221,6 +223,7 @@ async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2
         transaction: summarizeTransaction(transaction),
         flow: preview.flow,
         validation: preview.validation,
+        configurationHints: preview.configurationHints,
         queued: status === "QUEUED",
       },
       status === "QUEUED" ? 202 : 200
@@ -414,11 +417,13 @@ function buildNetSuitePreview(item: any): {
   bill: ReturnType<typeof transformToNetSuite>["bill"];
   request: ReturnType<typeof transformToNetSuite>["request"];
   warnings: string[];
+  configurationHints: ReturnType<typeof buildNetSuiteConfigurationHints>;
   validation: ReturnType<typeof validateNetSuiteRequest>;
   flow: ReturnType<typeof assessInvoiceFlow>;
 } {
   const config = loadNetSuiteConfig();
   const { bill, request, warnings } = transformToNetSuite(item.extractedJson, config);
+  const configurationHints = buildNetSuiteConfigurationHints(item.extractedJson, config);
   const validation = validateNetSuiteRequest(request, config);
   const flow = assessInvoiceFlow(item.extractedJson, {
     confidence: item.confidence,
@@ -428,7 +433,7 @@ function buildNetSuitePreview(item: any): {
     netSuiteValidationErrors: validation.errors,
   });
 
-  return { config, bill, request, warnings, validation, flow };
+  return { config, bill, request, warnings, configurationHints, validation, flow };
 }
 
 async function enqueueNetSuiteTransaction(transactionId: string) {

@@ -23,10 +23,12 @@ PDF/email/upload
 ```
 
 - `GET /invoices/{messageId}/{attachmentId}/netsuite` returns
-  `{ netsuiteFormat, netSuiteRequest, warnings, validation, flow, originalExtraction }`.
+  `{ netsuiteFormat, netSuiteRequest, warnings, configurationHints, validation, flow, originalExtraction }`.
 - `netsuiteFormat` is the clean REST body.
 - `netSuiteRequest` is the durable schema envelope with `schemaVersion`, `recordType`,
   `externalId`, document classification, business-unit routing, and payload.
+- `configurationHints` lists the exact `netsuite-config.json` paths that need NetSuite
+  internal IDs before live push can be enabled.
 - `POST /invoices/{messageId}/{attachmentId}/netsuite/transactions` writes the transaction
   ledger record before any NetSuite call is queued.
 - Replay endpoints support outage recovery:

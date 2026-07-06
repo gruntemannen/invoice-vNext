@@ -155,7 +155,7 @@ For any invoice, build the NetSuite payload and request envelope (authenticated)
 curl -H "Authorization: Bearer <id_token>" \
   https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite
 ```
-Returns `{ netsuiteFormat, netSuiteRequest, warnings, validation, flow, originalExtraction }`. See the
+Returns `{ netsuiteFormat, netSuiteRequest, warnings, configurationHints, validation, flow, originalExtraction }`. See the
 [NetSuite Integration Guide](NETSUITE-INTEGRATION.md) to enable live push.
 
 ### Log and replay NetSuite transactions

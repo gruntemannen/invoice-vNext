@@ -252,6 +252,14 @@ export interface NetSuitePushRequest {
   payload: NetSuiteRecordPayload;
 }
 
+export interface NetSuiteConfigurationHint {
+  path: string;
+  value: string;
+  reason: string;
+  requiredForLivePush: boolean;
+  example?: unknown;
+}
+
 // ===========================================================================
 // External id
 // ===========================================================================
@@ -486,6 +494,169 @@ function applyBusinessUnitSegment(
   target[config.businessUnitSegmentFieldId] = { id: route.businessUnitId };
 }
 
+function configKey(value: unknown): string {
+  return String(value ?? "")
+    .trim()
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"');
+}
+
+function hasMapping(map: Record<string, string> | undefined, value: unknown): boolean {
+  return Boolean(lookupCrosswalk(map, value));
+}
+
+export function buildNetSuiteConfigurationHints(
+  extracted: any,
+  config: NetSuiteConfig
+): NetSuiteConfigurationHint[] {
+  const hints: NetSuiteConfigurationHint[] = [];
+  const cw = config.crosswalks;
+  const vendor = extracted?.vendor ?? {};
+  const buyer = extracted?.buyer ?? {};
+  const invoice = extracted?.invoice ?? {};
+  const lines: any[] = Array.isArray(extracted?.lineItems) ? extracted.lineItems : [];
+
+  const vendorTaxId = String(vendor?.taxId ?? "").trim();
+  const vendorName = String(vendor?.name ?? "").trim();
+  if (
+    (vendorTaxId || vendorName) &&
+    !hasMapping(cw.vendorsByTaxId, vendorTaxId) &&
+    !hasMapping(cw.vendorsByName, vendorName)
+  ) {
+    hints.push({
+      path: vendorTaxId
+        ? `crosswalks.vendorsByTaxId["${configKey(vendorTaxId)}"]`
+        : `crosswalks.vendorsByName["${configKey(vendorName)}"]`,
+      value: vendorTaxId || vendorName,
+      reason: "Map the invoice issuer to the NetSuite vendor internal id.",
+      requiredForLivePush: true,
+      example: "<vendorInternalId>",
+    });
+  }
+
+  const currency = String(invoice?.currency ?? "").trim();
+  if (currency && !hasMapping(cw.currenciesByCode, currency)) {
+    hints.push({
+      path: `crosswalks.currenciesByCode["${configKey(currency)}"]`,
+      value: currency,
+      reason: "Map invoice currency to the NetSuite currency internal id.",
+      requiredForLivePush: true,
+      example: "<currencyInternalId>",
+    });
+  }
+
+  const paymentTerms = String(invoice?.paymentTerms ?? "").trim();
+  if (paymentTerms && !hasMapping(cw.termsByName, paymentTerms)) {
+    hints.push({
+      path: `crosswalks.termsByName["${configKey(paymentTerms)}"]`,
+      value: paymentTerms,
+      reason: "Map extracted payment terms to the NetSuite terms internal id, or normalize the extractor output to an existing NetSuite term name.",
+      requiredForLivePush: false,
+      example: "<termsInternalId>",
+    });
+  }
+
+  const buyerTaxId = String(buyer?.taxId ?? "").trim();
+  const buyerName = String(buyer?.name ?? "").trim();
+  const buyerEntityCode = String(buyer?.entityCode ?? "").trim();
+  const buyerDomain = emailDomain(buyer?.email);
+  const routeResolved = Boolean(resolveBusinessUnitRouting(buyer, config, []));
+  const subsidiaryResolved =
+    routeResolved ||
+    hasMapping(cw.subsidiariesByTaxId, buyerTaxId) ||
+    hasMapping(cw.subsidiariesByName, buyerName) ||
+    Boolean(config.subsidiaryId);
+  if ((buyerTaxId || buyerName || buyerEntityCode || buyerDomain) && !subsidiaryResolved) {
+    const path =
+      buyerEntityCode
+        ? `crosswalks.businessUnitsByEntityCode["${configKey(buyerEntityCode)}"]`
+        : buyerTaxId
+          ? `crosswalks.businessUnitsByTaxId["${configKey(buyerTaxId)}"]`
+          : buyerDomain
+            ? `crosswalks.businessUnitsByEmailDomain["${configKey(buyerDomain)}"]`
+            : `crosswalks.businessUnitsByName["${configKey(buyerName)}"]`;
+    const value = buyerEntityCode || buyerTaxId || buyerDomain || buyerName;
+    const businessUnitKey = normalizeLookup(value).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    hints.push({
+      path,
+      value,
+      reason: "Map the invoice recipient to a configured NetSuite business unit/subsidiary route.",
+      requiredForLivePush: true,
+      example: businessUnitKey || "<businessUnitKey>",
+    });
+    hints.push({
+      path: `businessUnits["${businessUnitKey || "<businessUnitKey>"}"]`,
+      value: buyerName || value,
+      reason: "Define the NetSuite subsidiary and dimensions for the recipient route.",
+      requiredForLivePush: true,
+      example: {
+        subsidiaryId: "<subsidiaryInternalId>",
+        departmentId: "<departmentInternalId>",
+        classId: "<classInternalId>",
+        locationId: "<locationInternalId>",
+        businessUnitId: "<businessUnitSegmentInternalId>",
+      },
+    });
+  }
+
+  const document = classifyDocument(invoice);
+  if (document.transactionIntent === "vendor_prepayment" && !config.prepaymentPaymentAccountId) {
+    hints.push({
+      path: "prepaymentPaymentAccountId",
+      value: "",
+      reason: "Vendor prepayments require a NetSuite bank or credit-card funding account.",
+      requiredForLivePush: true,
+      example: "<bankOrCreditCardAccountInternalId>",
+    });
+  }
+
+  const linesMissingAccount = document.transactionIntent !== "vendor_prepayment" &&
+    lines.some((line) => {
+      const accountCode = String(line?.account ?? "").trim();
+      return !accountCode || !hasMapping(cw.accountsByCode, accountCode);
+    }) &&
+    !config.defaults?.expenseAccountId &&
+    !config.apAccountId;
+  if (linesMissingAccount) {
+    hints.push({
+      path: "defaults.expenseAccountId",
+      value: "",
+      reason: "At least one invoice line has no mapped GL account; configure a default/suspense expense account or extract/map line account codes.",
+      requiredForLivePush: true,
+      example: "<expenseAccountInternalId>",
+    });
+  }
+
+  const missingClassCodes = new Set<string>();
+  for (const line of lines) {
+    const costCenter = String(line?.costCenter ?? "").trim();
+    if (costCenter && !hasMapping(cw.classesByCode, costCenter) && !config.defaults?.classId) {
+      missingClassCodes.add(costCenter);
+    }
+  }
+  for (const code of missingClassCodes) {
+    hints.push({
+      path: `crosswalks.classesByCode["${configKey(code)}"]`,
+      value: code,
+      reason: "Map extracted cost center/class code to the NetSuite class internal id, or configure defaults.classId.",
+      requiredForLivePush: false,
+      example: "<classInternalId>",
+    });
+  }
+
+  return dedupeConfigurationHints(hints);
+}
+
+function dedupeConfigurationHints(hints: NetSuiteConfigurationHint[]): NetSuiteConfigurationHint[] {
+  const seen = new Set<string>();
+  return hints.filter((hint) => {
+    const key = `${hint.path}:${hint.value}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 /**
  * Placeholder internal id used when a reference cannot be resolved through a
  * crosswalk and no default is configured. It is intentionally non-numeric and
@@ -550,7 +721,7 @@ export function transformToNetSuite(
     entity = { id: cw.vendorsByName[vendorName] };
   } else {
     warnings.push(
-      `Vendor not resolved (taxId="${taxId}", name="${vendorName}"); entity left unset — resolve via crosswalk or SuiteQL before push.`
+      `Vendor not resolved (taxId="${taxId}", name="${vendorName}"); entity left unset - resolve via crosswalk or SuiteQL before push.`
     );
   }
 
@@ -654,13 +825,16 @@ export function transformToNetSuite(
     // NetSuite "class" vs a custom segment. Field name on the line may be
     // `class` or a `cseg_*` custom column depending on the account.
     let cls: NetSuiteRef | undefined;
-    const classCode: string = line?.costCenter ?? line?.project ?? "";
+    const costCenterCode: string = line?.costCenter ?? "";
+    const projectCode: string = line?.project ?? "";
+    const classCode: string =
+      costCenterCode || (projectCode && cw.classesByCode[projectCode] ? projectCode : "");
     if (classCode && cw.classesByCode[classCode]) {
       cls = { id: cw.classesByCode[classCode] };
     } else if (businessUnitRouting?.classId || config.defaults?.classId) {
       cls = { id: businessUnitRouting?.classId ?? config.defaults?.classId ?? "" };
-    } else if (classCode) {
-      warnings.push(`Line ${lineNo}: class "${classCode}" not in crosswalk; left unset.`);
+    } else if (costCenterCode) {
+      warnings.push(`Line ${lineNo}: class "${costCenterCode}" not in crosswalk; left unset.`);
     }
 
     // Location default (extractor has no location concept today)

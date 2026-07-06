@@ -306,8 +306,9 @@ function renderVatValidation(d) {
   const status = validation.status || (validation.valid ? "VALID" : "—");
   const cls = status === "VALID" ? "ok" : status === "INVALID" ? "fail" : "pending";
   const number = validation.normalizedVat || taxId || "";
+  const provider = validation.provider === "CH_UID" ? "Swiss UID" : validation.provider === "EU_VIES" ? "VIES" : "";
   const match = validation.matches?.traderName === "INVALID" ? " name mismatch" : "";
-  return `<span class="badge ${cls}">${escapeHtml(status)}</span> ${escapeHtml(number)}${escapeHtml(match)}`;
+  return `<span class="badge ${cls}">${escapeHtml(status)}</span> ${escapeHtml(provider ? provider + " " : "")}${escapeHtml(number)}${escapeHtml(match)}`;
 }
 
 function escapeHtml(str) {

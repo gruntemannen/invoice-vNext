@@ -27,9 +27,9 @@ export const config = {
   // therefore cost) if the ingestion paths are flooded. Tune to your Bedrock account quota.
   extractReservedConcurrency: 5,
 
-  // Validate EU/Northern Ireland vendor VAT numbers against the European Commission VIES
-  // REST API during extraction. Lookup errors are recorded as metadata and do not fail
-  // invoice processing.
+  // Validate vendor VAT numbers during extraction. EU/Northern Ireland numbers use the
+  // European Commission VIES REST API; Swiss CHE MWST/TVA/IVA numbers use the Swiss
+  // UID PublicServices SOAP endpoint. Lookup errors are metadata and do not fail invoices.
   viesLookupEnabled: true,
   viesRequestTimeoutMs: 6000,
 

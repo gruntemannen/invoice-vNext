@@ -1,5 +1,6 @@
 export type ViesMatch = "VALID" | "INVALID" | "NOT_PROCESSED";
 export type ViesVatLookupStatus = "VALID" | "INVALID" | "SKIPPED" | "ERROR";
+export type VatValidationProvider = "EU_VIES" | "CH_UID";
 
 export interface ViesVatLookupRequest {
   countryCode: string;
@@ -11,15 +12,27 @@ export interface ViesVatLookupRequest {
   traderCompanyType?: string;
 }
 
+export interface SwissUidVatLookupRequest {
+  countryCode: "CH";
+  uid: string;
+  vatNumber: string;
+  vatSuffix?: "MWST" | "TVA" | "IVA";
+  digits: string;
+  checksumValid: boolean;
+}
+
 export interface ViesVatValidation {
-  provider: "EU_VIES";
+  provider: VatValidationProvider;
   status: ViesVatLookupStatus;
   checkedAt: string;
   normalizedVat?: string;
-  input?: ViesVatLookupRequest;
+  input?: ViesVatLookupRequest | SwissUidVatLookupRequest;
   valid?: boolean;
   countryCode?: string;
   vatNumber?: string;
+  uid?: string;
+  vatSuffix?: "MWST" | "TVA" | "IVA";
+  checksumValid?: boolean;
   requestDate?: string;
   requestIdentifier?: string;
   name?: string;
@@ -42,11 +55,16 @@ export interface ViesVatValidation {
 export interface ViesLookupOptions {
   enabled?: boolean;
   baseUrl?: string;
+  swissBaseUrl?: string;
   timeoutMs?: number;
 }
 
 const DEFAULT_VIES_BASE_URL = "https://ec.europa.eu/taxation_customs/vies/rest-api";
+const DEFAULT_SWISS_UID_BASE_URL = "https://www.uid-wse.admin.ch/V5.0/PublicServices.svc";
+const SWISS_UID_SOAP_ACTION =
+  "http://www.uid.admin.ch/xmlns/uid-wse/IPublicServices/ValidateVatNumber";
 const DEFAULT_TIMEOUT_MS = 6000;
+const SWISS_UID_CHECKSUM_WEIGHTS = [5, 4, 3, 2, 7, 6, 5, 4];
 
 const VIES_COUNTRIES = new Set([
   "AT",
@@ -136,6 +154,7 @@ export async function enrichExtractionWithVatLookup(
     provider: result.provider,
     status: result.status,
     normalizedVat: result.normalizedVat,
+    uid: result.uid,
     checkedAt: result.checkedAt,
     requestIdentifier: result.requestIdentifier,
   };
@@ -149,7 +168,8 @@ export async function enrichExtractionWithVatLookup(
     }
     pushMatchWarnings(result, warnings);
   } else if (result.status === "INVALID") {
-    warnings.push(`vies_vat_invalid:${result.normalizedVat ?? result.input?.vatNumber ?? "unknown"}`);
+    const warningPrefix = result.provider === "CH_UID" ? "swiss_vat_invalid" : "vies_vat_invalid";
+    warnings.push(`${warningPrefix}:${result.normalizedVat ?? result.input?.vatNumber ?? "unknown"}`);
   }
 
   return result;
@@ -160,6 +180,11 @@ export async function lookupVendorVatFromInvoice(
   options: ViesLookupOptions = {}
 ): Promise<ViesVatValidation | undefined> {
   const vendor = extracted?.vendor ?? {};
+  const swiss = parseSwissVatNumber(vendor?.taxId);
+  if (swiss) {
+    return checkSwissVatNumber(swiss, options);
+  }
+
   const parsed = parseEuropeanVatNumber(vendor?.taxId, inferVatCountryCode(vendor?.address, vendor?.name));
   if (!parsed) {
     if (!hasText(vendor?.taxId)) return undefined;
@@ -228,6 +253,139 @@ export async function checkVatNumber(
       message: err?.name === "AbortError" ? "VIES request timed out" : err?.message ?? String(err),
     };
   }
+}
+
+export async function checkSwissVatNumber(
+  input: SwissUidVatLookupRequest,
+  options: ViesLookupOptions = {}
+): Promise<ViesVatValidation> {
+  const checkedAt = new Date().toISOString();
+  const normalizedVat = input.vatNumber;
+
+  if (!input.checksumValid) {
+    return {
+      provider: "CH_UID",
+      status: "INVALID",
+      checkedAt,
+      input,
+      normalizedVat,
+      valid: false,
+      countryCode: "CH",
+      vatNumber: normalizedVat,
+      uid: input.uid,
+      vatSuffix: input.vatSuffix,
+      checksumValid: false,
+      message: "Swiss UID failed MOD11 checksum validation.",
+    };
+  }
+
+  const url = options.swissBaseUrl || DEFAULT_SWISS_UID_BASE_URL;
+  const body = buildSwissVatSoapEnvelope(normalizedVat);
+
+  try {
+    const res = await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "text/xml; charset=utf-8",
+          accept: "text/xml",
+          soapaction: `"${SWISS_UID_SOAP_ACTION}"`,
+        },
+        body,
+      },
+      options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    );
+
+    const responseText = await res.text().catch(() => "");
+    if (!res.ok) {
+      return {
+        provider: "CH_UID",
+        status: "ERROR",
+        checkedAt,
+        input,
+        normalizedVat,
+        countryCode: "CH",
+        vatNumber: normalizedVat,
+        uid: input.uid,
+        vatSuffix: input.vatSuffix,
+        checksumValid: true,
+        message: extractSoapFault(responseText) || `Swiss UID request failed with HTTP ${res.status}`,
+      };
+    }
+
+    const valid = extractBooleanTag(responseText, "ValidateVatNumberResult");
+    if (valid === undefined) {
+      return {
+        provider: "CH_UID",
+        status: "ERROR",
+        checkedAt,
+        input,
+        normalizedVat,
+        countryCode: "CH",
+        vatNumber: normalizedVat,
+        uid: input.uid,
+        vatSuffix: input.vatSuffix,
+        checksumValid: true,
+        message: extractSoapFault(responseText) || "Swiss UID response did not include a validation result.",
+      };
+    }
+
+    return {
+      provider: "CH_UID",
+      status: valid ? "VALID" : "INVALID",
+      checkedAt,
+      input,
+      normalizedVat,
+      valid,
+      countryCode: "CH",
+      vatNumber: normalizedVat,
+      uid: input.uid,
+      vatSuffix: input.vatSuffix,
+      checksumValid: true,
+    };
+  } catch (err: any) {
+    return {
+      provider: "CH_UID",
+      status: "ERROR",
+      checkedAt,
+      input,
+      normalizedVat,
+      countryCode: "CH",
+      vatNumber: normalizedVat,
+      uid: input.uid,
+      vatSuffix: input.vatSuffix,
+      checksumValid: true,
+      message: err?.name === "AbortError" ? "Swiss UID request timed out" : err?.message ?? String(err),
+    };
+  }
+}
+
+export function parseSwissVatNumber(value: unknown): SwissUidVatLookupRequest | undefined {
+  const raw = String(value ?? "").trim();
+  if (!raw) return undefined;
+
+  const text = raw
+    .toUpperCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "");
+
+  const match = text.match(/\bCHE\D*(\d{3})\D*(\d{3})\D*(\d{3})\b/);
+  if (!match) return undefined;
+
+  const digits = `${match[1]}${match[2]}${match[3]}`;
+  const suffix = text.match(/\b(MWST|TVA|IVA)\b/)?.[1] as SwissUidVatLookupRequest["vatSuffix"] | undefined;
+  const uid = formatSwissUid(digits);
+  const checksumValid = isSwissUidChecksumValid(digits);
+
+  return {
+    countryCode: "CH",
+    uid,
+    vatNumber: suffix ? `${uid} ${suffix}` : uid,
+    vatSuffix: suffix,
+    digits,
+    checksumValid,
+  };
 }
 
 export function parseEuropeanVatNumber(
@@ -365,6 +523,68 @@ function extractViesError(body: any): string | undefined {
   const wrappers = Array.isArray(body?.errorWrappers) ? body.errorWrappers : [];
   const message = wrappers.map((wrapper: any) => wrapper?.message || wrapper?.error).filter(Boolean).join("; ");
   return message || stringOrUndefined(body?.message);
+}
+
+function buildSwissVatSoapEnvelope(vatNumber: string): string {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <ValidateVatNumber xmlns="http://www.uid.admin.ch/xmlns/uid-wse">
+      <vatNumber>${escapeXml(vatNumber)}</vatNumber>
+    </ValidateVatNumber>
+  </s:Body>
+</s:Envelope>`;
+}
+
+function formatSwissUid(digits: string): string {
+  return `CHE-${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6, 9)}`;
+}
+
+function isSwissUidChecksumValid(digits: string): boolean {
+  if (!/^\d{9}$/.test(digits)) return false;
+  const sum = SWISS_UID_CHECKSUM_WEIGHTS.reduce(
+    (acc, weight, index) => acc + Number(digits[index]) * weight,
+    0
+  );
+  const remainder = sum % 11;
+  const check = remainder === 0 ? 0 : 11 - remainder;
+  return check !== 10 && check === Number(digits[8]);
+}
+
+function extractBooleanTag(xml: string, tagName: string): boolean | undefined {
+  const match = xml.match(new RegExp(`<(?:\\w+:)?${tagName}\\b[^>]*>\\s*(true|false)\\s*</(?:\\w+:)?${tagName}>`, "i"));
+  if (!match) return undefined;
+  return match[1].toLowerCase() === "true";
+}
+
+function extractSoapFault(xml: string): string | undefined {
+  const reason = extractTextTag(xml, "Reason") || extractTextTag(xml, "faultstring");
+  const code = extractTextTag(xml, "Code") || extractTextTag(xml, "faultcode");
+  return [code, reason].filter(Boolean).join(": ") || undefined;
+}
+
+function extractTextTag(xml: string, tagName: string): string | undefined {
+  const match = xml.match(new RegExp(`<(?:\\w+:)?${tagName}\\b[^>]*>\\s*([\\s\\S]*?)\\s*</(?:\\w+:)?${tagName}>`, "i"));
+  if (!match) return undefined;
+  return decodeXml(match[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function decodeXml(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
 }
 
 function trimTrailingSlash(value: string): string {

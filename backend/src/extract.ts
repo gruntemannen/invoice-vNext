@@ -16,6 +16,7 @@ const TABLE_NAME = process.env.TABLE_NAME ?? "";
 const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID ?? "global.anthropic.claude-sonnet-4-6";
 const VIES_LOOKUP_ENABLED = process.env.VIES_LOOKUP_ENABLED !== "false";
 const VIES_API_BASE_URL = process.env.VIES_API_BASE_URL;
+const SWISS_UID_API_BASE_URL = process.env.SWISS_UID_API_BASE_URL;
 const VIES_TIMEOUT_MS = Number(process.env.VIES_TIMEOUT_MS ?? "6000");
 
 export const handler = async (event: SQSEvent) => {
@@ -88,11 +89,13 @@ export const handler = async (event: SQSEvent) => {
       const vatValidation = await enrichExtractionWithVatLookup(normalized, warnings, {
         enabled: VIES_LOOKUP_ENABLED,
         baseUrl: VIES_API_BASE_URL,
+        swissBaseUrl: SWISS_UID_API_BASE_URL,
         timeoutMs: Number.isFinite(VIES_TIMEOUT_MS) && VIES_TIMEOUT_MS > 0 ? VIES_TIMEOUT_MS : 6000,
       });
       if (vatValidation?.status === "ERROR") {
-        log.warn("VIES VAT lookup failed", {
+        log.warn("Vendor VAT lookup failed", {
           messageId,
+          provider: vatValidation.provider,
           vat: vatValidation.normalizedVat,
           error: vatValidation.message,
         });

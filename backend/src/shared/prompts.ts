@@ -72,7 +72,7 @@ Rules:
 - In the user's samples, buyer names may include Censhare GmbH, Censhare Deutschland GmbH, Entirely AG, or similar entities; do not confuse those with the vendor.
 - For Japanese invoices, names followed by recipient honorifics are recipients/customers, not vendors. The vendor is usually the company with a registration number, tax ID, bank account, or stamp.
 - Keep the vendor name in its original language/script.
-- For EU VAT numbers, preserve the country prefix when printed (for example DE123456789, FR..., NL..., XI...). Do not return only the local digits if a prefix is shown.
+- For EU VAT numbers, preserve the country prefix when printed (for example DE123456789, FR..., NL..., XI...). For Swiss VAT/UID numbers, preserve CHE and any MWST/TVA/IVA suffix.
 - totalAmount = final gross amount including tax.
 - netAmount = subtotal before tax/discounts when shown.
 - taxAmount = VAT/consumption tax amount.

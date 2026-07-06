@@ -995,11 +995,14 @@ export function transformToNetSuite(
 
   // --- PO reference -------------------------------------------------------
   const poNumber: string = invoice?.purchaseOrderNumber ?? "";
+  const poLookupKey: string = invoice?.purchaseOrderLookupKey ?? poNumber;
   if (poNumber) {
-    const poId = cw.purchaseOrdersByNumber?.[poNumber];
+    const poId = lookupCrosswalk(cw.purchaseOrdersByNumber, poLookupKey);
+    const lookupNote =
+      poLookupKey && poLookupKey !== poNumber ? ` (lookup key "${poLookupKey}")` : "";
     if (poId) {
       warnings.push(
-        `PO "${poNumber}" maps to NetSuite purchase order ${poId}; use the PO-backed bill/three-way-match flow instead of a direct expense bill if this invoice should close the PO.`
+        `PO "${poNumber}"${lookupNote} maps to NetSuite purchase order ${poId}; use the PO-backed bill/three-way-match flow instead of a direct expense bill if this invoice should close the PO.`
       );
     } else {
       warnings.push(
@@ -1135,7 +1138,7 @@ export function transformToNetSuite(
     if (businessUnitRouting?.locationId || config.defaults?.locationId) {
       prepayment.location = asRef(businessUnitRouting?.locationId ?? config.defaults?.locationId);
     }
-    const poId = poNumber ? cw.purchaseOrdersByNumber?.[poNumber] : undefined;
+    const poId = poNumber ? lookupCrosswalk(cw.purchaseOrdersByNumber, poLookupKey) : undefined;
     if (poId) prepayment.purchaseOrder = { id: poId };
     applyBusinessUnitSegment(prepayment as unknown as Record<string, unknown>, config, businessUnitRouting);
     applyCustomFields(

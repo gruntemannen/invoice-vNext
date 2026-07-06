@@ -118,6 +118,7 @@ async function listInvoices(event: APIGatewayProxyEventV2) {
       buyerName: item.buyerName,
       invoiceNumber: item.invoiceNumber,
       purchaseOrderNumber: item.purchaseOrderNumber,
+      purchaseOrderLookupKey: item.purchaseOrderLookupKey ?? item.extractedJson?.invoice?.purchaseOrderLookupKey,
       invoiceType: item.invoiceType,
       netSuiteTransactionIntent: item.netSuiteTransactionIntent ?? item.extractedJson?.invoice?.transactionIntent,
       currency: item.currency,

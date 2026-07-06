@@ -283,7 +283,12 @@ function fmtReviewStatus(status) {
 
 function renderControlFlags(flags) {
   if (!Array.isArray(flags) || flags.length === 0) return "—";
-  return `<div class="flag-stack">${flags
+  const visibleFlags = flags.filter((flag) => {
+    const text = String(flag?.message || flag?.code || "");
+    return !text.includes("sanitized_purchase_order_number");
+  });
+  if (visibleFlags.length === 0) return "—";
+  return `<div class="flag-stack">${visibleFlags
     .slice(0, 5)
     .map((flag) => {
       const severity = ["info", "warning", "blocker"].includes(flag.severity) ? flag.severity : "info";

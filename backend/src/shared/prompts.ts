@@ -35,7 +35,7 @@ Return ONLY valid JSON in this exact format:
   },
   "invoice": {
     "invoiceNumber": "number",
-    "purchaseOrderNumber": "PO number or null",
+    "purchaseOrderNumber": "PO/order reference exactly as printed or null",
     "invoiceType": "Standard, Proforma, CreditNote, Reminder, Statement, or Other",
     "transactionIntent": "VendorBill or VendorPrepayment",
     "invoiceDate": "YYYY-MM-DD",
@@ -79,8 +79,9 @@ Rules:
 - lineItems amounts = pre-tax amounts.
 - For Proforma invoices, set invoiceType to "Proforma". For reminders/dunning notices/Mahnung, set "Reminder". For vendor statements, set "Statement".
 - Treat Proforma invoices as prepayment requests: set transactionIntent to "VendorPrepayment". Standard payable invoices should use "VendorBill".
-- purchaseOrderNumber = only the PO code (no labels), null if not present.
-- Extract PO numbers from labels such as PO, P.O., Auftrag, Bestellnummer, purchase order, or order number.
+- purchaseOrderNumber = the PO/order reference exactly as printed on the invoice, null if not present.
+- Do not normalize, strip, rewrite, or correct purchaseOrderNumber; the system derives a separate lookup key for NetSuite matching.
+- Capture PO/order references from labels such as PO, P.O., Auftrag, Bestellnummer, purchase order, or order number.
 - Capture IBAN/BIC/SWIFT values exactly as printed. If multiple IBANs are shown, include them all.
 - Convert written dates such as "May 21, 2026" or "08.05.26" to YYYY-MM-DD.
 `;

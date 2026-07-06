@@ -202,6 +202,9 @@ export function assessInvoiceFlow(
   }
 
   for (const warning of options.warnings ?? []) {
+    if (String(warning).trim() === "sanitized_purchase_order_number") {
+      continue;
+    }
     flags.push({
       code: "extraction_warning",
       severity: "warning",

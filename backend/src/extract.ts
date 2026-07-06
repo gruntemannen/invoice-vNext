@@ -149,6 +149,7 @@ export const handler = async (event: SQSEvent) => {
         buyerName: normalized.buyer?.name ?? null,
         invoiceNumber: normalized.invoice?.invoiceNumber ?? null,
         purchaseOrderNumber: normalized.invoice?.purchaseOrderNumber ?? null,
+        purchaseOrderLookupKey: normalized.invoice?.purchaseOrderLookupKey ?? null,
         invoiceType: normalized.invoice?.invoiceType ?? null,
         netSuiteTransactionIntent: normalized.invoice?.transactionIntent ?? null,
         currency: normalized.invoice?.currency ?? null,
@@ -288,6 +289,12 @@ function normalizeExtraction(raw: any): any {
           raw.purchaseOrder,
           raw.purchase_order
         ),
+      purchaseOrderLookupKey: firstPresent(
+        srcInvoice.purchaseOrderLookupKey,
+        srcInvoice.purchaseOrderMatchKey,
+        raw.purchaseOrderLookupKey,
+        raw.purchaseOrderMatchKey
+      ),
       invoiceType: normalizeInvoiceType(firstPresent(srcInvoice.invoiceType, srcInvoice.type, raw.invoiceType, raw.invoice_type, raw.type)),
       transactionIntent: normalizeTransactionIntent(
         firstPresent(srcInvoice.transactionIntent, srcInvoice.netSuiteTransactionIntent, raw.transactionIntent)
@@ -471,10 +478,11 @@ function parseMoney(input: string): number | null {
 /**
  * Light reconciliation for edge cases.
  * With Claude reading PDFs directly, most extraction should be accurate,
- * but we still handle proforma tagging and PO cleanup.
+ * but we still handle proforma tagging and PO lookup derivation.
  */
 function reconcileExtraction(extracted: any, warnings: string[]) {
   if (!extracted || typeof extracted !== "object") return;
+  extracted.invoice = extracted.invoice ?? {};
 
   // Proforma invoices are tagged with the neutral type "Proforma"; the ERP transform
   // (e.g. NetSuite) decides how to handle it. (Was the Oracle-specific "Prepayment".)
@@ -494,33 +502,32 @@ function reconcileExtraction(extracted: any, warnings: string[]) {
     extracted.invoice.transactionIntent = "VendorBill";
   }
 
-  // Clean up PO number if it contains labels or garbage
+  // Keep the PO number as extracted. A separate lookup key can help match
+  // NetSuite crosswalk values, but must not replace the invoice value.
   const poRaw = String(extracted?.invoice?.purchaseOrderNumber ?? "").trim();
-  if (poRaw && poRaw !== "null") {
-    const cleaned = sanitizePurchaseOrderNumber(poRaw);
-    if (cleaned && cleaned !== poRaw) {
-      extracted.invoice.purchaseOrderNumber = cleaned;
-      warnings.push("sanitized_purchase_order_number");
-    } else if (!cleaned) {
-      extracted.invoice.purchaseOrderNumber = null;
-    }
+  if (poRaw && poRaw.toLowerCase() !== "null") {
+    extracted.invoice.purchaseOrderNumber = poRaw;
+    extracted.invoice.purchaseOrderLookupKey = derivePurchaseOrderLookupKey(poRaw);
   } else {
     extracted.invoice.purchaseOrderNumber = null;
+    extracted.invoice.purchaseOrderLookupKey = null;
   }
 }
 
-function sanitizePurchaseOrderNumber(input: string): string | null {
+function derivePurchaseOrderLookupKey(input: string): string | null {
   if (!input) return null;
   let s = input.trim();
 
-  // Remove common labels if the model included them
+  // Remove common labels only for matching. The original PO is preserved.
   s = s.replace(
     /^\s*(?:po|p\.o\.|purchase\s*order|order\s*(?:no|number|nr|n[oº°])|n[úu]mero\s+de\s+orden\s+de\s+compra|orden\s+de\s+compra|n[úu]mero\s+de\s+pedido|bon\s+de\s+commande|bestellnummer|auftragsnummer|ordine\s+d['']?acquisto)\s*[:#]?\s*/i,
     ""
   );
+  s = s.replace(/^[\s:#\-\/.]+/, "");
 
   // Keep only plausible code characters
   s = s.replace(/[^A-Za-z0-9\-\/\.]/g, "");
+  s = s.replace(/^[\-\/.]+|[\-\/.]+$/g, "");
 
   // Must contain at least one digit to be a plausible identifier
   if (!/\d/.test(s)) return null;

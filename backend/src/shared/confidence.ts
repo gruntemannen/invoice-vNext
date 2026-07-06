@@ -1,17 +1,22 @@
 export function calculateConfidence(extracted: any): number {
   let score = 0;
-  let total = 6;
+  let total = 8;
 
   const vendorName = String(extracted?.vendor?.name ?? "").trim();
+  const buyerName = String(extracted?.buyer?.name ?? "").trim();
   const invoiceNumber = String(extracted?.invoice?.invoiceNumber ?? "").trim();
+  const invoiceDate = String(extracted?.invoice?.invoiceDate ?? "").trim();
   const currency = String(extracted?.invoice?.currency ?? "").trim();
   const totalAmount = extracted?.invoice?.totalAmount;
   const taxAmount = extracted?.invoice?.taxAmount;
+  const netAmount = extracted?.invoice?.netAmount;
   const lineItems: any[] = Array.isArray(extracted?.lineItems) ? extracted.lineItems : [];
 
   const hasRealVendor = !!vendorName && !isPlaceholder(vendorName) && vendorName.length >= 3;
+  const hasRealBuyer = !!buyerName && !isPlaceholder(buyerName) && buyerName.length >= 3;
   const hasRealInvoiceNumber =
     !!invoiceNumber && !isPlaceholder(invoiceNumber) && /[A-Za-z0-9]/.test(invoiceNumber) && /\d/.test(invoiceNumber);
+  const hasRealInvoiceDate = /^\d{4}-\d{2}-\d{2}$/.test(invoiceDate);
   const hasRealCurrency = !!currency && /^[A-Z]{3}$/.test(currency) && currency !== "ETC";
   const hasRealTotalAmount = typeof totalAmount === "number" && Number.isFinite(totalAmount) && totalAmount > 0;
   const hasRealLineItem =
@@ -23,14 +28,16 @@ export function calculateConfidence(extracted: any): number {
     });
 
   if (hasRealVendor) score += 1;
+  if (hasRealBuyer) score += 1;
   if (hasRealInvoiceNumber) score += 1;
+  if (hasRealInvoiceDate) score += 1;
   if (hasRealCurrency) score += 1;
   if (hasRealTotalAmount) score += 1;
   if (hasRealLineItem) score += 1;
 
   // Basic math sanity: if totals exist, check net + tax ~= total and line sum ~= net (when possible)
   if (typeof totalAmount === "number" && typeof taxAmount === "number" && Number.isFinite(totalAmount) && Number.isFinite(taxAmount) && totalAmount > 0 && taxAmount >= 0) {
-    const net = totalAmount - taxAmount;
+    const net = typeof netAmount === "number" && Number.isFinite(netAmount) && netAmount > 0 ? netAmount : totalAmount - taxAmount;
     const lineSum =
       lineItems.length
         ? lineItems.reduce((acc: number, li: any) => acc + (typeof li?.amount === "number" && Number.isFinite(li.amount) ? li.amount : 0), 0)

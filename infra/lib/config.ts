@@ -26,4 +26,8 @@ export const config = {
   // Reserved concurrency for the extraction Lambda — caps simultaneous Bedrock calls (and
   // therefore cost) if the ingestion paths are flooded. Tune to your Bedrock account quota.
   extractReservedConcurrency: 5,
+
+  // Live NetSuite pushes are disabled by default. When false, API requests still create a
+  // durable transaction log record that can be replayed after credentials/config are ready.
+  netSuiteLivePushEnabled: false,
 };

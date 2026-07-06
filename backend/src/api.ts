@@ -2,21 +2,32 @@ import { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from "aws-lambda";
 import { queryInvoices, docClient } from "./shared/dynamo";
 import { DeleteCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
+import { transformToNetSuite, validateNetSuiteVendorBill, type NetSuiteConfig } from "./shared/netsuite";
+import { loadNetSuiteConfig } from "./shared/netsuite-config";
+import { assessInvoiceFlow } from "./shared/flow";
 import {
-  transformToNetSuite,
-  validateNetSuiteVendorBill,
-  exampleNetSuiteConfig,
-  type NetSuiteConfig,
-} from "./shared/netsuite";
+  canReplay,
+  createNetSuiteTransaction,
+  getNetSuiteTransaction,
+  listNetSuiteTransactions,
+  markTransactionFailed,
+  markTransactionQueued,
+  summarizeTransaction,
+  type NetSuiteTransactionStatus,
+} from "./shared/transactions";
 import { computeStats } from "./shared/stats";
 import { log } from "./shared/logger";
 
 const TABLE_NAME = process.env.TABLE_NAME ?? "";
 const ATTACHMENT_BUCKET = process.env.ATTACHMENT_BUCKET ?? "";
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES ?? "0");
+const NETSUITE_QUEUE_URL = process.env.NETSUITE_QUEUE_URL ?? "";
+const NETSUITE_LIVE_PUSH_ENABLED = process.env.NETSUITE_LIVE_PUSH_ENABLED === "true";
 const s3 = new S3Client({});
+const sqs = new SQSClient({});
 
 export const handler = async (
   event: APIGatewayProxyEventV2
@@ -30,6 +41,18 @@ export const handler = async (
   }
   if (path === "/upload" && event.requestContext.http.method === "POST") {
     return createUpload(event);
+  }
+  if (path === "/netsuite/transactions" && event.requestContext.http.method === "GET") {
+    return listNetSuiteTransactionLog(event);
+  }
+  if (path === "/netsuite/transactions/replay" && event.requestContext.http.method === "POST") {
+    return replayNetSuiteTransactions(event);
+  }
+  if (path.startsWith("/netsuite/transactions/") && path.endsWith("/replay") && event.requestContext.http.method === "POST") {
+    return replayNetSuiteTransaction(event);
+  }
+  if (path.startsWith("/invoices/") && path.endsWith("/netsuite/transactions") && event.requestContext.http.method === "POST") {
+    return createNetSuiteTransactionForInvoice(event);
   }
   if (path.startsWith("/invoices/") && path.endsWith("/netsuite")) {
     return getNetSuiteFormat(event);
@@ -56,21 +79,31 @@ async function listInvoices(event: APIGatewayProxyEventV2) {
     }
     throw err;
   }
-  const items = result.items.map((item: any) => ({
-    messageId: item.messageId,
-    attachmentId: item.attachmentId,
-    attachmentKey: item.attachmentKey,
-    receivedAt: item.receivedAt,
-    from: item.from,
-    subject: item.subject,
-    status: item.status,
-    confidence: item.confidence,
-    warnings: item.warnings ?? [],
-    vendorName: item.vendorName,
-    invoiceNumber: item.invoiceNumber,
-    currency: item.currency,
-    totalAmount: item.totalAmount,
-  }));
+  const items = result.items.map((rawItem: any) => {
+    const item = withDerivedFlow(rawItem);
+    return {
+      messageId: item.messageId,
+      attachmentId: item.attachmentId,
+      attachmentKey: item.attachmentKey,
+      receivedAt: item.receivedAt,
+      from: item.from,
+      subject: item.subject,
+      status: item.status,
+      reviewStatus: item.reviewStatus ?? item.extractedJson?.meta?.reviewStatus,
+      autoBookEligible: item.autoBookEligible ?? item.extractedJson?.meta?.autoBookEligible,
+      controlFlags: item.controlFlags ?? item.extractedJson?.meta?.controlFlags ?? [],
+      confidence: item.confidence,
+      warnings: item.warnings ?? [],
+      vendorName: item.vendorName,
+      buyerName: item.buyerName,
+      invoiceNumber: item.invoiceNumber,
+      purchaseOrderNumber: item.purchaseOrderNumber,
+      invoiceType: item.invoiceType,
+      currency: item.currency,
+      totalAmount: item.totalAmount,
+      duplicateCount: item.duplicateCount ?? item.extractedJson?.meta?.duplicateCount ?? 0,
+    };
+  });
 
   return jsonResponse({ items, nextToken: result.nextToken });
 }
@@ -87,7 +120,7 @@ async function getInvoiceDetail(event: APIGatewayProxyEventV2) {
   if (!item) {
     return jsonResponse({ message: "Not found" }, 404);
   }
-  return jsonResponse(item);
+  return jsonResponse(withDerivedFlow(item));
 }
 
 async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
@@ -99,20 +132,14 @@ async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
     return jsonResponse({ message: "Not found" }, 404);
   }
 
-  // EXPORT-ONLY: build + validate the NetSuite vendor bill payload but do NOT
-  // push it. No live call to getAccessToken/upsertVendorBill until creds are
-  // wired in. Config comes from the placeholder example for now; in production
-  // this loads from netsuite-config.json + a secrets store.
-  const config: NetSuiteConfig = exampleNetSuiteConfig;
-
   try {
-    const { bill, warnings } = transformToNetSuite(item.extractedJson, config);
-    const validation = validateNetSuiteVendorBill(bill, config);
+    const preview = buildNetSuitePreview(item);
 
     return jsonResponse({
-      netsuiteFormat: bill,
-      warnings,
-      validation,
+      netsuiteFormat: preview.bill,
+      warnings: preview.warnings,
+      validation: preview.validation,
+      flow: preview.flow,
       originalExtraction: item.extractedJson,
     });
   } catch (error: any) {
@@ -123,6 +150,151 @@ async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
     });
     return jsonResponse({ message: "Failed to transform invoice" }, 500);
   }
+}
+
+async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2) {
+  const messageId = event.pathParameters?.messageId ?? "";
+  const attachmentId = event.pathParameters?.attachmentId ?? "";
+
+  const item = await findByAttachmentId(messageId, attachmentId);
+  if (!item) {
+    return jsonResponse({ message: "Not found" }, 404);
+  }
+  if (item.status !== "COMPLETED" || !item.extractedJson) {
+    return jsonResponse({ message: "Invoice extraction is not complete." }, 409);
+  }
+
+  try {
+    const preview = buildNetSuitePreview(item);
+    let status: NetSuiteTransactionStatus = "QUEUED";
+    let eventMessage = "Transaction logged and queued for NetSuite push.";
+
+    if (!preview.validation.valid || preview.flow.reviewStatus !== "READY_FOR_NETSUITE") {
+      status = "HELD_FOR_REVIEW";
+      eventMessage = "Transaction logged but held for AP review.";
+    } else if (!NETSUITE_LIVE_PUSH_ENABLED) {
+      status = "HELD_FOR_CONFIGURATION";
+      eventMessage = "Transaction logged but live NetSuite push is disabled.";
+    }
+
+    const transaction = await createNetSuiteTransaction(TABLE_NAME, {
+      invoiceMessageId: item.messageId,
+      invoiceAttachmentKey: item.attachmentKey,
+      invoiceAttachmentId: item.attachmentId,
+      externalId: preview.bill.externalId,
+      requestPayload: preview.bill,
+      validation: preview.validation,
+      flow: preview.flow,
+      warnings: preview.warnings,
+      status,
+      eventMessage,
+    });
+
+    if (status === "QUEUED") {
+      try {
+        await enqueueNetSuiteTransaction(transaction.transactionId);
+      } catch (err: any) {
+        await markTransactionFailed(
+          TABLE_NAME,
+          transaction.transactionId,
+          true,
+          `Failed to enqueue transaction: ${err?.message ?? String(err)}`
+        );
+        return jsonResponse(
+          {
+            message: "Transaction was logged but could not be queued. It can be replayed.",
+            transaction: summarizeTransaction({ ...transaction, status: "FAILED_RETRYABLE" }),
+          },
+          202
+        );
+      }
+    }
+
+    return jsonResponse(
+      {
+        transaction: summarizeTransaction(transaction),
+        flow: preview.flow,
+        validation: preview.validation,
+        queued: status === "QUEUED",
+      },
+      status === "QUEUED" ? 202 : 200
+    );
+  } catch (error: any) {
+    log.error("NetSuite transaction logging failed", {
+      messageId,
+      attachmentId,
+      error: error?.message ?? String(error),
+    });
+    return jsonResponse({ message: "Failed to log NetSuite transaction" }, 500);
+  }
+}
+
+async function listNetSuiteTransactionLog(event: APIGatewayProxyEventV2) {
+  const limit = Math.min(Number(event.queryStringParameters?.limit ?? 25), 100);
+  const safeLimit = Number.isFinite(limit) && limit > 0 ? limit : 25;
+  const status = parseTransactionStatus(event.queryStringParameters?.status);
+  try {
+    const result = await listNetSuiteTransactions(
+      TABLE_NAME,
+      safeLimit,
+      event.queryStringParameters?.nextToken,
+      status
+    );
+    return jsonResponse({
+      items: result.items.map(summarizeTransaction),
+      nextToken: result.nextToken,
+    });
+  } catch (err: any) {
+    if (err?.statusCode === 400) {
+      return jsonResponse({ message: err.message }, 400);
+    }
+    throw err;
+  }
+}
+
+async function replayNetSuiteTransaction(event: APIGatewayProxyEventV2) {
+  const transactionId = event.pathParameters?.transactionId ?? pathTransactionId(event.rawPath ?? "");
+  if (!transactionId) {
+    return jsonResponse({ message: "transactionId is required" }, 400);
+  }
+  if (!NETSUITE_LIVE_PUSH_ENABLED) {
+    return jsonResponse({ message: "NetSuite live push is disabled; enable it before replay." }, 409);
+  }
+
+  const transaction = await getNetSuiteTransaction(TABLE_NAME, transactionId);
+  if (!transaction) {
+    return jsonResponse({ message: "Transaction not found" }, 404);
+  }
+  if (!canReplay(transaction.status)) {
+    return jsonResponse({ message: `Transaction status ${transaction.status} cannot be replayed.` }, 409);
+  }
+
+  await markTransactionQueued(TABLE_NAME, transactionId, true);
+  await enqueueNetSuiteTransaction(transactionId);
+  return jsonResponse({ queued: true, transactionId }, 202);
+}
+
+async function replayNetSuiteTransactions(event: APIGatewayProxyEventV2) {
+  if (!NETSUITE_LIVE_PUSH_ENABLED) {
+    return jsonResponse({ message: "NetSuite live push is disabled; enable it before replay." }, 409);
+  }
+  const status = parseTransactionStatus(event.queryStringParameters?.status) ?? "FAILED_RETRYABLE";
+  const limit = Math.min(Number(event.queryStringParameters?.limit ?? 25), 100);
+  const result = await listNetSuiteTransactions(TABLE_NAME, limit, undefined, status);
+  const queued: string[] = [];
+  const skipped: Array<{ transactionId: string; status: string }> = [];
+
+  for (const transaction of result.items) {
+    if (!canReplay(transaction.status)) {
+      skipped.push({ transactionId: transaction.transactionId, status: transaction.status });
+      continue;
+    }
+    await markTransactionQueued(TABLE_NAME, transaction.transactionId, true);
+    await enqueueNetSuiteTransaction(transaction.transactionId);
+    queued.push(transaction.transactionId);
+  }
+
+  return jsonResponse({ queued, skipped, nextToken: result.nextToken }, 202);
 }
 
 async function downloadAttachment(event: APIGatewayProxyEventV2) {
@@ -231,6 +403,58 @@ async function findByAttachmentId(messageId: string, attachmentId: string) {
   return res.Items?.[0] ?? null;
 }
 
+function buildNetSuitePreview(item: any): {
+  config: NetSuiteConfig;
+  bill: ReturnType<typeof transformToNetSuite>["bill"];
+  warnings: string[];
+  validation: ReturnType<typeof validateNetSuiteVendorBill>;
+  flow: ReturnType<typeof assessInvoiceFlow>;
+} {
+  const config = loadNetSuiteConfig();
+  const { bill, warnings } = transformToNetSuite(item.extractedJson, config);
+  const validation = validateNetSuiteVendorBill(bill, config);
+  const flow = assessInvoiceFlow(item.extractedJson, {
+    confidence: item.confidence,
+    warnings: item.warnings ?? item.extractedJson?.meta?.warnings ?? [],
+    duplicateCount: item.duplicateCount ?? item.extractedJson?.meta?.duplicateCount ?? 0,
+    netSuiteWarnings: warnings,
+    netSuiteValidationErrors: validation.errors,
+  });
+
+  return { config, bill, warnings, validation, flow };
+}
+
+async function enqueueNetSuiteTransaction(transactionId: string) {
+  if (!NETSUITE_QUEUE_URL) {
+    throw new Error("NETSUITE_QUEUE_URL is not configured");
+  }
+  await sqs.send(
+    new SendMessageCommand({
+      QueueUrl: NETSUITE_QUEUE_URL,
+      MessageBody: JSON.stringify({ transactionId }),
+    })
+  );
+}
+
+function parseTransactionStatus(value?: string): NetSuiteTransactionStatus | undefined {
+  if (!value) return undefined;
+  const allowed: NetSuiteTransactionStatus[] = [
+    "HELD_FOR_REVIEW",
+    "HELD_FOR_CONFIGURATION",
+    "QUEUED",
+    "IN_FLIGHT",
+    "SUCCEEDED",
+    "FAILED_RETRYABLE",
+    "FAILED_PERMANENT",
+  ];
+  return allowed.includes(value as NetSuiteTransactionStatus) ? (value as NetSuiteTransactionStatus) : undefined;
+}
+
+function pathTransactionId(path: string): string {
+  const match = path.match(/^\/netsuite\/transactions\/([^/]+)\/replay$/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
 function jsonResponse(body: any, statusCode = 200): APIGatewayProxyResultV2 {
   return {
     statusCode,
@@ -239,5 +463,25 @@ function jsonResponse(body: any, statusCode = 200): APIGatewayProxyResultV2 {
       "access-control-allow-origin": "*",
     },
     body: JSON.stringify(body),
+  };
+}
+
+function withDerivedFlow(item: any) {
+  if (!item || item.reviewStatus || item.status !== "COMPLETED" || !item.extractedJson) {
+    return item;
+  }
+
+  const flow = assessInvoiceFlow(item.extractedJson, {
+    confidence: item.confidence,
+    warnings: item.warnings ?? item.extractedJson?.meta?.warnings ?? [],
+    duplicateCount: item.duplicateCount ?? item.extractedJson?.meta?.duplicateCount ?? 0,
+  });
+
+  return {
+    ...item,
+    reviewStatus: flow.reviewStatus,
+    autoBookEligible: flow.autoBookEligible,
+    controlFlags: flow.flags,
+    duplicateCount: flow.duplicateCount,
   };
 }

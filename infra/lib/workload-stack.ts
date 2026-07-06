@@ -31,6 +31,7 @@ interface InvoiceExtractorStackProps extends cdk.StackProps {
   maxUploadBytes: number;
   dataRetentionDays: number;
   extractReservedConcurrency: number;
+  netSuiteLivePushEnabled: boolean;
 }
 
 export class InvoiceExtractorStack extends cdk.Stack {
@@ -116,6 +117,20 @@ export class InvoiceExtractorStack extends cdk.Stack {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
+    table.addGlobalSecondaryIndex({
+      indexName: "duplicate",
+      partitionKey: { name: "duplicatePk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "duplicateSk", type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    table.addGlobalSecondaryIndex({
+      indexName: "transaction-status",
+      partitionKey: { name: "transactionStatusPk", type: dynamodb.AttributeType.STRING },
+      sortKey: { name: "transactionStatusSk", type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
     const dlq = new sqs.Queue(this, "ExtractionDLQ", {
       retentionPeriod: cdk.Duration.days(14),
     });
@@ -125,6 +140,15 @@ export class InvoiceExtractorStack extends cdk.Stack {
       // become visible again and get redelivered mid-processing.
       visibilityTimeout: cdk.Duration.minutes(6),
       deadLetterQueue: { queue: dlq, maxReceiveCount: 5 },
+    });
+
+    const netSuiteDlq = new sqs.Queue(this, "NetSuiteDLQ", {
+      retentionPeriod: cdk.Duration.days(14),
+    });
+
+    const netSuiteQueue = new sqs.Queue(this, "NetSuiteQueue", {
+      visibilityTimeout: cdk.Duration.minutes(2),
+      deadLetterQueue: { queue: netSuiteDlq, maxReceiveCount: 5 },
     });
 
     const lambdaLogRetention = logs.RetentionDays.TWO_WEEKS;
@@ -192,6 +216,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
         ATTACHMENT_BUCKET: attachmentBucket.bucketName,
         TABLE_NAME: table.tableName,
         QUEUE_URL: queue.queueUrl,
+        NETSUITE_QUEUE_URL: netSuiteQueue.queueUrl,
+        NETSUITE_LIVE_PUSH_ENABLED: String(props.netSuiteLivePushEnabled),
         MAX_UPLOAD_BYTES: String(maxUploadBytes),
       },
       logRetention: lambdaLogRetention,
@@ -209,6 +235,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
     queue.grantSendMessages(ingestFn);
     queue.grantConsumeMessages(extractFn);
     queue.grantSendMessages(apiFn);
+    netSuiteQueue.grantSendMessages(apiFn);
 
     // NetSuite OAuth 2.0 (M2M) credentials for the scaffolded push path. Populate the secret
     // value after deploy (or in a sandbox): { accountId, clientId, certificateId, privateKeyPem, alg }.
@@ -219,6 +246,25 @@ export class InvoiceExtractorStack extends cdk.Stack {
     });
     netsuiteSecret.grantRead(apiFn);
     apiFn.addEnvironment("NETSUITE_SECRET_ARN", netsuiteSecret.secretArn);
+
+    const netSuiteWorkerFn = new lambdaNode.NodejsFunction(this, "NetSuiteWorkerLambda", {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      entry: path.join(__dirname, "../../backend/src/netsuite-worker.ts"),
+      projectRoot: backendRoot,
+      depsLockFilePath: backendLockFile,
+      handler: "handler",
+      timeout: cdk.Duration.minutes(1),
+      environment: {
+        TABLE_NAME: table.tableName,
+        NETSUITE_SECRET_ARN: netsuiteSecret.secretArn,
+        NETSUITE_LIVE_PUSH_ENABLED: String(props.netSuiteLivePushEnabled),
+      },
+      logRetention: lambdaLogRetention,
+    });
+
+    table.grantReadWriteData(netSuiteWorkerFn);
+    netSuiteQueue.grantConsumeMessages(netSuiteWorkerFn);
+    netsuiteSecret.grantRead(netSuiteWorkerFn);
 
     // Bedrock permissions for Claude
     extractFn.addToRolePolicy(
@@ -335,6 +381,11 @@ export class InvoiceExtractorStack extends cdk.Stack {
       batchSize: 1,
     });
 
+    netSuiteWorkerFn.addEventSourceMapping("NetSuiteQueueMapping", {
+      eventSourceArn: netSuiteQueue.queueArn,
+      batchSize: 1,
+    });
+
     // Operational alarms. Subscribe an email/Slack endpoint to this topic after deploy.
     const alarmTopic = new sns.Topic(this, "AlarmsTopic", {
       topicName: `${props.projectPrefix}-alarms`,
@@ -344,6 +395,17 @@ export class InvoiceExtractorStack extends cdk.Stack {
       .metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(5) })
       .createAlarm(this, "DlqNotEmptyAlarm", {
         alarmDescription: "Messages have landed in the extraction dead-letter queue",
+        threshold: 0,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        evaluationPeriods: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      })
+      .addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
+
+    netSuiteDlq
+      .metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(5) })
+      .createAlarm(this, "NetSuiteDlqNotEmptyAlarm", {
+        alarmDescription: "NetSuite push transactions have landed in the dead-letter queue and need replay",
         threshold: 0,
         comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
         evaluationPeriods: 1,
@@ -520,6 +582,34 @@ export class InvoiceExtractorStack extends cdk.Stack {
     });
 
     httpApi.addRoutes({
+      path: "/invoices/{messageId}/{attachmentId}/netsuite/transactions",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("NetSuiteTransactionIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/netsuite/transactions",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("NetSuiteTransactionListIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/netsuite/transactions/replay",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("NetSuiteTransactionReplayManyIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/netsuite/transactions/{transactionId}/replay",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("NetSuiteTransactionReplayIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
       path: "/upload",
       methods: [apigwv2.HttpMethod.POST],
       integration: new apigwv2Integrations.HttpLambdaIntegration("UploadIntegration", apiFn),
@@ -560,6 +650,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
     new cdk.CfnOutput(this, "RawBucketName", { value: rawBucket.bucketName });
     new cdk.CfnOutput(this, "AttachmentBucketName", { value: attachmentBucket.bucketName });
     new cdk.CfnOutput(this, "QueueUrl", { value: queue.queueUrl });
+    new cdk.CfnOutput(this, "NetSuiteQueueUrl", { value: netSuiteQueue.queueUrl });
     new cdk.CfnOutput(this, "AlarmsTopicArn", { value: alarmTopic.topicArn });
     new cdk.CfnOutput(this, "UserPoolId", { value: userPool.userPoolId });
     new cdk.CfnOutput(this, "UserPoolClientId", { value: userPoolClient.userPoolClientId });

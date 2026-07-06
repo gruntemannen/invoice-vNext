@@ -65,3 +65,26 @@ export async function queryInvoices(
 
   return { items: res.Items ?? [], nextToken: token };
 }
+
+export async function queryDuplicateInvoices(
+  tableName: string,
+  duplicatePk: string,
+  current?: { messageId?: string; attachmentKey?: string }
+) {
+  const res = await docClient.send(
+    new QueryCommand({
+      TableName: tableName,
+      IndexName: "duplicate",
+      KeyConditionExpression: "duplicatePk = :pk",
+      ExpressionAttributeValues: { ":pk": duplicatePk },
+      ScanIndexForward: false,
+      Limit: 10,
+    })
+  );
+
+  return (res.Items ?? []).filter((item) => {
+    if (item.status === "FAILED") return false;
+    if (!current?.messageId || !current?.attachmentKey) return true;
+    return !(item.messageId === current.messageId && item.attachmentKey === current.attachmentKey);
+  });
+}

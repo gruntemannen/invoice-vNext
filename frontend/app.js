@@ -256,6 +256,39 @@ function statusClass(status) {
   }
 }
 
+function reviewClass(status) {
+  switch (status) {
+    case "READY_FOR_NETSUITE":
+      return "ok";
+    case "NEEDS_REVIEW":
+      return "pending";
+    default:
+      return "pending";
+  }
+}
+
+function fmtReviewStatus(status) {
+  switch (status) {
+    case "READY_FOR_NETSUITE":
+      return "Ready";
+    case "NEEDS_REVIEW":
+      return "Review";
+    default:
+      return "—";
+  }
+}
+
+function renderControlFlags(flags) {
+  if (!Array.isArray(flags) || flags.length === 0) return "—";
+  return `<div class="flag-stack">${flags
+    .slice(0, 5)
+    .map((flag) => {
+      const severity = ["info", "warning", "blocker"].includes(flag.severity) ? flag.severity : "info";
+      return `<span class="flag ${severity}">${escapeHtml(flag.message || flag.code || "Review required")}</span>`;
+    })
+    .join("")}</div>`;
+}
+
 function escapeHtml(str) {
   if (str == null) return "";
   return String(str)
@@ -556,7 +589,16 @@ function filteredInvoices() {
   return state.invoices.filter((it) => {
     if (state.statusFilter !== "ALL" && it.status !== state.statusFilter) return false;
     if (!term) return true;
-    const hay = [it.vendorName, it.subject, it.from, it.invoiceNumber]
+    const hay = [
+      it.vendorName,
+      it.buyerName,
+      it.subject,
+      it.from,
+      it.invoiceNumber,
+      it.purchaseOrderNumber,
+      it.invoiceType,
+      it.reviewStatus,
+    ]
       .filter(Boolean)
       .join(" ")
       .toLowerCase();
@@ -571,7 +613,7 @@ function renderAudit() {
   body.innerHTML = "";
 
   if (rows.length === 0) {
-    body.innerHTML = `<tr><td colspan="6"><div class="empty">No invoices match your filters.</div></td></tr>`;
+    body.innerHTML = `<tr><td colspan="7"><div class="empty">No invoices match your filters.</div></td></tr>`;
     return;
   }
 
@@ -584,6 +626,7 @@ function renderAudit() {
       <td>${escapeHtml(it.invoiceNumber || "—")}</td>
       <td class="num">${escapeHtml(fmtAmount(it.totalAmount, it.currency))}</td>
       <td><span class="badge ${statusClass(it.status)}">${escapeHtml(it.status || "—")}</span></td>
+      <td><span class="badge ${reviewClass(it.reviewStatus)}">${escapeHtml(fmtReviewStatus(it.reviewStatus))}</span></td>
       <td class="num">${
         it.status === "COMPLETED"
           ? `<span class="conf ${confidenceClass(it.confidence)}">${fmtPct(it.confidence)}</span>`
@@ -601,10 +644,16 @@ function renderAudit() {
 
 const DETAIL_FIELDS = [
   ["Status", (d) => `<span class="badge ${statusClass(d.status)}">${escapeHtml(d.status || "—")}</span>`],
+  ["Review", (d) => `<span class="badge ${reviewClass(d.reviewStatus)}">${escapeHtml(fmtReviewStatus(d.reviewStatus))}</span>`],
   ["Vendor", (d) => escapeHtml(d.vendorName || "—")],
+  ["Buyer", (d) => escapeHtml(d.buyerName || d.extractedJson?.buyer?.name || "—")],
   ["Invoice #", (d) => escapeHtml(d.invoiceNumber || "—")],
+  ["PO", (d) => escapeHtml(d.purchaseOrderNumber || d.extractedJson?.invoice?.purchaseOrderNumber || "—")],
+  ["Type", (d) => escapeHtml(d.invoiceType || d.extractedJson?.invoice?.invoiceType || "—")],
   ["Amount", (d) => escapeHtml(fmtAmount(d.totalAmount, d.currency))],
   ["Confidence", (d) => (d.status === "COMPLETED" ? escapeHtml(fmtPct(d.confidence)) : "—")],
+  ["Duplicates", (d) => escapeHtml(String(d.duplicateCount ?? d.extractedJson?.meta?.duplicateCount ?? 0))],
+  ["Controls", (d) => renderControlFlags(d.controlFlags ?? d.extractedJson?.meta?.controlFlags ?? [])],
   ["From", (d) => escapeHtml(d.from || "—")],
   ["Subject", (d) => escapeHtml(d.subject || "—")],
   ["Received", (d) => escapeHtml(fmtDate(d.receivedAt))],
@@ -656,6 +705,8 @@ async function openDetail(messageId, attachmentId) {
 
     // Wire download lazily (presigned URL fetched on click to keep it fresh).
     $("drawer-download").onclick = () => downloadPdf(messageId, attachmentId);
+    $("drawer-netsuite").onclick = () => previewNetSuite(messageId, attachmentId);
+    $("drawer-netsuite-log").onclick = () => logNetSuiteTransaction(messageId, attachmentId);
     $("drawer-delete").onclick = () => deleteInvoice(messageId, attachmentId);
   } catch (err) {
     if (err.message === "Unauthorized") return;
@@ -685,6 +736,52 @@ async function downloadPdf(messageId, attachmentId) {
     if (err.message === "Unauthorized") return;
     console.error(err);
     toast("Download failed.", "error");
+  }
+}
+
+async function previewNetSuite(messageId, attachmentId) {
+  const jsonBox = $("drawer-json");
+  try {
+    jsonBox.textContent = "Loading NetSuite preview...";
+    const res = await apiFetch(
+      `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}/netsuite`
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      jsonBox.textContent = JSON.stringify(data || { message: `Preview failed (${res.status})` }, null, 2);
+      toast("NetSuite preview failed.", "error");
+      return;
+    }
+    jsonBox.textContent = JSON.stringify(data, null, 2);
+    toast("NetSuite preview loaded.", "success");
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    jsonBox.textContent = "NetSuite preview failed.";
+    toast("NetSuite preview failed.", "error");
+  }
+}
+
+async function logNetSuiteTransaction(messageId, attachmentId) {
+  const jsonBox = $("drawer-json");
+  try {
+    jsonBox.textContent = "Logging NetSuite transaction...";
+    const res = await apiFetch(
+      `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}/netsuite/transactions`,
+      { method: "POST" }
+    );
+    const data = await res.json().catch(() => ({}));
+    jsonBox.textContent = JSON.stringify(data, null, 2);
+    if (res.ok) {
+      toast(data.queued ? "NetSuite transaction queued." : "NetSuite transaction logged.", "success");
+    } else {
+      toast(data.message || "Transaction logging failed.", "error");
+    }
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    jsonBox.textContent = "Transaction logging failed.";
+    toast("Transaction logging failed.", "error");
   }
 }
 

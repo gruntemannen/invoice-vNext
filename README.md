@@ -22,6 +22,8 @@ Invoice Extractor is a production-ready, serverless application that:
 - **Admin Console**: Cognito-authenticated dashboard with ingestion stats, success rates, and a DynamoDB audit view
 - **Secure by Default**: JWT-protected API, least-privilege IAM, DynamoDB PITR, S3 versioning, a Bedrock concurrency cap, and CloudWatch alarms
 - **Confidence Scoring**: Automatic quality assessment of extracted data
+- **AP Control Flow**: Captures buyer/legal entity, PO, service period, payment terms, vendor bank details, duplicate fingerprints, and review flags before NetSuite booking
+- **Durable NetSuite Outbox**: Logs every NetSuite push request and attempt in DynamoDB before calling NetSuite, with replay endpoints for outages
 - **Multi-Account Architecture**: Designed for AWS Organizations with separate workload accounts
 - **Cost Optimized**: Pay-per-use serverless architecture
 
@@ -49,8 +51,21 @@ Access  (Cognito JWT on every route)                      │
 2. An ingest Lambda records it in DynamoDB and queues a processing job (SQS)
 3. The Extract Lambda sends the PDF directly to Claude Sonnet 4.6
 4. Claude visually analyzes the document and extracts structured data
-5. Results are validated, confidence-scored, and stored in DynamoDB
-6. Admins sign in to the console (Cognito) to review stats/audit, and can export any invoice as a NetSuite vendor bill
+5. Results are validated, confidence-scored, checked for likely duplicates, and stored in DynamoDB with review flags
+6. Admins sign in to the console (Cognito) to review stats/audit, inspect control flags, download the PDF, and preview the NetSuite vendor bill payload
+
+### AP review flow
+
+The flow is designed for a centralized AP inbox rather than entity-specific mailboxes:
+
+1. SES stores every inbound email in `raw/`; the ingest Lambda extracts invoice attachments and preserves sender/subject/source metadata.
+2. Claude extracts vendor, buyer/legal entity, invoice header, PO, service period, payment terms, vendor bank details, and line items.
+3. The extractor computes a duplicate key from vendor + invoice number + currency + gross total and queries a sparse DynamoDB `duplicate` index for prior records.
+4. Each invoice gets a `reviewStatus` of `READY_FOR_NETSUITE` or `NEEDS_REVIEW`, plus AP-readable control flags such as low confidence, potential duplicate, PO match required, non-standard document, missing buyer entity, or bank details captured for vendor-master verification.
+5. The NetSuite preview endpoint builds the vendor-bill payload, validates required NetSuite refs, and folds mapping/validation warnings into the same flow decision.
+6. The NetSuite transaction endpoint writes a durable DynamoDB outbox record before any push is queued. Worker attempts append status events to that record, and retryable failures can be replayed after an outage.
+
+Live auto-booking should stay disabled until vendor, subsidiary, currency, expense-account, PO, and bank-detail controls are populated and validated in a NetSuite sandbox.
 
 ### Components
 
@@ -101,6 +116,7 @@ export const config = {
   maxUploadBytes: 10 * 1024 * 1024,   // max invoice attachment size (bytes)
   dataRetentionDays: 90,              // DynamoDB TTL / attachment retention
   extractReservedConcurrency: 5,      // cap on concurrent Bedrock calls (cost control)
+  netSuiteLivePushEnabled: false,      // false = log transactions only; true = worker calls NetSuite
 };
 ```
 
@@ -126,8 +142,8 @@ hosted UI; the app stores the returned id token and sends it as a bearer token o
 - Recent failures, each linking straight to the record
 
 ### Audit (browse DynamoDB)
-- Filter by status and search by vendor / subject / sender / invoice number
-- Open any record for full metadata, the extracted JSON, a PDF download, and delete
+- Filter by status and search by vendor / buyer / subject / sender / invoice number / PO / review status
+- Open any record for full metadata, AP control flags, extracted JSON, NetSuite preview, durable transaction logging, PDF download, and delete
 
 ### Ingest invoices
 - **Email**: send to the SES-verified address (lands in S3 `raw/` and is processed automatically)
@@ -139,8 +155,27 @@ For any invoice, build the NetSuite vendor-bill payload (authenticated):
 curl -H "Authorization: Bearer <id_token>" \
   https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite
 ```
-Returns `{ netsuiteFormat, warnings, validation, originalExtraction }`. See the
+Returns `{ netsuiteFormat, warnings, validation, flow, originalExtraction }`. See the
 [NetSuite Integration Guide](NETSUITE-INTEGRATION.md) to enable live push.
+
+### Log and replay NetSuite transactions
+
+Create a durable transaction record from an invoice. This writes to DynamoDB before any queue/send:
+```bash
+curl -X POST -H "Authorization: Bearer <id_token>" \
+  https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite/transactions
+```
+
+List or replay failed transactions after a NetSuite outage:
+```bash
+curl -H "Authorization: Bearer <id_token>" \
+  "https://your-api-url/netsuite/transactions?status=FAILED_RETRYABLE"
+
+curl -X POST -H "Authorization: Bearer <id_token>" \
+  https://your-api-url/netsuite/transactions/{transactionId}/replay
+```
+
+Bulk replay is available with `POST /netsuite/transactions/replay?status=FAILED_RETRYABLE&limit=25`.
 
 ## NetSuite Integration
 
@@ -150,7 +185,7 @@ today (it builds + validates the payload), and live push is a credentials + sand
 
 ### Features
 - Transform extracted JSON → NetSuite REST `vendorBill` payload (expense sublist)
-- Configurable crosswalks (vendor / GL account / currency / department / class / terms → internal ids)
+- Configurable crosswalks (vendor / subsidiary / PO / GL account / currency / department / class / terms → internal ids)
 - OAuth 2.0 M2M (JWT client-assertion) client, SuiteQL resolver, idempotent `eid:` upsert
 - Validation + gross-vs-net reconciliation before import
 
@@ -162,7 +197,7 @@ Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
 {
   "subsidiaryId": "",
   "apAccountId": "",
-  "defaults": { "departmentId": "", "classId": "", "locationId": "", "taxCodeId": "" },
+  "defaults": { "expenseAccountId": "", "departmentId": "", "classId": "", "locationId": "", "taxCodeId": "" },
   "crosswalks": {
     "vendorsByTaxId": { "VAT123456": "4521" },
     "vendorsByName": {},
@@ -170,7 +205,10 @@ Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
     "currenciesByCode": { "USD": "1", "EUR": "4" },
     "departmentsByCode": {},
     "classesByCode": {},
-    "termsByName": { "Net 30": "5" }
+    "termsByName": { "Net 30": "5" },
+    "subsidiariesByTaxId": {},
+    "subsidiariesByName": {},
+    "purchaseOrdersByNumber": {}
   }
 }
 ```
@@ -221,6 +259,7 @@ environment variables:
 | `maxUploadBytes` | Max invoice attachment size (default 10 MiB). |
 | `dataRetentionDays` | DynamoDB TTL + attachment retention in days (default 90). |
 | `extractReservedConcurrency` | Cap on concurrent Bedrock invocations (cost control; tune to your account quota). |
+| `netSuiteLivePushEnabled` | Enables the NetSuite worker to call NetSuite. Keep `false` until sandbox validation is complete; transaction logging still works. |
 | `managementAccountId` / `memberAccount*` | AWS Organizations multi-account settings. |
 
 ### Cost Controls
@@ -263,6 +302,22 @@ GET /invoices/{messageId}/{attachmentId}
 **Get NetSuite Format**
 ```
 GET /invoices/{messageId}/{attachmentId}/netsuite
+```
+
+**Log NetSuite Transaction**
+```
+POST /invoices/{messageId}/{attachmentId}/netsuite/transactions
+```
+
+**List NetSuite Transactions**
+```
+GET /netsuite/transactions?status=FAILED_RETRYABLE
+```
+
+**Replay NetSuite Transaction**
+```
+POST /netsuite/transactions/{transactionId}/replay
+POST /netsuite/transactions/replay?status=FAILED_RETRYABLE&limit=25
 ```
 
 **Download PDF**

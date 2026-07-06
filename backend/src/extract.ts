@@ -1,9 +1,10 @@
 import { SQSEvent } from "aws-lambda";
 import { getObject } from "./shared/s3";
-import { updateItem } from "./shared/dynamo";
+import { queryDuplicateInvoices, updateItem } from "./shared/dynamo";
 import { invokeBedrock, DocumentInput } from "./shared/bedrock";
 import { buildExtractionPrompt, buildRepairPrompt } from "./shared/prompts";
 import { calculateConfidence } from "./shared/confidence";
+import { assessInvoiceFlow, buildDuplicateKey, summarizeDuplicateMatch } from "./shared/flow";
 import { log } from "./shared/logger";
 import { emitMetric } from "./shared/metrics";
 
@@ -82,21 +83,66 @@ export const handler = async (event: SQSEvent) => {
       const confidence = calculateConfidence(normalized);
       normalized.meta.confidenceScore = confidence;
 
-      // 8. Save to database
+      // 8. Find likely duplicates before marking this invoice ready for review/export.
+      const duplicateKey = buildDuplicateKey(normalized);
+      let duplicateMatches: ReturnType<typeof summarizeDuplicateMatch>[] = [];
+      if (duplicateKey) {
+        try {
+          duplicateMatches = (
+            await queryDuplicateInvoices(TABLE_NAME, duplicateKey, {
+              messageId,
+              attachmentKey,
+            })
+          ).map(summarizeDuplicateMatch);
+        } catch (err: any) {
+          warnings.push(`duplicate_lookup_failed: ${err?.message ?? String(err)}`);
+          log.warn("Duplicate lookup failed", { messageId, duplicateKey, error: err?.message ?? String(err) });
+        }
+      }
+
+      const flow = assessInvoiceFlow(normalized, {
+        confidence,
+        warnings,
+        duplicateCount: duplicateMatches.length,
+      });
+      normalized.meta.reviewStatus = flow.reviewStatus;
+      normalized.meta.autoBookEligible = flow.autoBookEligible;
+      normalized.meta.controlFlags = flow.flags;
+      normalized.meta.duplicateKey = duplicateKey;
+      normalized.meta.duplicateCount = duplicateMatches.length;
+      normalized.meta.duplicateMatches = duplicateMatches;
+
+      // 9. Save to database
+      const updates: Record<string, any> = {
+        status: "COMPLETED",
+        reviewStatus: flow.reviewStatus,
+        autoBookEligible: flow.autoBookEligible,
+        controlFlags: flow.flags,
+        warnings,
+        updatedAt: new Date().toISOString(),
+        extractedJson: normalized,
+        confidence,
+        vendorName: normalized.vendor?.name ?? null,
+        buyerName: normalized.buyer?.name ?? null,
+        invoiceNumber: normalized.invoice?.invoiceNumber ?? null,
+        purchaseOrderNumber: normalized.invoice?.purchaseOrderNumber ?? null,
+        invoiceType: normalized.invoice?.invoiceType ?? null,
+        currency: normalized.invoice?.currency ?? null,
+        totalAmount: normalized.invoice?.totalAmount ?? null,
+        duplicateCount: duplicateMatches.length,
+        duplicateMatches,
+        modelUsed,
+      };
+
+      if (duplicateKey) {
+        updates.duplicatePk = duplicateKey;
+        updates.duplicateSk = `${normalized.invoice?.invoiceDate ?? receivedAt}#${messageId}#${attachmentId}`;
+      }
+
       await updateItem(
         TABLE_NAME,
         { messageId, attachmentKey },
-        {
-          status: "COMPLETED",
-          updatedAt: new Date().toISOString(),
-          extractedJson: normalized,
-          confidence,
-          vendorName: normalized.vendor?.name ?? null,
-          invoiceNumber: normalized.invoice?.invoiceNumber ?? null,
-          currency: normalized.invoice?.currency ?? null,
-          totalAmount: normalized.invoice?.totalAmount ?? null,
-          modelUsed,
-        }
+        updates
       );
 
       emitMetric("ExtractionSuccess", 1, "Count", { Model: modelUsed });
@@ -181,49 +227,171 @@ function parseJsonResponse(text: string | undefined): any {
  * Normalize extraction to ensure consistent structure
  */
 function normalizeExtraction(raw: any): any {
-  // If already has proper structure, use it
-  if (raw.vendor && raw.invoice) {
-    return {
-      vendor: {
-        name: raw.vendor.name ?? null,
-        taxId: raw.vendor.taxId ?? null,
-        address: raw.vendor.address ?? null,
-      },
-      invoice: {
-        invoiceNumber: raw.invoice.invoiceNumber ?? null,
-        purchaseOrderNumber:
-          raw.invoice.purchaseOrderNumber ?? raw.invoice.poNumber ?? raw.invoice.po ?? raw.invoice.purchaseOrder ?? null,
-        invoiceType: raw.invoice.invoiceType ?? raw.invoice.type ?? null,
-        invoiceDate: raw.invoice.invoiceDate ?? null,
-        dueDate: raw.invoice.dueDate ?? null,
-        currency: raw.invoice.currency ?? null,
-        totalAmount: parseNumber(raw.invoice.totalAmount),
-        taxAmount: parseNumber(raw.invoice.taxAmount),
-      },
-      lineItems: Array.isArray(raw.lineItems) ? raw.lineItems : [],
-    };
-  }
+  const srcVendor = raw.vendor ?? raw.supplier ?? raw.seller ?? {};
+  const srcBuyer = raw.buyer ?? raw.customer ?? raw.billTo ?? raw.recipient ?? {};
+  const srcInvoice = raw.invoice ?? raw;
 
-  // Handle flat structure - map common field names
   return {
     vendor: {
-      name: raw.vendorName ?? raw.vendor_name ?? raw.supplierName ?? raw.name ?? null,
-      taxId: raw.taxId ?? raw.vatNumber ?? raw.vat ?? null,
-      address: raw.vendorAddress ?? raw.address ?? null,
+      name: firstPresent(srcVendor.name, raw.vendorName, raw.vendor_name, raw.supplierName, raw.sellerName, raw.name),
+      taxId: firstPresent(srcVendor.taxId, srcVendor.vatNumber, srcVendor.vatId, raw.taxId, raw.vatNumber, raw.vat),
+      address: firstPresent(srcVendor.address, raw.vendorAddress),
+      email: firstPresent(srcVendor.email, raw.vendorEmail),
+      bankDetails: normalizeBankDetails(
+        firstPresent(srcVendor.bankDetails, srcVendor.bank, raw.bankDetails, raw.vendorBankDetails, raw.paymentDetails),
+        raw
+      ),
+    },
+    buyer: {
+      name: firstPresent(srcBuyer.name, raw.buyerName, raw.customerName, raw.billToName, raw.recipientName),
+      taxId: firstPresent(srcBuyer.taxId, srcBuyer.vatNumber, srcBuyer.vatId, raw.buyerTaxId, raw.customerTaxId),
+      address: firstPresent(srcBuyer.address, raw.buyerAddress, raw.customerAddress, raw.billToAddress),
+      email: firstPresent(srcBuyer.email, raw.buyerEmail, raw.customerEmail),
+      entityCode: firstPresent(srcBuyer.entityCode, raw.entityCode, raw.subsidiaryCode),
     },
     invoice: {
-      invoiceNumber: raw.invoiceNumber ?? raw.invoice_number ?? raw.number ?? null,
+      invoiceNumber: firstPresent(srcInvoice.invoiceNumber, raw.invoiceNumber, raw.invoice_number, raw.number),
       purchaseOrderNumber:
-        raw.purchaseOrderNumber ?? raw.poNumber ?? raw.po_number ?? raw.po ?? raw.purchaseOrder ?? raw.purchase_order ?? null,
-      invoiceType: raw.invoiceType ?? raw.invoice_type ?? raw.type ?? null,
-      invoiceDate: raw.invoiceDate ?? raw.invoice_date ?? raw.date ?? null,
-      dueDate: raw.dueDate ?? raw.due_date ?? null,
-      currency: raw.currency ?? null,
-      totalAmount: parseNumber(raw.totalAmount ?? raw.total ?? raw.amount),
-      taxAmount: parseNumber(raw.taxAmount ?? raw.tax ?? raw.vat),
+        firstPresent(
+          srcInvoice.purchaseOrderNumber,
+          srcInvoice.poNumber,
+          srcInvoice.po,
+          srcInvoice.purchaseOrder,
+          raw.purchaseOrderNumber,
+          raw.poNumber,
+          raw.po_number,
+          raw.po,
+          raw.purchaseOrder,
+          raw.purchase_order
+        ),
+      invoiceType: normalizeInvoiceType(firstPresent(srcInvoice.invoiceType, srcInvoice.type, raw.invoiceType, raw.invoice_type, raw.type)),
+      invoiceDate: firstPresent(srcInvoice.invoiceDate, raw.invoiceDate, raw.invoice_date, raw.date),
+      dueDate: firstPresent(srcInvoice.dueDate, raw.dueDate, raw.due_date),
+      currency: normalizeCurrency(firstPresent(srcInvoice.currency, raw.currency)),
+      paymentTerms: firstPresent(srcInvoice.paymentTerms, srcInvoice.terms, raw.paymentTerms, raw.terms),
+      description: firstPresent(srcInvoice.description, srcInvoice.memo, raw.description, raw.memo),
+      servicePeriod: normalizeServicePeriod(srcInvoice.servicePeriod ?? raw.servicePeriod ?? raw.period),
+      servicePeriodStart: firstPresent(srcInvoice.servicePeriodStart, raw.servicePeriodStart, raw.periodStart),
+      servicePeriodEnd: firstPresent(srcInvoice.servicePeriodEnd, raw.servicePeriodEnd, raw.periodEnd),
+      remittanceReference: firstPresent(srcInvoice.remittanceReference, raw.remittanceReference, raw.paymentReference),
+      totalAmount: parseNumber(firstPresent(srcInvoice.totalAmount, raw.totalAmount, raw.total, raw.amount)),
+      taxAmount: parseNumber(firstPresent(srcInvoice.taxAmount, raw.taxAmount, raw.tax, raw.vat)),
+      netAmount: parseNumber(firstPresent(srcInvoice.netAmount, raw.netAmount, raw.subtotal, raw.subTotal)),
     },
-    lineItems: raw.lineItems ?? raw.items ?? raw.lines ?? [],
+    lineItems: normalizeLineItems(raw.lineItems ?? raw.items ?? raw.lines ?? []),
   };
+}
+
+function normalizeLineItems(items: any[]): any[] {
+  if (!Array.isArray(items)) return [];
+  return items.map((line, index) => ({
+    lineNumber: parseNumber(firstPresent(line?.lineNumber, line?.line, line?.position)) ?? index + 1,
+    description: firstPresent(line?.description, line?.memo, line?.name, line?.item) ?? null,
+    quantity: parseNumber(firstPresent(line?.quantity, line?.qty)),
+    unitPrice: parseNumber(firstPresent(line?.unitPrice, line?.rate, line?.price)),
+    amount: parseNumber(firstPresent(line?.amount, line?.netAmount, line?.total)),
+    taxRate: parseTaxRate(firstPresent(line?.taxRate, line?.vatRate, line?.taxPercent, line?.vatPercent)),
+    account: firstPresent(line?.account, line?.glAccount, line?.glCode, line?.expenseAccount),
+    department: firstPresent(line?.department, line?.departmentCode),
+    costCenter: firstPresent(line?.costCenter, line?.costCentre, line?.class),
+    project: firstPresent(line?.project, line?.projectCode, line?.job),
+  }));
+}
+
+function firstPresent(...values: any[]): any {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    if (typeof value === "string" && value.trim() === "") continue;
+    return value;
+  }
+  return null;
+}
+
+function normalizeCurrency(value: any): string | null {
+  const s = String(value ?? "").trim().toUpperCase();
+  if (!s) return null;
+  const symbols: Record<string, string> = { "€": "EUR", "$": "USD", "£": "GBP" };
+  return symbols[s] ?? s;
+}
+
+function normalizeInvoiceType(value: any): string | null {
+  const s = String(value ?? "").trim();
+  if (!s) return null;
+  if (/mahnung|reminder|dunning/i.test(s)) return "Reminder";
+  if (/credit|gutschrift|credit\s*note/i.test(s)) return "CreditNote";
+  if (/pro\s*forma|proforma/i.test(s)) return "Proforma";
+  if (/rechnung|invoice|vat\s*invoice|standard/i.test(s)) return "Standard";
+  return s;
+}
+
+function normalizeServicePeriod(value: any): any {
+  if (!value || typeof value !== "object") return null;
+  return {
+    startDate: firstPresent(value.startDate, value.start, value.from),
+    endDate: firstPresent(value.endDate, value.end, value.to),
+  };
+}
+
+function normalizeBankDetails(bank: any, raw: any): any {
+  const ibans = uniqueStrings([
+    ...asArray(bank?.ibans),
+    bank?.iban,
+    bank?.accountIban,
+    raw?.iban,
+    raw?.vendorIban,
+  ].flatMap(extractIbans));
+
+  const bics = uniqueStrings([
+    ...asArray(bank?.bics),
+    bank?.bic,
+    bank?.swift,
+    raw?.bic,
+    raw?.swift,
+  ].flatMap(extractBics));
+
+  return {
+    ibans,
+    bic: firstPresent(bics[0], bank?.bic, bank?.swift, raw?.bic, raw?.swift),
+    bankName: firstPresent(bank?.bankName, bank?.name, raw?.bankName),
+    accountName: firstPresent(bank?.accountName, raw?.accountName),
+    accountNumber: firstPresent(bank?.accountNumber, raw?.accountNumber),
+  };
+}
+
+function asArray(value: any): any[] {
+  if (Array.isArray(value)) return value;
+  return value === null || value === undefined ? [] : [value];
+}
+
+function uniqueStrings(values: any[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    const s = String(value ?? "").replace(/\s+/g, " ").trim();
+    if (!s) continue;
+    const key = s.toUpperCase().replace(/\s+/g, "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
+}
+
+function extractIbans(value: any): string[] {
+  const s = String(value ?? "").toUpperCase();
+  return s.match(/[A-Z]{2}\d{2}[A-Z0-9 ]{8,34}/g) ?? [];
+}
+
+function extractBics(value: any): string[] {
+  const s = String(value ?? "").toUpperCase();
+  return s.match(/[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}(?:[A-Z0-9]{3})?/g) ?? [];
+}
+
+function parseTaxRate(value: any): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const parsed = parseMoney(String(value).replace("%", ""));
+  return parsed;
 }
 
 /**

@@ -69,6 +69,7 @@ export interface NetSuiteConfig {
   subsidiaryId?: string;
   apAccountId?: string;
   defaults?: {
+    expenseAccountId?: string;
     departmentId?: string;
     classId?: string;
     locationId?: string;
@@ -82,6 +83,9 @@ export interface NetSuiteConfig {
     departmentsByCode: Record<string, string>;
     classesByCode: Record<string, string>;
     termsByName: Record<string, string>;
+    subsidiariesByTaxId?: Record<string, string>;
+    subsidiariesByName?: Record<string, string>;
+    purchaseOrdersByNumber?: Record<string, string>;
   };
 }
 
@@ -212,6 +216,46 @@ function toNumber(value: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+function buildExpenseSourceLines(lineItems: any[], invoice: any, warnings: string[]): any[] {
+  if (lineItems.length > 0) return lineItems;
+
+  const taxAmount = round2(toNumber(invoice?.taxAmount));
+  const netAmount = round2(toNumber(invoice?.netAmount));
+  const grossAmount = round2(toNumber(invoice?.totalAmount));
+  const fallbackAmount = netAmount > 0 ? netAmount : round2(grossAmount - taxAmount);
+
+  if (fallbackAmount > 0) {
+    warnings.push(
+      "No line items found; created one summary expense line from the invoice net amount."
+    );
+    return [
+      {
+        lineNumber: 1,
+        description: invoice?.description ?? "Invoice total",
+        amount: fallbackAmount,
+      },
+    ];
+  }
+
+  return [];
+}
+
+function buildMemo(invoice: any): string {
+  const parts = [
+    invoice?.description,
+    invoice?.purchaseOrderNumber ? `PO ${invoice.purchaseOrderNumber}` : null,
+    invoice?.servicePeriod?.startDate || invoice?.servicePeriod?.endDate
+      ? `Service period ${invoice?.servicePeriod?.startDate ?? "?"} to ${invoice?.servicePeriod?.endDate ?? "?"}`
+      : null,
+    invoice?.remittanceReference ? `Payment ref ${invoice.remittanceReference}` : null,
+  ]
+    .filter(Boolean)
+    .map((part) => String(part).trim())
+    .filter(Boolean);
+
+  return parts.join(" | ").slice(0, 999);
+}
+
 /**
  * Placeholder internal id used when a reference cannot be resolved through a
  * crosswalk and no default is configured. It is intentionally non-numeric and
@@ -230,11 +274,11 @@ export const UNRESOLVED_PLACEHOLDER = "__UNRESOLVED__";
  *   invoice.currency      -> currency ref (crosswalk currenciesByCode)
  *   invoice.dueDate       -> dueDate
  *   invoice.paymentTerms  -> terms ref (crosswalk termsByName)
- *   invoice.description   -> memo
- *   config.subsidiaryId   -> subsidiary ref (single-subsidiary)
+ *   invoice.description/PO/servicePeriod -> memo
+ *   buyer.taxId/name or config.subsidiaryId -> subsidiary ref
  *   config.apAccountId    -> header AP account ref
  *   lineItems[] (NET)     -> expense.items[]:
- *       account  via accountsByCode (else default apAccount / suspense + warning)
+ *       account  via accountsByCode (else default expenseAccount/apAccount + warning)
  *       amount   = line net amount
  *       memo     = line description
  *       department via departmentsByCode (line.department, else default)
@@ -252,6 +296,7 @@ export function transformToNetSuite(
   const cw = config.crosswalks;
 
   const vendor = extracted?.vendor ?? {};
+  const buyer = extracted?.buyer ?? {};
   const invoice = extracted?.invoice ?? {};
   const lineItems: any[] = Array.isArray(extracted?.lineItems) ? extracted.lineItems : [];
 
@@ -295,14 +340,40 @@ export function transformToNetSuite(
     account = { id: config.apAccountId };
   }
 
-  // --- Subsidiary (single-subsidiary; only when configured) ---------------
+  // --- Subsidiary/entity routing -----------------------------------------
   let subsidiary: NetSuiteRef | undefined;
-  if (config.subsidiaryId) {
+  const buyerTaxId: string = buyer?.taxId ?? "";
+  const buyerName: string = buyer?.name ?? "";
+  if (buyerTaxId && cw.subsidiariesByTaxId?.[buyerTaxId]) {
+    subsidiary = { id: cw.subsidiariesByTaxId[buyerTaxId] };
+  } else if (buyerName && cw.subsidiariesByName?.[buyerName]) {
+    subsidiary = { id: cw.subsidiariesByName[buyerName] };
+  } else if (config.subsidiaryId) {
     subsidiary = { id: config.subsidiaryId };
+  } else if (buyerTaxId || buyerName) {
+    warnings.push(
+      `Buyer entity not resolved (taxId="${buyerTaxId}", name="${buyerName}"); subsidiary left unset.`
+    );
+  }
+
+  // --- PO reference -------------------------------------------------------
+  const poNumber: string = invoice?.purchaseOrderNumber ?? "";
+  if (poNumber) {
+    const poId = cw.purchaseOrdersByNumber?.[poNumber];
+    if (poId) {
+      warnings.push(
+        `PO "${poNumber}" maps to NetSuite purchase order ${poId}; use the PO-backed bill/three-way-match flow instead of a direct expense bill if this invoice should close the PO.`
+      );
+    } else {
+      warnings.push(
+        `PO "${poNumber}" extracted but not in purchaseOrdersByNumber; resolve/match the PO in NetSuite before push.`
+      );
+    }
   }
 
   // --- Lines (NET amounts) -> expense sublist -----------------------------
-  const items: ExpenseLine[] = lineItems.map((line, index) => {
+  const sourceLines = buildExpenseSourceLines(lineItems, invoice, warnings);
+  const items: ExpenseLine[] = sourceLines.map((line, index) => {
     const lineNo = toNumber(line?.lineNumber) || index + 1;
     const amount = round2(toNumber(line?.amount));
 
@@ -311,12 +382,13 @@ export function transformToNetSuite(
     const glCode: string = line?.account ?? "";
     if (glCode && cw.accountsByCode[glCode]) {
       lineAccount = { id: cw.accountsByCode[glCode] };
-    } else if (config.apAccountId) {
+    } else if (config.defaults?.expenseAccountId || config.apAccountId) {
       // Fall back to a configured default/suspense account so the bill still
       // balances, but flag it for review.
-      lineAccount = { id: config.apAccountId };
+      const fallbackAccountId = config.defaults?.expenseAccountId ?? config.apAccountId ?? "";
+      lineAccount = { id: fallbackAccountId };
       warnings.push(
-        `Line ${lineNo}: GL account "${glCode}" not in crosswalk; fell back to default account ${config.apAccountId}.`
+        `Line ${lineNo}: GL account "${glCode}" not in crosswalk; fell back to default account ${fallbackAccountId}.`
       );
     } else {
       lineAccount = { id: UNRESOLVED_PLACEHOLDER };
@@ -401,8 +473,8 @@ export function transformToNetSuite(
   const dueDate: string = invoice?.dueDate ?? "";
   if (dueDate) bill.dueDate = dueDate;
 
-  const description: string = invoice?.description ?? "";
-  if (description) bill.memo = description;
+  const memo = buildMemo(invoice);
+  if (memo) bill.memo = memo;
 
   if (entity) bill.entity = entity;
   if (subsidiary) bill.subsidiary = subsidiary;
@@ -732,6 +804,7 @@ export const exampleNetSuiteConfig: NetSuiteConfig = {
   subsidiaryId: undefined,
   apAccountId: undefined,
   defaults: {
+    expenseAccountId: undefined,
     departmentId: undefined,
     classId: undefined,
     locationId: undefined,
@@ -745,5 +818,8 @@ export const exampleNetSuiteConfig: NetSuiteConfig = {
     departmentsByCode: {},
     classesByCode: {},
     termsByName: {},
+    subsidiariesByTaxId: {},
+    subsidiariesByName: {},
+    purchaseOrdersByNumber: {},
   },
 };

@@ -885,7 +885,7 @@ function renderNetSuiteSettings() {
   const settings = normalizeNetSuiteSettings(state.netSuiteSettings);
   $("netsuite-active-env").value = settings.activeEnvironment;
   $("netsuite-config-envs").innerHTML = NS_ENVS.map(([env, label]) =>
-    renderNetSuiteEnvironment(env, settings.environments[env] || defaultNetSuiteEnv(label))
+    renderNetSuiteEnvironment(env, settings.environments[env] || defaultNetSuiteEnv(label), settings.activeEnvironment)
   ).join("");
 
   NS_ENVS.forEach(([env]) => {
@@ -893,7 +893,7 @@ function renderNetSuiteSettings() {
   });
 }
 
-function renderNetSuiteEnvironment(env, values) {
+function renderNetSuiteEnvironment(env, values, activeEnvironment) {
   const fields = NS_FIELDS.map(([key, label, type]) => {
     const value = values[key] ?? "";
     return `
@@ -907,7 +907,10 @@ function renderNetSuiteEnvironment(env, values) {
   return `
     <div class="config-env">
       <div class="config-env-head">
-        <h3>${escapeHtml(values.label || env)}</h3>
+        <div class="config-env-title">
+          <h3>${escapeHtml(values.label || env)}</h3>
+          ${env === activeEnvironment ? '<span class="env-badge">Push target</span>' : ""}
+        </div>
         <button id="ns-${escapeHtml(env)}-defaults" class="button secondary small" type="button">Use account defaults</button>
       </div>
       <div class="form-grid">

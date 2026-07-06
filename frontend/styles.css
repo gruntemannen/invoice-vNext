@@ -10,11 +10,11 @@
 
 :root {
   /* surfaces */
-  --bg: #f5f7fb;
+  --bg: #f4f6f8;
   --surface: #ffffff;
-  --surface-2: #f9fafc;
-  --border: #e4e8ef;
-  --border-strong: #d3d9e3;
+  --surface-2: #f8fafc;
+  --border: #dfe4ea;
+  --border-strong: #cbd3dd;
 
   /* text */
   --text: #1b2433;
@@ -22,9 +22,9 @@
   --faint: #99a2b3;
 
   /* brand + accents */
-  --primary: #3358d4;
-  --primary-2: #2945b8;
-  --primary-soft: #eef2fe;
+  --primary: #365f88;
+  --primary-2: #24496d;
+  --primary-soft: #edf2f6;
 
   /* status */
   --green: #1f9d5b;
@@ -37,15 +37,15 @@
   --violet-soft: #f0eafc;
 
   /* chart series */
-  --c-ing: #3358d4;
-  --c-ok: #1f9d5b;
-  --c-fail: #d6455d;
+  --c-ing: #657487;
+  --c-ok: #9aa4b2;
+  --c-fail: #4f5b6a;
 
-  --shadow-sm: 0 1px 2px rgba(20, 30, 50, 0.06), 0 1px 3px rgba(20, 30, 50, 0.05);
-  --shadow-md: 0 4px 16px rgba(20, 30, 50, 0.09);
+  --shadow-sm: 0 1px 2px rgba(20, 30, 50, 0.05);
+  --shadow-md: 0 3px 10px rgba(20, 30, 50, 0.08);
   --shadow-lg: 0 18px 48px rgba(20, 30, 50, 0.22);
-  --radius: 14px;
-  --radius-sm: 10px;
+  --radius: 8px;
+  --radius-sm: 6px;
 
   --sidebar-w: 232px;
   --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
@@ -76,7 +76,7 @@ h1,
 h2,
 h3 {
   margin: 0;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
 }
 
 .muted {
@@ -138,7 +138,7 @@ h3 {
 
 /* ----------------------------- Sidebar -------------------------------- */
 .sidebar {
-  background: #131a2b;
+  background: #151c29;
   color: #cdd5e4;
   display: flex;
   flex-direction: column;
@@ -156,14 +156,14 @@ h3 {
 .brand-mark {
   width: 38px;
   height: 38px;
-  border-radius: 11px;
+  border-radius: 8px;
   display: grid;
   place-items: center;
   font-weight: 800;
   font-size: 14px;
   color: #fff;
-  background: linear-gradient(135deg, #4f7cff, #2945b8);
-  box-shadow: 0 6px 14px rgba(51, 88, 212, 0.4);
+  background: var(--primary);
+  box-shadow: none;
 }
 .brand-text {
   display: flex;
@@ -206,9 +206,9 @@ h3 {
   color: #fff;
 }
 .nav-item.active {
-  background: var(--primary);
+  background: #232d3d;
   color: #fff;
-  box-shadow: 0 6px 14px rgba(51, 88, 212, 0.35);
+  box-shadow: inset 3px 0 0 #6f7d90;
 }
 .nav-ico {
   font-size: 15px;
@@ -238,8 +238,8 @@ h3 {
   align-items: center;
   gap: 14px;
   padding: 12px 22px;
-  background: rgba(255, 255, 255, 0.85);
-  backdrop-filter: blur(8px);
+  background: var(--surface);
+  backdrop-filter: none;
   border-bottom: 1px solid var(--border);
 }
 .topbar h1 {
@@ -256,10 +256,10 @@ h3 {
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 4px 6px 4px 4px;
-  background: var(--surface-2);
+  padding: 4px 8px 4px 4px;
+  background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 999px;
+  border-radius: var(--radius);
 }
 .avatar {
   width: 28px;
@@ -270,7 +270,7 @@ h3 {
   font-weight: 700;
   font-size: 13px;
   color: #fff;
-  background: linear-gradient(135deg, var(--violet), var(--primary));
+  background: #4d5968;
 }
 .user-email {
   font-size: 13px;
@@ -381,7 +381,7 @@ h3 {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
   padding: 18px 20px;
 }
 .panel.no-pad {
@@ -412,7 +412,7 @@ h3 {
   color: var(--muted);
   margin-bottom: 8px;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0;
 }
 
 /* ------------------------------- KPIs --------------------------------- */
@@ -425,47 +425,25 @@ h3 {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
   padding: 16px 18px;
   position: relative;
   overflow: hidden;
 }
 .kpi::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 4px;
-  background: var(--primary);
-}
-.kpi.green::before {
-  background: var(--green);
-}
-.kpi.red::before {
-  background: var(--red);
-}
-.kpi.amber::before {
-  background: var(--amber);
-}
-.kpi.violet::before {
-  background: var(--violet);
-}
-.kpi.blue::before {
-  background: var(--primary);
+  content: none;
 }
 .kpi-label {
   font-size: 12.5px;
   color: var(--muted);
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0;
 }
 .kpi-value {
-  font-size: 30px;
-  font-weight: 800;
+  font-size: 28px;
+  font-weight: 700;
   margin-top: 6px;
-  letter-spacing: -0.02em;
 }
 .kpi-skel {
   display: inline-block;
@@ -509,7 +487,7 @@ h3 {
 }
 .legend {
   display: flex;
-  gap: 16px;
+  gap: 10px;
   font-size: 12.5px;
   color: var(--muted);
   flex-wrap: wrap;
@@ -517,22 +495,15 @@ h3 {
 .lg {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 0;
+}
+.lg + .lg::before {
+  content: "/";
+  color: var(--faint);
+  margin-right: 10px;
 }
 .sw {
-  width: 11px;
-  height: 11px;
-  border-radius: 3px;
-  display: inline-block;
-}
-.sw-ing {
-  background: var(--c-ing);
-}
-.sw-ok {
-  background: var(--c-ok);
-}
-.sw-fail {
-  background: var(--c-fail);
+  display: none;
 }
 
 /* --------------------------- Recent failures -------------------------- */
@@ -655,7 +626,7 @@ h3 {
   font-size: 11.5px;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
   color: var(--muted);
   background: var(--surface-2);
   border-bottom: 1px solid var(--border);
@@ -699,7 +670,7 @@ h3 {
   border-radius: 999px;
   font-size: 11.5px;
   font-weight: 700;
-  letter-spacing: 0.02em;
+  letter-spacing: 0;
 }
 .badge.ok {
   background: var(--green-soft);
@@ -875,7 +846,7 @@ h3 {
   font-size: 11.5px;
   color: var(--muted);
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0;
   font-weight: 600;
 }
 .meta-value {

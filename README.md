@@ -1,491 +1,494 @@
 # Invoice Extractor
 
-**Serverless invoice processing system** that extracts structured data from PDF invoices using AI, with built-in NetSuite integration.
+Serverless invoice processing for a centralized AP inbox. The system ingests invoices from
+email or browser upload, extracts structured data with Claude on Amazon Bedrock, validates and
+enriches vendor data, and prepares NetSuite AP transactions with a durable replayable outbox.
 
-![Architecture](https://img.shields.io/badge/AWS-Serverless-orange) ![Bedrock](https://img.shields.io/badge/AI-Claude%20Sonnet%204.6-blue) ![NetSuite](https://img.shields.io/badge/ERP-NetSuite-2e7d32)
+![AWS](https://img.shields.io/badge/AWS-Serverless-orange)
+![Bedrock](https://img.shields.io/badge/AI-Claude%20Sonnet%204.6-blue)
+![NetSuite](https://img.shields.io/badge/ERP-NetSuite-2e7d32)
 
-## Overview
+## Current Solution
 
-Invoice Extractor is a production-ready, serverless application that:
-- Ingests PDF invoices from **email** (Amazon SES) and **web upload**
-- Extracts structured JSON using Claude Sonnet 4.6 on Amazon Bedrock (reads PDFs directly)
-- Stores results in DynamoDB with confidence scoring
-- Pushes invoices to **NetSuite** as Accounts Payable vendor bills or vendor prepayments (export-only scaffold today; OAuth 2.0 push-ready)
-- Provides a **Cognito-authenticated admin console** for ingestion stats, success rates, and audit
+Invoice Extractor currently provides:
 
-## Key Features
+- PDF invoice intake from Amazon SES email or authenticated browser upload.
+- Direct PDF extraction with Claude Sonnet 4.6 on Amazon Bedrock.
+- DynamoDB persistence for source metadata, extracted JSON, confidence, review flags,
+  duplicate fingerprints, NetSuite runtime settings, and NetSuite transaction logs.
+- EU/Northern Ireland VAT validation through the European Commission VIES API.
+- Swiss `CHE... MWST/TVA/IVA` VAT validation through the Swiss UID PublicServices endpoint.
+- AP review controls for missing data, low confidence, duplicates, PO matching, non-standard
+  documents, proformas, and vendor bank details.
+- NetSuite AP payload generation for `vendorBill` and `vendorPrepayment`.
+- Runtime NetSuite endpoint configuration for Test and Prod in the admin console.
+- Durable NetSuite transaction logging before any live push attempt.
+- Replay endpoints for NetSuite outages or retryable failures.
+- Optional live NetSuite worker with OAuth 2.0 M2M, idempotent upsert, and vendor-master
+  compare/fill for configured missing fields.
 
-- **AI-Powered Extraction**: Uses Claude Sonnet 4.6 for accurate invoice data extraction directly from PDFs (no OCR needed)
-- **Email + Web Ingestion**: Accepts invoices via Amazon SES email receiving or direct web upload
-- **Multi-Language Support**: Works with invoices in any language (Japanese, Chinese, Korean, European languages, etc.)
-- **NetSuite Integration**: Transforms extracted data into NetSuite REST vendor bills or vendor prepayments — export-only today, with an OAuth 2.0 (M2M) push scaffold included
-- **Admin Console**: Cognito-authenticated dashboard with ingestion stats, success rates, and a DynamoDB audit view
-- **Secure by Default**: JWT-protected API, least-privilege IAM, DynamoDB PITR, S3 versioning, a Bedrock concurrency cap, and CloudWatch alarms
-- **Confidence Scoring**: Automatic quality assessment of extracted data
-- **AP Control Flow**: Captures buyer/legal entity, PO, service period, payment terms, vendor bank details, duplicate fingerprints, and review flags before NetSuite booking
-- **VAT Enrichment**: Validates supported EU/Northern Ireland vendor VAT IDs with VIES and records returned registry details/match status
-- **Vendor Master Sync**: Before live NetSuite push, compares mapped invoice/VIES vendor data to the NetSuite vendor record and fills configured blank fields
-- **Durable NetSuite Outbox**: Logs every NetSuite push request and attempt in DynamoDB before calling NetSuite, with replay endpoints for outages
-- **Multi-Account Architecture**: Designed for AWS Organizations with separate workload accounts
-- **Cost Optimized**: Pay-per-use serverless architecture
+Live NetSuite push is deliberately controlled by `netSuiteLivePushEnabled`. With the default
+`false`, the app still logs NetSuite transactions and keeps them replayable, but the worker does
+not call NetSuite.
 
 ## Architecture
 
-```
-Ingestion
-  Email  ─▶ Amazon SES ─▶ S3 (raw/)   ─▶ Ingest Lambda ┐
-  Upload ─▶ S3 (uploads/)             ─▶ Upload Lambda ┘─▶ SQS
-                                                          │
-Processing                                                ▼
-                                  Extract Lambda (Claude Sonnet 4.6, reads PDF)
-                                                          │
-                                                          ▼
-                                                      DynamoDB
-                                                          ▲
-Access  (Cognito JWT on every route)                      │
-  Admin UI (CloudFront PWA) ─▶ API Lambda ────────────────┘
-                                  └─▶ NetSuite AP transaction (export-only)
-```
+```text
+Email path:
+  Inbound email -> Amazon SES -> S3 raw/ -> Ingest Lambda -> SQS
 
-### How It Works
+Upload path:
+  Admin UI -> API Lambda -> presigned S3 PUT -> S3 uploads/ -> Upload Ingest Lambda -> SQS
 
-1. An invoice arrives by **email** (Amazon SES → S3 `raw/`) or **web upload** (→ S3 `uploads/`)
-2. An ingest Lambda records it in DynamoDB and queues a processing job (SQS)
-3. The Extract Lambda sends the PDF directly to Claude Sonnet 4.6
-4. Claude visually analyzes the document and extracts structured data
-5. Results are validated, confidence-scored, checked for likely duplicates, and stored in DynamoDB with review flags
-6. Admins sign in to the console (Cognito) to review stats/audit, inspect control flags, download the PDF, and preview the NetSuite AP transaction payload
+Processing:
+  SQS -> Extract Lambda -> Claude Sonnet 4.6 on Bedrock
+      -> normalize + reconcile extraction
+      -> EU VIES or Swiss UID VAT validation
+      -> duplicate lookup + AP control flags
+      -> DynamoDB invoice record
 
-### AP review flow
-
-The flow is designed for a centralized AP inbox rather than entity-specific mailboxes:
-
-1. SES stores every inbound email in `raw/`; the ingest Lambda extracts invoice attachments and preserves sender/subject/source metadata.
-2. Claude extracts vendor, buyer/legal entity, invoice header, PO, service period, payment terms, vendor bank details, and line items.
-3. The extractor computes a duplicate key from vendor + invoice number + currency + gross total and queries a sparse DynamoDB `duplicate` index for prior records.
-4. EU/Northern Ireland vendor VAT numbers are validated against the European Commission VIES REST API when a supported VAT ID is extracted. Results are stored on `vendor.vatValidation`; invalid VATs or VIES name/address mismatches hold the invoice for review, while lookup outages are metadata-only.
-5. Each invoice gets a `reviewStatus` of `READY_FOR_NETSUITE` or `NEEDS_REVIEW`, plus AP-readable control flags such as low confidence, potential duplicate, PO match required, non-standard document, missing buyer entity, or bank details captured for vendor-master verification.
-6. The NetSuite preview endpoint builds the vendor-bill or vendor-prepayment payload, validates required NetSuite refs, and folds mapping/validation warnings into the same flow decision.
-7. The NetSuite transaction endpoint writes a durable DynamoDB outbox record before any push is queued. Worker attempts compare/fill configured missing vendor-master fields, append status events to that record, and retryable failures can be replayed after an outage.
-
-Live auto-booking should stay disabled until vendor, subsidiary, currency, expense-account, PO, and bank-detail controls are populated and validated in a NetSuite sandbox.
-
-### Components
-
-- **Admin UI**: Static PWA (S3 + CloudFront) — Cognito hosted-UI login, dashboard (stats / success rate / trend), and a DynamoDB audit view
-- **Cognito**: User pool + JWT authorizer protecting every API route
-- **API Lambda**: Authenticated endpoints — list, **stats**, detail, download, delete, upload, and NetSuite export
-- **Ingest Lambda**: Parses inbound SES email (S3 `raw/`) and queues attachments
-- **Upload Ingest Lambda**: Handles web uploads (S3 `uploads/`)
-- **Extract Lambda**: Sends PDFs to Claude Sonnet 4.6, validates and stores results
-- **DynamoDB**: Stores invoice metadata and extracted JSON (PITR enabled)
-- **SQS**: Queues extraction jobs with a DLQ + CloudWatch alarms
-
-## Quick Start
-
-### Prerequisites
-
-- AWS Account with Organizations (or single account)
-- AWS CLI configured
-- Node.js 20+ and npm
-- CDK CLI: `npm install -g aws-cdk`
-
-### Deployment
-
-1. **Clone and install dependencies**:
-```bash
-git clone <repository-url>
-cd invoice-extractor
-cd infra && npm install
-cd ../backend && npm install
+Review and integration:
+  CloudFront PWA -> Cognito Hosted UI -> JWT-protected API Lambda
+      -> invoice audit/detail/download/delete
+      -> NetSuite preview
+      -> durable NetSuite transaction log
+      -> optional NetSuite worker push
+      -> replay after outage
 ```
 
-2. **Configure** (edit `infra/lib/config.ts`):
-```typescript
-export const config = {
-  memberAccountEmail: "your-email@company.com",
-  memberAccountName: "invoice-extractor",
-  managementAccountId: "YOUR_MGMT_ACCOUNT_ID",
+## End-To-End Flow
 
-  // Deploy region. For the email path this MUST support SES inbound receiving
-  // (e.g. us-east-1, us-west-2, eu-west-1). eu-central-1 does NOT.
-  region: "eu-west-1",
-  projectPrefix: "invoice-extractor",
+1. An invoice arrives by email or browser upload.
+2. The ingest path stores the PDF in S3, writes a pending invoice record to DynamoDB, and queues
+   extraction in SQS.
+3. The Extract Lambda sends the PDF directly to Claude Sonnet 4.6. There is no separate OCR step.
+4. The extraction is normalized into vendor, buyer, invoice header, service period, remittance,
+   bank details, and line items.
+5. Proforma invoices are marked as `VendorPrepayment`; standard invoices remain `VendorBill`.
+6. The printed PO value is preserved as `invoice.purchaseOrderNumber`. A separate
+   `invoice.purchaseOrderLookupKey` may be derived for NetSuite matching, but the invoice PO is
+   not rewritten.
+7. Vendor VAT enrichment runs:
+   - EU and Northern Ireland VAT IDs use VIES.
+   - Swiss `CHE-###.###.### MWST/TVA/IVA` IDs use Swiss UID validation.
+   - Unsupported tax IDs are skipped with metadata rather than failing extraction.
+8. Duplicate detection hashes vendor, invoice number, currency, and gross total, then checks a
+   sparse DynamoDB duplicate index.
+9. The AP flow assigns `READY_FOR_NETSUITE` or `NEEDS_REVIEW` and stores reader-facing control
+   flags.
+10. The admin console lets AP review the record, download the PDF, preview NetSuite, log a
+    NetSuite transaction, or delete the invoice and PDF.
+11. NetSuite transaction logging writes a `NETSUITE_TRANSACTION` item before anything is queued.
+12. If live push is enabled and the item is ready/configured, the NetSuite worker fetches the
+    transaction, optionally fills configured missing vendor-master fields, performs the idempotent
+    NetSuite upsert, and records success or failure events.
+13. Retryable failures can be replayed individually or in bulk after NetSuite recovers.
 
-  // Bedrock extraction model — a cross-region inference profile whose geo prefix
-  // (us./eu./jp./au./global.) matches `region`.
-  bedrockModelId: "eu.anthropic.claude-sonnet-4-6",
+## Key Components
 
-  maxUploadBytes: 10 * 1024 * 1024,   // max invoice attachment size (bytes)
-  dataRetentionDays: 90,              // DynamoDB TTL / attachment retention
-  extractReservedConcurrency: 5,      // cap on concurrent Bedrock calls (cost control)
-  netSuiteLivePushEnabled: false,      // false = log transactions only; true = worker calls NetSuite
-};
-```
+- `frontend/`: static PWA admin console deployed to S3 and CloudFront.
+- `backend/src/ingest.ts`: parses inbound SES email and queues attachments.
+- `backend/src/upload-ingest.ts`: handles S3 upload events for browser uploads.
+- `backend/src/extract.ts`: extraction orchestration, confidence, VAT enrichment, duplicate
+  lookup, and DynamoDB update.
+- `backend/src/shared/vies.ts`: EU VIES and Swiss UID VAT validation.
+- `backend/src/shared/flow.ts`: AP review status, auto-book eligibility, and control flags.
+- `backend/src/shared/netsuite.ts`: NetSuite transform, validation, OAuth, SuiteQL, live upsert,
+  business-unit routing, and vendor-master sync.
+- `backend/src/shared/transactions.ts`: durable NetSuite outbox, status model, and replay helpers.
+- `backend/src/api.ts`: authenticated API endpoints for audit, upload, config, NetSuite preview,
+  transaction logging, and replay.
+- `infra/`: AWS CDK app for buckets, queues, table, Lambdas, API Gateway, Cognito, CloudFront,
+  alarms, KMS, and Secrets Manager.
 
-3. **Deploy** (see [Deployment Guide](#deployment-guide) for multi-account setup):
-```bash
-cd infra
-npx cdk deploy InvoiceExtractorStack --context stacks=InvoiceExtractorStack
-```
+## Admin Console
 
-4. **Create an admin user & sign in**:
-   - Create a user in the Cognito user pool (stack output `UserPoolId`) — self-signup is disabled
-   - Open the CloudFront URL (output `FrontendUrl`), sign in via the Cognito hosted UI, and you land on the dashboard
+The admin console is protected by Amazon Cognito. Self-signup is disabled; create users in the
+stack's Cognito user pool.
 
-## Usage
+Views:
 
-### Sign in
-The admin console is protected by Amazon Cognito. Open the CloudFront URL and sign in via the
-hosted UI; the app stores the returned id token and sends it as a bearer token on every API call.
+- **Dashboard**: totals, success rate, completed/failed/pending counts, average confidence,
+  30-day trend, and recent failures.
+- **Audit**: searchable invoice records with detail drawer, extracted JSON, VAT status, control
+  flags, NetSuite preview, durable transaction logging, PDF download, and delete.
+- **Upload**: PDF-only upload through presigned S3 PUT.
+- **Config**: Test and Prod NetSuite endpoint settings.
 
-### Dashboard
-- KPI cards: total ingested, success rate, completed / failed / pending, average confidence
-- 30-day ingestion trend (ingested vs completed vs failed)
-- Recent failures, each linking straight to the record
+## VAT Validation
 
-### Audit (browse DynamoDB)
-- Filter by status and search by vendor / buyer / subject / sender / invoice number / PO / review status
-- Open any record for full metadata, AP control flags, extracted JSON, NetSuite preview, durable transaction logging, PDF download, and delete
+The extractor stores VAT validation on `extractedJson.vendor.vatValidation` and a compact summary
+on `extractedJson.meta.vendorVatValidation`.
 
-### Ingest invoices
-- **Email**: send to the SES-verified address (lands in S3 `raw/` and is processed automatically)
-- **Upload**: use the Upload action in the console (presigned PUT to S3 `uploads/`)
+Supported providers:
 
-### Export to NetSuite
-For any invoice, build the NetSuite payload and request envelope (authenticated):
-```bash
-curl -H "Authorization: Bearer <id_token>" \
-  https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite
-```
-Returns `{ netsuiteFormat, netSuiteRequest, warnings, configurationHints, validation, flow, originalExtraction }`. See the
-[NetSuite Integration Guide](NETSUITE-INTEGRATION.md) to enable live push.
+| Provider | Input examples | Behavior |
+|---|---|---|
+| `EU_VIES` | `DE123456789`, `FR...`, `NL...`, `XI...` | Calls European Commission VIES REST API and records valid/invalid status plus returned registry/match fields. |
+| `CH_UID` | `CHE-116.289.195 MWST`, `CHE116289195 TVA` | Validates Swiss UID checksum, then calls Swiss UID PublicServices `ValidateVatNumber`. |
 
-### Log and replay NetSuite transactions
-
-Create a durable transaction record from an invoice. This writes to DynamoDB before any queue/send:
-```bash
-curl -X POST -H "Authorization: Bearer <id_token>" \
-  https://your-api-url/invoices/{messageId}/{attachmentId}/netsuite/transactions
-```
-
-List or replay failed transactions after a NetSuite outage:
-```bash
-curl -H "Authorization: Bearer <id_token>" \
-  "https://your-api-url/netsuite/transactions?status=FAILED_RETRYABLE"
-
-curl -X POST -H "Authorization: Bearer <id_token>" \
-  https://your-api-url/netsuite/transactions/{transactionId}/replay
-```
-
-Bulk replay is available with `POST /netsuite/transactions/replay?status=FAILED_RETRYABLE&limit=25`.
+Lookup outages and timeouts are stored as `ERROR` metadata and do not fail extraction. Invalid
+VATs create review warnings. Swiss and EU results share the same status model:
+`VALID`, `INVALID`, `SKIPPED`, or `ERROR`.
 
 ## NetSuite Integration
 
-Extracted invoices map to NetSuite AP transactions. Standard invoices become **vendor bills**;
-proforma invoices become **vendor prepayments** because they are prepayment requests rather than
-final AP bills. The transform, OAuth 2.0 (M2M) client, SuiteQL resolver, durable outbox, replay,
-and idempotent upsert are implemented; live push remains a credentials + sandbox-validation step.
+Standard invoices map to NetSuite `vendorBill`. Proforma invoices map to `vendorPrepayment`
+because they are prepayment requests, not final AP bills.
 
-### Features
-- Transform extracted JSON to NetSuite REST `vendorBill` or `vendorPrepayment`
-- Configurable crosswalks for vendor, subsidiary, PO, GL account, currency, department, class, terms, and recipient-to-business-unit routing
-- OAuth 2.0 M2M (JWT client-assertion) client, SuiteQL resolver, idempotent `eid:` upsert, and replayable transaction ledger
-- Validation + gross-vs-net reconciliation before import
+Implemented:
 
-### Configuration
+- NetSuite AP transform and validation.
+- NetSuite Test/Prod runtime endpoint settings in DynamoDB.
+- OAuth 2.0 M2M JWT client assertion.
+- SuiteQL helper.
+- Idempotent REST upsert by external ID.
+- Vendor-master compare/fill before AP push when `vendorSync` is configured.
+- Durable transaction outbox and replay endpoints.
 
-Edit `backend/netsuite-config.json` (non-secret crosswalks + defaults):
+Default live behavior:
 
-```json
-{
-  "subsidiaryId": "",
-  "apAccountId": "",
-  "prepaymentPaymentAccountId": "",
-  "prepaymentAccountId": "",
-  "businessUnitSegmentFieldId": "",
-  "defaultBusinessUnitKey": "",
-  "vendorSync": {
-    "enabled": true,
-    "recordId": "vendor",
-    "missingOnly": true,
-    "fields": { "name": "companyName", "email": "email" }
-  },
-  "defaults": { "expenseAccountId": "", "departmentId": "", "classId": "", "locationId": "", "taxCodeId": "" },
-  "crosswalks": {
-    "vendorsByTaxId": { "VAT123456": "4521" },
-    "vendorsByName": {},
-    "accountsByCode": { "5000": "212" },
-    "currenciesByCode": { "USD": "1", "EUR": "4" },
-    "departmentsByCode": {},
-    "classesByCode": {},
-    "termsByName": { "Net 30": "5" },
-    "subsidiariesByTaxId": {},
-    "subsidiariesByName": {},
-    "purchaseOrdersByNumber": {},
-    "businessUnitsByTaxId": {},
-    "businessUnitsByName": {},
-    "businessUnitsByEntityCode": {},
-    "businessUnitsByEmailDomain": {},
-    "businessUnitsByAddressContains": {}
-  },
-  "businessUnits": {}
-}
-```
+- `netSuiteLivePushEnabled: false` logs transactions but does not call NetSuite.
+- `netSuiteLivePushEnabled: true` queues ready/configured transactions to the NetSuite worker.
 
-Recipient company names map through `crosswalks.businessUnitsByName` to entries in
-`businessUnits`. Set `defaultBusinessUnitKey` when unmapped recipients should still route to
-a controlled NetSuite fallback business unit.
+See [NETSUITE-INTEGRATION.md](NETSUITE-INTEGRATION.md) for NetSuite field mapping and the
+sandbox checklist.
 
-NetSuite environment endpoints are configured in the admin console under **Config**. Test and
-Prod each have their own account id, REST base URL, OAuth token endpoint, optional Secrets
-Manager ARN/name override, OAuth scope, REST paths, record ids, timeout, SuiteTax flag, and
-`tranId` option. These runtime settings are stored in DynamoDB so they can be changed without a
-deployment. If an environment-specific secret is blank, the worker falls back to
-`NETSUITE_SECRET_ARN`.
+## NetSuite Runtime Configuration
 
-NetSuite OAuth 2.0 credentials live in AWS Secrets Manager, not in `netsuite-config.json`.
+The admin console **Config** page stores Test and Prod endpoint settings in DynamoDB:
 
-See [NetSuite Integration Guide](NETSUITE-INTEGRATION.md) for setup, field mapping, and the sandbox-validation checklist.
+- active push target: Test or Prod
+- account ID
+- REST API base URL
+- OAuth token endpoint
+- optional per-environment Secrets Manager ARN/name
+- OAuth scope
+- Record API path
+- SuiteQL path
+- vendor bill record ID
+- vendor prepayment record ID
+- request timeout
+- SuiteTax enabled
+- `tranId` allowed
 
-## Deployment Guide
+Both Test and Prod are shown so AP/admin users can maintain both sets of settings. The selector
+chooses the active target stamped on NetSuite previews and transaction logs; live worker calls use
+the environment stored on the transaction.
 
-### Single Account Deployment
+Non-secret NetSuite defaults and crosswalks live in `backend/netsuite-config.json`. Secrets live
+in AWS Secrets Manager, either from the environment-specific Config value or the stack-level
+`NETSUITE_SECRET_ARN` fallback.
+
+## Vendor Master Sync
+
+When a live NetSuite transaction has a resolved vendor internal ID, the worker can fetch the
+NetSuite vendor record and fill configured blank fields. It does not overwrite populated fields
+unless `vendorSync.missingOnly` is set to `false`.
+
+Supported source fields:
+
+- `name`
+- `email`
+- `taxId`
+- `address`
+- `iban`
+- `bic`
+- `bankName`
+- `vatValidationStatus`
+- `vatRequestIdentifier`
+
+The default mapping is intentionally conservative: `name -> companyName` and `email -> email`.
+VAT, bank, and custom entity fields must be mapped to account-specific NetSuite field IDs before
+live updates.
+
+## Deployment
+
+### Prerequisites
+
+- AWS account and AWS CLI profile.
+- Node.js 20+ and npm.
+- AWS CDK CLI.
+- Amazon Bedrock model access for Claude Sonnet 4.6.
+- A region compatible with your ingestion path. For email receiving, use an SES inbound region
+  such as `eu-west-1`.
+
+### Install
 
 ```bash
 cd infra
 npm install
-npx cdk bootstrap
-npx cdk deploy InvoiceExtractorStack
+
+cd ../backend
+npm install
 ```
 
-### Multi-Account Deployment (Organizations)
+### Configure
 
-For an AWS Organizations setup, set `managementAccountId` / `memberAccount*` in
-`infra/lib/config.ts`, then deploy the helper stacks before the workload stack. The
-`stacks` context selects which stack(s) to act on (see `infra/bin/app.ts`):
+Edit `infra/lib/config.ts`.
+
+```typescript
+export const config = {
+  region: "eu-west-1",
+  projectPrefix: "invoice-extractor",
+  bedrockModelId: "eu.anthropic.claude-sonnet-4-6",
+  maxUploadBytes: 10 * 1024 * 1024,
+  dataRetentionDays: 90,
+  extractReservedConcurrency: 5,
+  viesLookupEnabled: true,
+  viesRequestTimeoutMs: 6000,
+  netSuiteLivePushEnabled: false,
+
+  memberAccountName: "invoice-extractor",
+  memberAccountEmail: "your-email@company.com",
+  managementAccountId: "YOUR_MGMT_ACCOUNT_ID"
+};
+```
+
+### Deploy Single Account
 
 ```bash
 cd infra
-# (optional) create the member/workload account under the org
-npx cdk deploy OrgAccountStack --context stacks=OrgAccountStack
-# bootstrap the member account for CDK
-npx cdk deploy MemberBootstrapStack --context stacks=MemberBootstrapStack
-# deploy the workload into the member account
+npx cdk bootstrap
 npx cdk deploy InvoiceExtractorStack --context stacks=InvoiceExtractorStack
 ```
 
-## Configuration
+### Deploy With AWS Organizations Helpers
 
-### `infra/lib/config.ts`
+```bash
+cd infra
+npx cdk deploy OrgAccountStack --context stacks=OrgAccountStack
+npx cdk deploy MemberBootstrapStack --context stacks=MemberBootstrapStack
+npx cdk deploy InvoiceExtractorStack --context stacks=InvoiceExtractorStack
+```
 
-All deploy-time choices live in one file and are threaded into the stack and the Lambda
-environment variables:
+### Create Admin Users
 
-| Field | Purpose |
-|---|---|
-| `region` | AWS region. Must support SES inbound receiving if you use the email path (eu-central-1 does not). |
-| `projectPrefix` | Prefix for all resource names (lowercase, DNS-safe). |
-| `bedrockModelId` | Bedrock model id (cross-region inference profile); its geo prefix must match `region`. |
-| `maxUploadBytes` | Max invoice attachment size (default 10 MiB). |
-| `dataRetentionDays` | DynamoDB TTL + attachment retention in days (default 90). |
-| `extractReservedConcurrency` | Cap on concurrent Bedrock invocations (cost control; tune to your account quota). |
-| `netSuiteLivePushEnabled` | Enables the NetSuite worker to call NetSuite. Keep `false` until sandbox validation is complete; transaction logging still works. |
-| `managementAccountId` / `memberAccount*` | AWS Organizations multi-account settings. |
+Use the stack output `UserPoolId`, then create or manage users in Cognito. Example:
 
-### Cost Controls
+```bash
+aws cognito-idp admin-create-user \
+  --user-pool-id <UserPoolId> \
+  --username user@example.com \
+  --user-attributes Name=email,Value=user@example.com Name=email_verified,Value=true
+```
 
-- **CloudWatch Logs**: 2-week retention
-- **DynamoDB TTL**: `dataRetentionDays` (default 90)
-- **S3 Lifecycle**: Transition to IA after 30 days
-- **Reserved Concurrency**: `extractReservedConcurrency` caps Bedrock spend
-
-### Bedrock Model Access
-
-Ensure Claude Sonnet 4.6 access is enabled:
-1. Go to AWS Bedrock Console (in the deployment region, e.g. eu-west-1)
-2. Navigate to "Model access"
-3. Enable "Claude Sonnet 4.6" (Anthropic)
-4. Confirm the cross-region inference profile is usable (the default model id is the EU geo profile `eu.anthropic.claude-sonnet-4-6`)
+Open the stack output `FrontendUrl` and sign in through Cognito Hosted UI.
 
 ## API Reference
 
-### Endpoints
+Every API route requires `Authorization: Bearer <id_token>`.
 
-All endpoints require a Cognito JWT: `Authorization: Bearer <id_token>`.
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/stats` | Dashboard totals, success rate, trend, and recent failures. |
+| `GET` | `/invoices?limit=25&nextToken=...` | List invoice audit rows. |
+| `GET` | `/invoices/{messageId}/{attachmentId}` | Get full invoice detail. |
+| `DELETE` | `/invoices/{messageId}/{attachmentId}` | Delete invoice row and PDF. |
+| `GET` | `/invoices/{messageId}/{attachmentId}/download` | Return a 15-minute presigned PDF URL. |
+| `POST` | `/upload` | Create a presigned PDF upload URL. |
+| `GET` | `/config/netsuite` | Read NetSuite Test/Prod runtime settings. |
+| `POST` | `/config/netsuite` | Save NetSuite Test/Prod runtime settings. |
+| `GET` | `/invoices/{messageId}/{attachmentId}/netsuite` | Build NetSuite preview, validation, and config hints. |
+| `POST` | `/invoices/{messageId}/{attachmentId}/netsuite/transactions` | Log a durable NetSuite transaction and optionally queue live push. |
+| `GET` | `/netsuite/transactions?status=FAILED_RETRYABLE` | List NetSuite transaction log rows. |
+| `POST` | `/netsuite/transactions/{transactionId}/replay` | Replay one replayable transaction. |
+| `POST` | `/netsuite/transactions/replay?status=FAILED_RETRYABLE&limit=25` | Bulk replay replayable transactions. |
 
-**List Invoices**
-```
-GET /invoices?limit=25&nextToken=...
-```
+Upload request body:
 
-**Dashboard Stats**
-```
-GET /stats
-```
-Returns totals, success rate, average confidence, a 30-day trend, and recent failures.
-
-**Get Invoice Detail**
-```
-GET /invoices/{messageId}/{attachmentId}
-```
-
-**Get NetSuite Format**
-```
-GET /invoices/{messageId}/{attachmentId}/netsuite
-```
-
-**Log NetSuite Transaction**
-```
-POST /invoices/{messageId}/{attachmentId}/netsuite/transactions
+```json
+{
+  "filename": "invoice.pdf",
+  "fileSize": 123456
+}
 ```
 
-**List NetSuite Transactions**
-```
-GET /netsuite/transactions?status=FAILED_RETRYABLE
+NetSuite preview response:
+
+```json
+{
+  "netsuiteFormat": {},
+  "netSuiteRequest": {},
+  "netSuiteEnvironment": {},
+  "warnings": [],
+  "configurationHints": [],
+  "validation": { "valid": false, "errors": [] },
+  "flow": {},
+  "originalExtraction": {}
+}
 ```
 
-**Replay NetSuite Transaction**
-```
-POST /netsuite/transactions/{transactionId}/replay
-POST /netsuite/transactions/replay?status=FAILED_RETRYABLE&limit=25
-```
+## Extracted Data Shape
 
-**Download PDF**
-```
-GET /invoices/{messageId}/{attachmentId}/download
-```
-
-**Delete Invoice**
-```
-DELETE /invoices/{messageId}/{attachmentId}
-```
-
-**Request Upload URL**
-```
-POST /upload
-Body: { "filename": "invoice.pdf", "fileSize": 123456 }
-```
-
-## Extracted Data Schema
+Representative stored extraction:
 
 ```json
 {
   "vendor": {
-    "name": "Supplier Name",
-    "taxId": "VAT123456",
-    "address": "123 Main St, City, 12345, Country"
+    "name": "PKF Consulting AG",
+    "taxId": "CHE-116.289.195 MWST",
+    "address": "Example Street 1, 8000 Zurich",
+    "email": "ap@example.com",
+    "bankDetails": {
+      "ibans": ["CH9300762011623852957"],
+      "bic": "POFICHBEXXX",
+      "bankName": "PostFinance",
+      "accountName": "PKF Consulting AG",
+      "accountNumber": null
+    },
+    "vatValidation": {
+      "provider": "CH_UID",
+      "status": "VALID",
+      "normalizedVat": "CHE-116.289.195 MWST",
+      "valid": true,
+      "countryCode": "CH",
+      "uid": "CHE-116.289.195",
+      "vatSuffix": "MWST"
+    }
+  },
+  "buyer": {
+    "name": "Entirely AG",
+    "taxId": null,
+    "address": null,
+    "email": null,
+    "entityCode": null
   },
   "invoice": {
-    "invoiceNumber": "INV-001",
-    "purchaseOrderNumber": "PO-12345",
+    "invoiceNumber": "1321770 / 3180",
+    "purchaseOrderNumber": "PO -9-25-0027",
+    "purchaseOrderLookupKey": "9-25-0027",
     "invoiceType": "Standard",
     "transactionIntent": "VendorBill",
-    "invoiceDate": "2025-01-15",
-    "dueDate": "2025-02-15",
-    "currency": "USD",
-    "totalAmount": 1234.56,
-    "taxAmount": 123.45
+    "invoiceDate": "2026-07-06",
+    "dueDate": null,
+    "currency": "CHF",
+    "paymentTerms": null,
+    "description": null,
+    "servicePeriod": { "startDate": null, "endDate": null },
+    "remittanceReference": null,
+    "netAmount": 3471.09,
+    "taxAmount": 281.16,
+    "totalAmount": 3752.25
   },
-  "lineItems": [
-    {
-      "description": "Product/Service",
-      "quantity": 10,
-      "unitPrice": 100.00,
-      "amount": 1000.00
-    }
-  ],
+  "lineItems": [],
   "meta": {
-    "confidenceScore": 0.95,
-    "extractionModel": "eu.anthropic.claude-sonnet-4-6",
-    "warnings": []
+    "confidenceScore": 1,
+    "reviewStatus": "READY_FOR_NETSUITE",
+    "autoBookEligible": true,
+    "controlFlags": []
   }
 }
 ```
 
-Notes:
-- `invoice.totalAmount` **includes tax** (gross).
-- `lineItems.unitPrice` and `lineItems.amount` are **pre-tax** (net).
-- `invoice.invoiceType` is "Standard" or "Proforma"; proformas set `invoice.transactionIntent` to "VendorPrepayment".
-- Vendor names are preserved in original language/script (Japanese, Chinese, etc.).
+Important extraction rules:
 
-## Monitoring
+- `invoice.totalAmount` is gross.
+- `lineItems.amount` and `lineItems.unitPrice` are net/pre-tax.
+- Proformas set `invoice.transactionIntent` to `VendorPrepayment`.
+- `purchaseOrderNumber` preserves the invoice text; `purchaseOrderLookupKey` is only for matching.
+- Vendor names remain in the original language/script.
 
-### CloudWatch Metrics
+## Operations
 
-Namespace: `InvoiceExtractor`
+### Monitor
 
-- `ExtractionSuccess` - Successful extractions
-- `ExtractionFailure` - Failed extractions
-- `ExtractionDurationMs` - Processing time
+CloudWatch namespace: `InvoiceExtractor`
 
-### CloudWatch Logs
+- `ExtractionSuccess`
+- `ExtractionFailure`
+- `ExtractionDurationMs`
+- upload/rejection and NetSuite worker metrics where emitted
 
-- `/aws/lambda/InvoiceExtractorStack-ExtractLambda*` - Extraction logs
-- `/aws/lambda/InvoiceExtractorStack-ApiLambda*` - API logs
-- `/aws/lambda/InvoiceExtractorStack-UploadIngestLambda*` - Upload logs
+Useful logs:
+
+- `/aws/lambda/InvoiceExtractorStack-ExtractLambda*`
+- `/aws/lambda/InvoiceExtractorStack-ApiLambda*`
+- `/aws/lambda/InvoiceExtractorStack-UploadIngestLambda*`
+- `/aws/lambda/InvoiceExtractorStack-NetSuiteWorkerLambda*`
+
+### Replay NetSuite Outages
+
+When NetSuite is down, transaction rows remain in DynamoDB. After recovery:
+
+```bash
+curl -H "Authorization: Bearer <id_token>" \
+  "https://<api>/netsuite/transactions?status=FAILED_RETRYABLE"
+
+curl -X POST -H "Authorization: Bearer <id_token>" \
+  "https://<api>/netsuite/transactions/replay?status=FAILED_RETRYABLE&limit=25"
+```
+
+### Delete Test Invoices
+
+Deleting a row from the Audit drawer removes the DynamoDB item and the stored PDF object.
+Deleted records cannot be requeued unless the PDF is uploaded again.
 
 ## Troubleshooting
 
-### Invoice Extraction Failed
+### Extraction Failed
 
-Check CloudWatch logs for the Extract Lambda:
-```bash
-aws logs tail /aws/lambda/InvoiceExtractorStack-ExtractLambda* --follow
-```
+Check the Extract Lambda logs. Common causes:
 
-Common issues:
-- **Model access denied**: Enable Claude model access in Bedrock console
-- **Marketplace subscription**: Ensure AWS Marketplace permissions are configured
-- **Low confidence**: PDF quality issues or complex layout
-- **Timeout**: Increase Lambda timeout or memory
+- Bedrock model access not enabled.
+- Bedrock quota/throttling.
+- File is not a valid PDF for browser upload.
+- External VAT lookup timeout. This is recorded as metadata and should not fail extraction.
+- DynamoDB marshalling or schema issues. The shared writer removes nested `undefined` values.
+
+### VAT Shows `SKIPPED`
+
+The tax ID was present but not supported by a configured validator. Current supported validation
+paths are EU/Northern Ireland VIES and Swiss UID/MWST/TVA/IVA.
+
+### NetSuite Preview Has Warnings
+
+Preview can produce warnings before any live push:
+
+- vendor, currency, account, subsidiary, department, class, PO, or terms not mapped
+- proforma/prepayment account missing
+- gross/net reconciliation mismatch
+- vendor-master fields require review
+- buyer/business-unit route missing or falling back to default
+
+Warnings are expected while crosswalks and runtime settings are being populated.
 
 ### Upload Fails
 
-- Check file size (default 10 MB; configurable via `maxUploadBytes` in `config.ts`)
-- Ensure PDF format (uploads must be PDF; the email path also accepts PNG/JPEG)
-- Check S3 bucket permissions
-
-### NetSuite Transformation Errors
-
-- Verify the crosswalks in `netsuite-config.json` resolve vendor / account / currency to NetSuite internal ids
-- Check `subsidiaryId` / `apAccountId` match the target NetSuite account
-- Populate recipient-to-business-unit crosswalks when buyer details should drive subsidiary, department, class, location, or custom segment routing
-- Set `prepaymentPaymentAccountId` before pushing proforma invoices as NetSuite vendor prepayments
-- Ensure all required fields are extracted (entity, tranDate, and either vendor-bill expense lines or vendor-prepayment payment amount)
+- Browser uploads accept PDFs only.
+- Check `maxUploadBytes`.
+- Verify the browser is authenticated and the API returns a presigned S3 URL.
+- Check S3 CORS and Upload Ingest Lambda logs.
 
 ## Security
 
-- **Authentication**: Amazon Cognito user pool + JWT authorizer on every API route (invite-only, optional TOTP MFA)
-- **No public S3 access**: All buckets use CloudFront OAI; SSL enforced
-- **IAM least privilege**: Separate roles per Lambda; NetSuite credentials in Secrets Manager
-- **CORS**: API restricted to the CloudFront origin
-- **Data protection**: DynamoDB PITR, S3 versioning, and model-output PII kept out of logs
-- **Cost/abuse controls**: reserved concurrency on the Bedrock Lambda + email attachment validation
+- Cognito Hosted UI and JWT authorizer protect every API route.
+- Self-signup is disabled; users are admin-created.
+- S3 buckets block public access and enforce SSL.
+- Attachment bucket and DynamoDB use the customer-managed KMS key.
+- DynamoDB point-in-time recovery is enabled.
+- S3 object versioning is enabled.
+- Lambda roles use least-privilege grants.
+- NetSuite credentials live in Secrets Manager, not in DynamoDB or source config.
+- Bedrock concurrency is capped by `extractReservedConcurrency`.
 
-## Cost Estimate
+## Cost Controls
 
-For 1,000 invoices/month:
+- Serverless pay-per-use architecture.
+- DynamoDB on-demand capacity.
+- DynamoDB TTL and S3 lifecycle controlled by `dataRetentionDays`.
+- CloudWatch log retention is two weeks.
+- Bedrock invocation concurrency is capped.
 
-- **Lambda**: ~$5 (execution time)
-- **Bedrock (Claude Sonnet 4.6)**: ~$15-25 (input/output tokens)
-- **DynamoDB**: ~$1 (on-demand)
-- **S3**: ~$1 (storage + requests)
-- **CloudFront**: ~$1 (data transfer)
-- **KMS + Secrets Manager**: ~$1-2
-
-**Total**: ~$25-35/month
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
+For roughly 1,000 invoices/month, typical infrastructure cost is small compared with Bedrock
+model usage. Actual cost depends on PDF size, token volume, retries, and retention.
 
 ## Documentation
 
 - [Project Structure](PROJECT-STRUCTURE.md)
 - [Bedrock Setup](BEDROCK-SETUP.md)
 - [NetSuite Integration](NETSUITE-INTEGRATION.md)
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.

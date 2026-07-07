@@ -4,23 +4,30 @@ This system pushes emailed/uploaded invoices into Oracle NetSuite as AP transact
 Standard payable invoices map to `vendorBill`; proforma invoices map to
 `vendorPrepayment` because they are prepayment requests, not final AP vendor bills.
 
-The integration is scaffolded: transform, validation, OAuth 2.0 client, SuiteQL resolver,
-durable outbox, replay, and idempotent upsert are implemented. Live push stays disabled
-until credentials and sandbox validation are complete.
+The integration includes transform, validation, OAuth 2.0 client, SuiteQL resolver, durable
+outbox, replay, and idempotent upsert. Live push stays disabled by default until credentials
+and sandbox validation are complete.
 
 ## Vendor VAT Enrichment
 
-During extraction, supported EU/Northern Ireland vendor VAT numbers are checked against the
-European Commission VIES REST API. The enrichment:
+During extraction, supported vendor VAT numbers are checked and stored on
+`extractedJson.vendor.vatValidation`, with a compact copy on
+`extractedJson.meta.vendorVatValidation`.
 
-- parses prefixed VAT IDs such as `DE123456789` and maps Greece `GR` to VIES `EL`
-- can infer a country from the vendor address when the model extracted only local VAT digits
-- sends extracted vendor name/address fields for VIES approximate matching
-- stores the result on `extractedJson.vendor.vatValidation`
-- raises review warnings only for invalid VATs or explicit VIES match mismatches
+Supported validators:
 
-VIES lookup outages/timeouts are logged and stored as metadata, but they do not fail extraction
-or prevent later NetSuite replay.
+- `EU_VIES`: validates EU and Northern Ireland VAT IDs through the European Commission VIES API.
+  The parser accepts prefixed VAT IDs such as `DE123456789`, maps Greece `GR` to VIES `EL`, can
+  infer a country from the vendor address when only local VAT digits were extracted, and sends
+  extracted vendor name/address fields for approximate matching.
+- `CH_UID`: validates Swiss `CHE-###.###.### MWST/TVA/IVA` IDs. The parser normalizes the UID,
+  checks the UID checksum locally, then calls the Swiss UID PublicServices `ValidateVatNumber`
+  SOAP endpoint.
+
+Both validators return the same status model: `VALID`, `INVALID`, `SKIPPED`, or `ERROR`.
+Unsupported tax IDs are skipped with metadata. Lookup outages/timeouts are logged and stored as
+metadata, but they do not fail extraction or prevent later NetSuite replay. Review warnings are
+raised for invalid VATs or explicit registry match mismatches.
 
 ## Vendor Master Sync
 
@@ -29,7 +36,7 @@ a conservative vendor-master compare before creating/updating the AP record:
 
 1. Use the resolved vendor internal id from the transaction payload.
 2. Fetch the NetSuite `vendor` record through the REST Record API.
-3. Compare mapped extracted/VIES fields against the current vendor record.
+3. Compare mapped extracted/VAT-validation fields against the current vendor record.
 4. PATCH only fields that are blank in NetSuite, unless `vendorSync.missingOnly` is explicitly
    set to `false`.
 5. Store the sync result on the durable NetSuite transaction as `vendorSyncResult`.
@@ -49,7 +56,8 @@ NetSuite account, so map those to account-specific entity/custom fields in
     "taxId": "custentity_vendor_vat_id",
     "iban": "custentity_vendor_iban",
     "bic": "custentity_vendor_bic",
-    "vatValidationStatus": "custentity_vies_status"
+    "vatValidationStatus": "custentity_vendor_vat_status",
+    "vatRequestIdentifier": "custentity_vendor_vat_request_id"
   }
 }
 ```
@@ -59,6 +67,8 @@ NetSuite account, so map those to account-specific entity/custom fields in
 ```text
 PDF/email/upload
   -> Bedrock extraction
+  -> EU VIES or Swiss UID VAT validation
+  -> duplicate lookup + AP control flags
   -> DynamoDB invoice record
   -> transformToNetSuite()
   -> NetSuite push envelope
@@ -97,11 +107,13 @@ Key exports: `transformToNetSuite`, `validateNetSuiteRequest`, `buildExternalId`
 | `invoice.currency` | `currency` `{ id }` | via `currenciesByCode` |
 | `invoice.dueDate` / `paymentTerms` | `dueDate` / `terms` `{ id }` | terms via `termsByName` |
 | `buyer.*` | `subsidiary` and business dimensions | routed through recipient/business-unit mapping |
-| `invoice.purchaseOrderNumber` | warning or PO ref context | PO-backed bills should use a PO match/conversion flow |
+| `invoice.purchaseOrderNumber` / `invoice.purchaseOrderLookupKey` | warning or PO ref context | the printed PO is preserved; the lookup key is only for NetSuite matching |
 | `lineItems[]` net amounts | `expense.items[]` | GL, department, class, location, and tax code are crosswalked |
 
 `invoice.totalAmount` is gross. Expense lines are net. The transform warns when
-`sum(line net) + taxAmount != totalAmount`.
+`sum(line net) + taxAmount != totalAmount`. If a PO is present, the transform does not alter the
+invoice PO number. It may use `purchaseOrderLookupKey` for crosswalk lookup and emits a warning so
+AP can decide whether the invoice belongs in a PO-backed bill or three-way-match flow.
 
 ## Proformas -> vendorPrepayment
 

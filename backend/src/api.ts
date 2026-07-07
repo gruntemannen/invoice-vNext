@@ -1,5 +1,5 @@
 import { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from "aws-lambda";
-import { queryInvoices, docClient } from "./shared/dynamo";
+import { queryInvoices, updateItem, docClient } from "./shared/dynamo";
 import { DeleteCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
@@ -18,7 +18,11 @@ import {
   saveNetSuiteRuntimeSettings,
   type NetSuiteRuntimeSettings,
 } from "./shared/netsuite-settings";
-import { assessInvoiceFlow } from "./shared/flow";
+import {
+  assessInvoiceFlow,
+  normalizeDuplicateReview,
+  type DuplicateReviewAction,
+} from "./shared/flow";
 import {
   canReplay,
   createNetSuiteTransaction,
@@ -65,11 +69,26 @@ export const handler = async (
   if (path === "/netsuite/transactions/replay" && event.requestContext.http.method === "POST") {
     return replayNetSuiteTransactions(event);
   }
-  if (path.startsWith("/netsuite/transactions/") && path.endsWith("/replay") && event.requestContext.http.method === "POST") {
+  if (
+    path.startsWith("/netsuite/transactions/") &&
+    path.endsWith("/replay") &&
+    event.requestContext.http.method === "POST"
+  ) {
     return replayNetSuiteTransaction(event);
   }
-  if (path.startsWith("/invoices/") && path.endsWith("/netsuite/transactions") && event.requestContext.http.method === "POST") {
+  if (
+    path.startsWith("/invoices/") &&
+    path.endsWith("/netsuite/transactions") &&
+    event.requestContext.http.method === "POST"
+  ) {
     return createNetSuiteTransactionForInvoice(event);
+  }
+  if (
+    path.startsWith("/invoices/") &&
+    path.endsWith("/duplicate-review") &&
+    event.requestContext.http.method === "POST"
+  ) {
+    return updateDuplicateReview(event);
   }
   if (path.startsWith("/invoices/") && path.endsWith("/netsuite")) {
     return getNetSuiteFormat(event);
@@ -272,6 +291,84 @@ async function updateNetSuiteSettings(event: APIGatewayProxyEventV2) {
 
   const settings = await saveNetSuiteRuntimeSettings(TABLE_NAME, body, actorFromEvent(event));
   return jsonResponse(settings);
+}
+
+async function updateDuplicateReview(event: APIGatewayProxyEventV2) {
+  const messageId = event.pathParameters?.messageId ?? "";
+  const attachmentId = event.pathParameters?.attachmentId ?? "";
+  let body: any = {};
+
+  try {
+    body = event.body ? JSON.parse(event.body) : {};
+  } catch {
+    return jsonResponse({ message: "Invalid request body" }, 400);
+  }
+
+  const action = parseDuplicateReviewAction(body?.action);
+  if (!action) {
+    return jsonResponse({ message: "action must be HOLD_FOR_REVIEW or ALLOW_NETSUITE" }, 400);
+  }
+
+  const item = await findByAttachmentId(messageId, attachmentId);
+  if (!item) {
+    return jsonResponse({ message: "Not found" }, 404);
+  }
+  if (item.status !== "COMPLETED" || !item.extractedJson) {
+    return jsonResponse({ message: "Invoice extraction is not complete." }, 409);
+  }
+
+  const duplicateCount = item.duplicateCount ?? item.extractedJson?.meta?.duplicateCount ?? 0;
+  if (duplicateCount <= 0) {
+    return jsonResponse({ message: "This invoice has no duplicate matches to review." }, 409);
+  }
+
+  const now = new Date().toISOString();
+  const duplicateReview = normalizeDuplicateReview({
+    action,
+    reviewedAt: now,
+    reviewedBy: actorFromEvent(event),
+    note: trimNote(body?.note),
+  });
+  const extractedJson = {
+    ...item.extractedJson,
+    meta: {
+      ...(item.extractedJson?.meta ?? {}),
+      duplicateReview,
+    },
+  };
+  const flow = assessInvoiceFlow(extractedJson, {
+    confidence: item.confidence,
+    warnings: item.warnings ?? extractedJson?.meta?.warnings ?? [],
+    duplicateCount,
+  });
+
+  extractedJson.meta.reviewStatus = flow.reviewStatus;
+  extractedJson.meta.autoBookEligible = flow.autoBookEligible;
+  extractedJson.meta.controlFlags = flow.flags;
+  extractedJson.meta.duplicateReview = duplicateReview;
+
+  await updateItem(
+    TABLE_NAME,
+    { messageId: item.messageId, attachmentKey: item.attachmentKey },
+    {
+      duplicateReview,
+      reviewStatus: flow.reviewStatus,
+      autoBookEligible: flow.autoBookEligible,
+      controlFlags: flow.flags,
+      duplicateCount: flow.duplicateCount,
+      updatedAt: now,
+      extractedJson,
+    }
+  );
+
+  return jsonResponse({
+    duplicateReview,
+    reviewStatus: flow.reviewStatus,
+    autoBookEligible: flow.autoBookEligible,
+    controlFlags: flow.flags,
+    duplicateCount: flow.duplicateCount,
+    flow,
+  });
 }
 
 async function listNetSuiteTransactionLog(event: APIGatewayProxyEventV2) {
@@ -501,6 +598,17 @@ function parseTransactionStatus(value?: string): NetSuiteTransactionStatus | und
     "FAILED_PERMANENT",
   ];
   return allowed.includes(value as NetSuiteTransactionStatus) ? (value as NetSuiteTransactionStatus) : undefined;
+}
+
+function parseDuplicateReviewAction(value: unknown): DuplicateReviewAction | undefined {
+  return value === "HOLD_FOR_REVIEW" || value === "ALLOW_NETSUITE"
+    ? value
+    : undefined;
+}
+
+function trimNote(value: unknown): string | undefined {
+  const note = String(value ?? "").trim();
+  return note ? note.slice(0, 500) : undefined;
 }
 
 function pathTransactionId(path: string): string {

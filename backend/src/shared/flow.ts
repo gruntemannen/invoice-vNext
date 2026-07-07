@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 export type ControlSeverity = "info" | "warning" | "blocker";
 export type ReviewStatus = "READY_FOR_NETSUITE" | "NEEDS_REVIEW";
+export type DuplicateReviewAction = "HOLD_FOR_REVIEW" | "ALLOW_NETSUITE";
 
 export interface ControlFlag {
   code: string;
@@ -26,6 +27,7 @@ export interface FlowAssessment {
   autoBookEligible: boolean;
   duplicateKey: string | null;
   duplicateCount: number;
+  duplicateReview: DuplicateReviewDecision | null;
   flags: ControlFlag[];
 }
 
@@ -33,9 +35,17 @@ export interface FlowAssessmentOptions {
   confidence?: number;
   warnings?: string[];
   duplicateCount?: number;
+  duplicateReview?: DuplicateReviewDecision | null;
   netSuiteWarnings?: string[];
   netSuiteValidationErrors?: string[];
   minimumAutoBookConfidence?: number;
+}
+
+export interface DuplicateReviewDecision {
+  action: DuplicateReviewAction;
+  reviewedAt?: string;
+  reviewedBy?: string;
+  note?: string;
 }
 
 const DEFAULT_AUTO_BOOK_CONFIDENCE = 0.95;
@@ -88,6 +98,9 @@ export function assessInvoiceFlow(
       : extracted?.meta?.confidenceScore;
   const duplicateKey = buildDuplicateKey(extracted);
   const duplicateCount = options.duplicateCount ?? extracted?.meta?.duplicateCount ?? 0;
+  const duplicateReview = normalizeDuplicateReview(
+    options.duplicateReview ?? extracted?.meta?.duplicateReview
+  );
 
   if (!hasValue(vendor.name)) {
     flags.push({
@@ -194,11 +207,21 @@ export function assessInvoiceFlow(
   }
 
   if (duplicateCount > 0) {
-    flags.push({
-      code: "potential_duplicate",
-      severity: "blocker",
-      message: `${duplicateCount} possible duplicate invoice record${duplicateCount === 1 ? "" : "s"} found.`,
-    });
+    if (duplicateReview?.action === "ALLOW_NETSUITE") {
+      flags.push({
+        code: "duplicate_allowed",
+        severity: "info",
+        message: duplicateReview.reviewedBy
+          ? `Duplicate invoice allowed for NetSuite by ${duplicateReview.reviewedBy}.`
+          : "Duplicate invoice allowed for NetSuite by AP review.",
+      });
+    } else {
+      flags.push({
+        code: "potential_duplicate",
+        severity: "blocker",
+        message: `${duplicateCount} possible duplicate invoice record${duplicateCount === 1 ? "" : "s"} found.`,
+      });
+    }
   }
 
   for (const warning of options.warnings ?? []) {
@@ -242,7 +265,25 @@ export function assessInvoiceFlow(
     autoBookEligible,
     duplicateKey,
     duplicateCount,
+    duplicateReview,
     flags: dedupeFlags(flags),
+  };
+}
+
+export function normalizeDuplicateReview(value: any): DuplicateReviewDecision | null {
+  const action =
+    value?.action === "ALLOW_NETSUITE"
+      ? "ALLOW_NETSUITE"
+      : value?.action === "HOLD_FOR_REVIEW"
+        ? "HOLD_FOR_REVIEW"
+        : null;
+  if (!action) return null;
+
+  return {
+    action,
+    reviewedAt: stringOrUndefined(value?.reviewedAt),
+    reviewedBy: stringOrUndefined(value?.reviewedBy),
+    note: stringOrUndefined(value?.note),
   };
 }
 
@@ -257,6 +298,11 @@ function canonical(value: unknown): string {
 
 function hasValue(value: unknown): boolean {
   return String(value ?? "").trim().length > 0;
+}
+
+function stringOrUndefined(value: unknown): string | undefined {
+  const s = String(value ?? "").trim();
+  return s || undefined;
 }
 
 function hasBankDetails(bank: any): boolean {

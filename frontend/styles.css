@@ -949,6 +949,75 @@ h3 {
 .drawer-section {
   margin-top: 8px;
 }
+.duplicate-review-panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  margin: 0 0 18px;
+  background: var(--surface-2);
+}
+.duplicate-review-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.duplicate-review-status,
+.duplicate-review-message {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.segmented button {
+  min-height: 34px;
+  padding: 7px 10px;
+  border: 0;
+  border-right: 1px solid var(--border-strong);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.segmented button:last-child {
+  border-right: 0;
+}
+.segmented button.active {
+  background: var(--primary);
+  color: #fff;
+}
+.segmented button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.duplicate-match-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+.duplicate-match {
+  display: grid;
+  grid-template-columns:
+    minmax(90px, 1fr)
+    minmax(110px, 1.2fr)
+    minmax(80px, 0.8fr)
+    minmax(110px, 1fr);
+  gap: 8px;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
 .json-box {
   margin: 0;
   background: #0f1626;
@@ -1042,6 +1111,18 @@ h3 {
 @media (max-width: 520px) {
   .kpi-value {
     font-size: 24px;
+  }
+  .duplicate-review-head {
+    flex-direction: column;
+  }
+  .segmented {
+    width: 100%;
+  }
+  .segmented button {
+    flex: 1;
+  }
+  .duplicate-match {
+    grid-template-columns: 1fr;
   }
   .drawer-foot .button.danger {
     margin-right: 0;

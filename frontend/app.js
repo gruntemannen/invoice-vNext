@@ -311,6 +311,87 @@ function renderVatValidation(d) {
   return `<span class="badge ${cls}">${escapeHtml(status)}</span> ${escapeHtml(provider ? provider + " " : "")}${escapeHtml(number)}${escapeHtml(match)}`;
 }
 
+function duplicateReview(d) {
+  return d.duplicateReview ?? d.extractedJson?.meta?.duplicateReview ?? null;
+}
+
+function duplicateCount(d) {
+  return d.duplicateCount ?? d.extractedJson?.meta?.duplicateCount ?? 0;
+}
+
+function duplicateMatches(d) {
+  const matches = d.duplicateMatches ?? d.extractedJson?.meta?.duplicateMatches ?? [];
+  return Array.isArray(matches) ? matches : [];
+}
+
+function renderDuplicateDecision(d) {
+  if (duplicateCount(d) <= 0) return "—";
+  const review = duplicateReview(d);
+  if (review?.action === "ALLOW_NETSUITE") {
+    return `<span class="badge ok">Allow NetSuite</span>`;
+  }
+  return `<span class="badge pending">Hold for review</span>`;
+}
+
+function renderDuplicateReviewPanel(d) {
+  const panel = $("duplicate-review-panel");
+  if (!panel) return;
+
+  const count = duplicateCount(d);
+  if (d.status !== "COMPLETED" || count <= 0) {
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return;
+  }
+
+  const review = duplicateReview(d);
+  const action = review?.action === "ALLOW_NETSUITE" ? "ALLOW_NETSUITE" : "HOLD_FOR_REVIEW";
+  const matches = duplicateMatches(d).slice(0, 3);
+  const reviewed = review?.reviewedAt
+    ? `Reviewed ${escapeHtml(fmtDate(review.reviewedAt))}${
+        review.reviewedBy ? ` by ${escapeHtml(review.reviewedBy)}` : ""
+      }`
+    : "No admin decision recorded";
+
+  panel.innerHTML = `
+    <div class="duplicate-review-head">
+      <div>
+        <div class="panel-title">Duplicate handling</div>
+        <div class="duplicate-review-status">
+          ${escapeHtml(count)} possible duplicate${count === 1 ? "" : "s"} - ${reviewed}
+        </div>
+      </div>
+      <div class="segmented" role="group" aria-label="Duplicate invoice handling">
+        <button type="button" class="${action === "HOLD_FOR_REVIEW" ? "active" : ""}"
+          data-duplicate-action="HOLD_FOR_REVIEW">Hold for review</button>
+        <button type="button" class="${action === "ALLOW_NETSUITE" ? "active" : ""}"
+          data-duplicate-action="ALLOW_NETSUITE">Allow NetSuite</button>
+      </div>
+    </div>
+    ${
+      matches.length
+        ? `<div class="duplicate-match-list">${matches
+            .map(
+              (m) => `
+                <div class="duplicate-match">
+                  <span>${escapeHtml(m.invoiceNumber || "Invoice")}</span>
+                  <span>${escapeHtml(m.vendorName || "Unknown vendor")}</span>
+                  <span>${escapeHtml(fmtAmount(m.totalAmount, m.currency))}</span>
+                  <span>${escapeHtml(fmtDate(m.receivedAt))}</span>
+                </div>`
+            )
+            .join("")}</div>`
+        : ""
+    }
+    <div class="duplicate-review-message" aria-live="polite"></div>
+  `;
+  panel.classList.remove("hidden");
+
+  panel.querySelectorAll("[data-duplicate-action]").forEach((button) => {
+    button.addEventListener("click", () => saveDuplicateReview(button.dataset.duplicateAction));
+  });
+}
+
 function escapeHtml(str) {
   if (str == null) return "";
   return String(str)
@@ -679,6 +760,7 @@ const DETAIL_FIELDS = [
   ["Amount", (d) => escapeHtml(fmtAmount(d.totalAmount, d.currency))],
   ["Confidence", (d) => (d.status === "COMPLETED" ? escapeHtml(fmtPct(d.confidence)) : "—")],
   ["Duplicates", (d) => escapeHtml(String(d.duplicateCount ?? d.extractedJson?.meta?.duplicateCount ?? 0))],
+  ["Duplicate decision", renderDuplicateDecision],
   ["Controls", (d) => renderControlFlags(d.controlFlags ?? d.extractedJson?.meta?.controlFlags ?? [])],
   ["From", (d) => escapeHtml(d.from || "—")],
   ["Subject", (d) => escapeHtml(d.subject || "—")],
@@ -698,6 +780,8 @@ async function openDetail(messageId, attachmentId) {
   fields.innerHTML = `<div class="empty">Loading…</div>`;
   jsonBox.textContent = "";
   $("drawer-meta").textContent = "";
+  $("duplicate-review-panel").classList.add("hidden");
+  $("duplicate-review-panel").innerHTML = "";
   overlay.classList.remove("hidden");
   document.body.classList.add("no-scroll");
 
@@ -714,6 +798,7 @@ async function openDetail(messageId, attachmentId) {
         <span class="meta-value">${fn(d)}</span>
       </div>`
     ).join("");
+    renderDuplicateReviewPanel(d);
 
     let jsonPayload;
     if (d.status === "FAILED") {
@@ -808,6 +893,56 @@ async function logNetSuiteTransaction(messageId, attachmentId) {
     console.error(err);
     jsonBox.textContent = "Transaction logging failed.";
     toast("Transaction logging failed.", "error");
+  }
+}
+
+async function saveDuplicateReview(action) {
+  if (!state.currentDetail || !["HOLD_FOR_REVIEW", "ALLOW_NETSUITE"].includes(action)) return;
+  const { messageId, attachmentId } = state.currentDetail;
+  const panel = $("duplicate-review-panel");
+  const msg = panel?.querySelector(".duplicate-review-message");
+
+  try {
+    panel?.querySelectorAll("button").forEach((button) => {
+      button.disabled = true;
+    });
+    if (msg) msg.textContent = "Saving...";
+
+    const res = await apiFetch(
+      `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}/duplicate-review`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action }),
+      }
+    );
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      if (msg) msg.textContent = data.message || "Could not save duplicate decision.";
+      toast(data.message || "Could not save duplicate decision.", "error");
+      return;
+    }
+
+    const ready = data.reviewStatus === "READY_FOR_NETSUITE";
+    toast(
+      action === "ALLOW_NETSUITE"
+        ? ready
+          ? "Duplicate allowed for NetSuite."
+          : "Duplicate allowed; remaining controls still need review."
+        : "Duplicate held for review.",
+      "success"
+    );
+    await openDetail(messageId, attachmentId);
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    if (msg) msg.textContent = "Could not save duplicate decision.";
+    toast("Could not save duplicate decision.", "error");
+  } finally {
+    panel?.querySelectorAll("button").forEach((button) => {
+      button.disabled = false;
+    });
   }
 }
 

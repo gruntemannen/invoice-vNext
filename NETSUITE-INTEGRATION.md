@@ -164,6 +164,23 @@ transaction body and expense lines. `defaultBusinessUnitKey` is used only after 
 tax id, company name, email domain, and address matching all miss. Missing recipient routing
 with no fallback emits a NetSuite warning and keeps the invoice in review.
 
+## Duplicate Invoice Handling
+
+Duplicate detection hashes vendor, invoice number, currency, and gross total. A match creates a
+`potential_duplicate` blocker and keeps the invoice in AP review by default.
+
+Admins can save one of two invoice-level decisions from the detail drawer:
+
+- `HOLD_FOR_REVIEW`: keep the duplicate blocker active. This is the default when no admin
+  decision exists.
+- `ALLOW_NETSUITE`: record who approved the duplicate and when, clear only the duplicate blocker,
+  and allow the invoice to proceed if no other blockers or warnings remain.
+
+The decision is stored on `extractedJson.meta.duplicateReview` and mirrored on the invoice row.
+NetSuite preview and transaction logging both recompute the AP flow from the stored decision, so
+a duplicate that is still held logs as `HELD_FOR_REVIEW`, while an allowed duplicate can be queued
+when validation, configuration, and live-push settings permit it.
+
 ## Configuration
 
 Edit `backend/netsuite-config.json`. It contains non-secret values only.

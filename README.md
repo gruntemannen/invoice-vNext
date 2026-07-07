@@ -20,6 +20,8 @@ Invoice Extractor currently provides:
 - Swiss `CHE... MWST/TVA/IVA` VAT validation through the Swiss UID PublicServices endpoint.
 - AP review controls for missing data, low confidence, duplicates, PO matching, non-standard
   documents, proformas, and vendor bank details.
+- Admin duplicate handling: hold duplicate invoices for review or allow a reviewed duplicate to
+  continue to NetSuite.
 - NetSuite AP payload generation for `vendorBill` and `vendorPrepayment`.
 - Runtime NetSuite endpoint configuration for Test and Prod in the admin console.
 - Durable NetSuite transaction logging before any live push attempt.
@@ -74,15 +76,17 @@ Review and integration:
    - Unsupported tax IDs are skipped with metadata rather than failing extraction.
 8. Duplicate detection hashes vendor, invoice number, currency, and gross total, then checks a
    sparse DynamoDB duplicate index.
-9. The AP flow assigns `READY_FOR_NETSUITE` or `NEEDS_REVIEW` and stores reader-facing control
+9. Duplicate invoices are held for AP review by default. An admin can mark the duplicate as
+   allowed for NetSuite; this clears only the duplicate blocker, not unrelated validation issues.
+10. The AP flow assigns `READY_FOR_NETSUITE` or `NEEDS_REVIEW` and stores reader-facing control
    flags.
-10. The admin console lets AP review the record, download the PDF, preview NetSuite, log a
+11. The admin console lets AP review the record, download the PDF, preview NetSuite, log a
     NetSuite transaction, or delete the invoice and PDF.
-11. NetSuite transaction logging writes a `NETSUITE_TRANSACTION` item before anything is queued.
-12. If live push is enabled and the item is ready/configured, the NetSuite worker fetches the
+12. NetSuite transaction logging writes a `NETSUITE_TRANSACTION` item before anything is queued.
+13. If live push is enabled and the item is ready/configured, the NetSuite worker fetches the
     transaction, optionally fills configured missing vendor-master fields, performs the idempotent
     NetSuite upsert, and records success or failure events.
-13. Retryable failures can be replayed individually or in bulk after NetSuite recovers.
+14. Retryable failures can be replayed individually or in bulk after NetSuite recovers.
 
 ## Key Components
 
@@ -287,6 +291,7 @@ Every API route requires `Authorization: Bearer <id_token>`.
 | `DELETE` | `/invoices/{messageId}/{attachmentId}` | Delete invoice row and PDF. |
 | `GET` | `/invoices/{messageId}/{attachmentId}/download` | Return a 15-minute presigned PDF URL. |
 | `POST` | `/upload` | Create a presigned PDF upload URL. |
+| `POST` | `/invoices/{messageId}/{attachmentId}/duplicate-review` | Save `HOLD_FOR_REVIEW` or `ALLOW_NETSUITE` for a duplicate invoice. |
 | `GET` | `/config/netsuite` | Read NetSuite Test/Prod runtime settings. |
 | `POST` | `/config/netsuite` | Save NetSuite Test/Prod runtime settings. |
 | `GET` | `/invoices/{messageId}/{attachmentId}/netsuite` | Build NetSuite preview, validation, and config hints. |
@@ -376,6 +381,11 @@ Representative stored extraction:
     "confidenceScore": 1,
     "reviewStatus": "READY_FOR_NETSUITE",
     "autoBookEligible": true,
+    "duplicateReview": {
+      "action": "ALLOW_NETSUITE",
+      "reviewedAt": "2026-07-07T10:30:00.000Z",
+      "reviewedBy": "ap@example.com"
+    },
     "controlFlags": []
   }
 }
@@ -387,6 +397,8 @@ Important extraction rules:
 - `lineItems.amount` and `lineItems.unitPrice` are net/pre-tax.
 - Proformas set `invoice.transactionIntent` to `VendorPrepayment`.
 - `purchaseOrderNumber` preserves the invoice text; `purchaseOrderLookupKey` is only for matching.
+- Duplicate invoices default to `HOLD_FOR_REVIEW`; `ALLOW_NETSUITE` is an admin decision stored
+  with timestamp and reviewer.
 - Vendor names remain in the original language/script.
 
 ## Operations

@@ -26,7 +26,8 @@ DynamoDB, validates vendor VAT details, and prepares replayable NetSuite AP tran
 ## Backend (`backend/`)
 
 - `src/api.ts`: JWT-protected HTTP API for stats, invoice list/detail/download/delete, upload,
-  NetSuite runtime config, NetSuite preview, durable transaction logging, and replay.
+  duplicate review decisions, NetSuite runtime config, NetSuite preview, durable transaction
+  logging, and replay.
 - `src/extract.ts`: SQS extraction worker. Reads PDFs, invokes Claude Sonnet 4.6, normalizes the
   extraction, enriches VAT details, detects duplicates, assigns AP flow state, and writes
   DynamoDB records.

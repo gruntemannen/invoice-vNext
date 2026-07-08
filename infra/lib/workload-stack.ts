@@ -45,6 +45,8 @@ interface CognitoAuthConfig {
   domain?: string;
   scope?: string;
   responseType?: "token" | "code" | string;
+  landingClientId?: string;
+  landingUrl?: string;
 }
 
 interface ResolvedCognitoAuth {
@@ -55,6 +57,8 @@ interface ResolvedCognitoAuth {
   domain: string;
   scope: string;
   responseType: "token" | "code";
+  audienceClientIds: string[];
+  landingUrl: string;
 }
 
 function normalizeHostedUiDomain(domain?: string): string | undefined {
@@ -100,6 +104,8 @@ function resolveExternalCognitoAuth(config?: CognitoAuthConfig): ResolvedCognito
   const region = config.region?.trim() || regionFromIssuer(issuer);
   const userPoolId = config.userPoolId?.trim() || userPoolIdFromIssuer(issuer);
   const clientId = config.clientId?.trim();
+  const landingClientId = config.landingClientId?.trim();
+  const landingUrl = config.landingUrl?.trim() || "https://d31eg8zeuvav8w.cloudfront.net/?signed_out=1";
   const domain = normalizeHostedUiDomain(config.domain);
   const scope = config.scope?.trim() || "openid email profile";
   const responseType = (config.responseType?.trim() || "code").toLowerCase();
@@ -127,6 +133,8 @@ function resolveExternalCognitoAuth(config?: CognitoAuthConfig): ResolvedCognito
     domain: domain!,
     scope,
     responseType,
+    audienceClientIds: [clientId!, landingClientId].filter((value): value is string => Boolean(value)),
+    landingUrl,
   };
 }
 
@@ -630,6 +638,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
         domain: cognitoHostedUiDomain,
         scope: "openid email profile",
         responseType: "token",
+        audienceClientIds: [userPoolClient.userPoolClientId],
+        landingUrl: appUrl,
       };
     }
 
@@ -637,7 +647,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
     const jwtAuthorizer = new apigwv2Authorizers.HttpJwtAuthorizer(
       "AdminJwtAuthorizer",
       auth.issuer,
-      { jwtAudience: [auth.clientId] }
+      { jwtAudience: auth.audienceClientIds }
     );
 
     const httpApi = new apigwv2.HttpApi(this, "InvoiceApi", {
@@ -767,7 +777,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
                 responseType: auth.responseType,
                 tokenEndpoint: `https://${auth.domain}/oauth2/token`,
                 redirectUri: appUrl,
-                logoutUri: appUrl,
+                logoutUri: auth.landingUrl,
               },
             },
             null,

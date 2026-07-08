@@ -49,6 +49,8 @@ function readCognitoContext(): CognitoAuthConfig | undefined {
     ["domain", "cognitoDomain"],
     ["scope", "cognitoScope"],
     ["responseType", "cognitoResponseType"],
+    ["landingClientId", "cognitoLandingClientId"],
+    ["landingUrl", "landingUrl"],
   ];
 
   for (const [key, contextName] of contextPairs) {

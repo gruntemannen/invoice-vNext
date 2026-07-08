@@ -14,6 +14,8 @@ export interface CognitoAuthConfig {
   domain?: string;
   scope?: string;
   responseType?: "token" | "code";
+  landingClientId?: string;
+  landingUrl?: string;
 }
 
 export interface InvoiceConfig {
@@ -81,5 +83,7 @@ export const config: InvoiceConfig = {
   //   clientId: "...",
   //   domain: "....auth.eu-central-1.amazoncognito.com",
   //   responseType: "code",
+  //   landingClientId: "3ckpnotgecjp7gtb7a1h5tgaan",
+  //   landingUrl: "https://d31eg8zeuvav8w.cloudfront.net/?signed_out=1",
   // },
 };

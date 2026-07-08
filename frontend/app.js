@@ -32,6 +32,7 @@ const TOKEN_KEY = "invoice_admin_id_token";
 const PKCE_VERIFIER_KEY = "invoice_admin_pkce_verifier";
 const OAUTH_STATE_KEY = "invoice_admin_oauth_state";
 const OAUTH_EXPECTED_EMAIL_KEY = "invoice_admin_oauth_expected_email";
+const LANDING_HANDOFF_PARAM = "entirely_id_token";
 
 /* ----------------------------- DOM refs -------------------------------- */
 const $ = (id) => document.getElementById(id);
@@ -147,10 +148,13 @@ async function pkceChallenge(verifier) {
 function readTokenFromHash() {
   if (!window.location.hash || window.location.hash.length < 2) return null;
   const params = new URLSearchParams(window.location.hash.slice(1));
-  const token = params.get("id_token");
+  const token = params.get(LANDING_HANDOFF_PARAM) || params.get("id_token");
   if (token) {
     // Clean the hash so the token isn't left in the address bar / history.
-    history.replaceState(null, "", window.location.pathname + window.location.search);
+    const query = new URLSearchParams(window.location.search);
+    ["sso", "login_hint"].forEach((name) => query.delete(name));
+    const cleanQuery = query.toString();
+    history.replaceState(null, "", window.location.pathname + (cleanQuery ? `?${cleanQuery}` : ""));
   }
   return token;
 }
@@ -247,15 +251,25 @@ function buildLogoutUrl() {
   const c = state.cognito;
   const qs = new URLSearchParams({
     client_id: c.clientId,
-    logout_uri: c.logoutUri || c.redirectUri,
+    logout_uri: c.logoutUri || "https://d31eg8zeuvav8w.cloudfront.net/?signed_out=1",
   });
   return `https://${hostedUiDomain()}/logout?${qs.toString()}`;
 }
 
-async function redirectToLogin() {
-  bootText.textContent = "Redirecting to sign in…";
+function landingHomeUrl() {
+  try {
+    const url = new URL(state.cognito?.logoutUri || "https://d31eg8zeuvav8w.cloudfront.net/");
+    url.searchParams.delete("signed_out");
+    return url.toString();
+  } catch {
+    return "https://d31eg8zeuvav8w.cloudfront.net/";
+  }
+}
+
+function redirectToLanding() {
+  bootText.textContent = "Returning to the landing page...";
   showBootGate();
-  window.location.assign(await buildLoginUrl());
+  window.location.assign(landingHomeUrl());
 }
 
 function logout() {
@@ -312,10 +326,10 @@ async function apiFetch(path, options = {}) {
   const res = await fetch(url, { ...options, headers });
 
   if (res.status === 401 || res.status === 403) {
-    // Token rejected/expired -> clear and re-login.
+    // Token rejected/expired -> clear and return to the only password entry point.
     clearStoredAuth();
     state.idToken = null;
-    void redirectToLogin();
+    redirectToLanding();
     // Throw so callers stop processing; redirect is already underway.
     throw new Error("Unauthorized");
   }
@@ -1551,12 +1565,12 @@ async function boot() {
   } catch (err) {
     console.error(err);
     clearStoredAuth();
-    bootText.textContent = "Sign-in failed. Please try again.";
+    redirectToLanding();
     return;
   }
 
   if (!authenticated) {
-    await redirectToLogin();
+    redirectToLanding();
     return;
   }
 

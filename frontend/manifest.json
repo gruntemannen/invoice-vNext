@@ -1,18 +1,18 @@
 {
-  "name": "Invoice Admin",
-  "short_name": "Invoice Admin",
+  "name": "Entirely Invoice Console",
+  "short_name": "Entirely",
   "description": "Admin console for emailed-invoice extraction: dashboard, audit, and upload.",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",
-  "background_color": "#f5f7fb",
-  "theme_color": "#f6f8fc",
+  "background_color": "#f2ebe3",
+  "theme_color": "#f2ebe3",
   "icons": [
     {
-      "src": "favicon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "src": "assets/logo/entirely-logomark-black.png",
+      "sizes": "279x279",
+      "type": "image/png",
+      "purpose": "any"
     }
   ]
 }

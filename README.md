@@ -107,8 +107,9 @@ Review and integration:
 
 ## Admin Console
 
-The admin console is protected by Amazon Cognito. Self-signup is disabled; create users in the
-stack's Cognito user pool.
+The admin console is protected by Amazon Cognito. By default the stack creates an app-owned
+admin user pool. It can also be configured to trust a shared Cognito issuer/client, in which
+case users are created and managed in the shared pool instead of this stack.
 
 Views:
 
@@ -243,11 +244,50 @@ export const config = {
   viesRequestTimeoutMs: 6000,
   netSuiteLivePushEnabled: false,
 
+  // Optional. Leave unset to create/use the stack-owned admin pool.
+  // cognito: {
+  //   region: "eu-central-1",
+  //   userPoolId: "eu-central-1_...",
+  //   clientId: "...",
+  //   domain: "....auth.eu-central-1.amazoncognito.com",
+  //   responseType: "code",
+  // },
+
   memberAccountName: "invoice-extractor",
   memberAccountEmail: "your-email@company.com",
   managementAccountId: "YOUR_MGMT_ACCOUNT_ID"
 };
 ```
+
+### Optional Shared Cognito
+
+Leave `cognito` unset to preserve the existing behavior: CDK creates an app-owned
+`eu-west-1` Cognito pool/client and the frontend uses Hosted UI implicit flow. The current live
+app-owned pool/client are `eu-west-1_wiRp2Mca6` / `6ca4encpti6son15j3a416vb9j`.
+
+To test or deploy against the future shared Frankfurt pool, set `config.cognito` or pass CDK
+context values. The central app client should be named `entirely-invoice-web`, should allow the
+CloudFront `FrontendUrl` with and without a trailing slash as callback/logout URLs, and should
+include `openid email profile` scopes. For `responseType: "code"`, configure the app client as a
+public client with authorization-code grant and PKCE, with no client secret.
+
+```bash
+npx cdk synth InvoiceExtractorStack \
+  --context stacks=InvoiceExtractorStack \
+  --context cognitoRegion=eu-central-1 \
+  --context cognitoUserPoolId=<CentralUserPoolId> \
+  --context cognitoClientId=<EntirelyInvoiceWebClientId> \
+  --context cognitoDomain=<HostedUiDomain> \
+  --context cognitoResponseType=code
+```
+
+You can pass `--context cognitoIssuer=https://cognito-idp.eu-central-1.amazonaws.com/<CentralUserPoolId>`
+instead of `cognitoRegion` plus `cognitoUserPoolId`.
+
+For an existing deployed stack, treat this as a cutover: once shared Cognito is configured, the
+API authorizer and generated frontend config stop using the app-owned pool/client. The app-owned
+user pool has `Retain` removal policy, but the old app client/domain should no longer be relied on
+after the shared issuer/client are active.
 
 ### Deploy Single Account
 
@@ -268,11 +308,15 @@ npx cdk deploy InvoiceExtractorStack --context stacks=InvoiceExtractorStack
 
 ### Create Admin Users
 
-Use the stack output `UserPoolId`, then create or manage users in Cognito. Example:
+In default app-owned Cognito mode, use the stack output `UserPoolId`, then create or manage users
+in Cognito. In shared Cognito mode, create and manage users in the central Frankfurt pool that
+owns the configured issuer; the invoice stack only consumes that pool's issuer, Hosted UI domain,
+and app client.
 
 ```bash
 aws cognito-idp admin-create-user \
-  --user-pool-id <UserPoolId> \
+  --region eu-central-1 \
+  --user-pool-id <CentralOrStackUserPoolId> \
   --username user@example.com \
   --user-attributes Name=email,Value=user@example.com Name=email_verified,Value=true
 ```
@@ -474,7 +518,8 @@ Warnings are expected while crosswalks and runtime settings are being populated.
 
 ## Security
 
-- Cognito Hosted UI and JWT authorizer protect every API route.
+- Cognito Hosted UI and JWT authorizer protect every API route; the frontend supports implicit
+  flow by default and authorization-code + PKCE when configured.
 - Self-signup is disabled; users are admin-created.
 - S3 buckets block public access and enforce SSL.
 - Attachment bucket and DynamoDB use the customer-managed KMS key.

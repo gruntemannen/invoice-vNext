@@ -1,8 +1,8 @@
 /* =========================================================================
    Invoice Admin — static PWA admin console (vanilla JS, no build step)
    Views: Dashboard (GET /stats), Audit (GET /invoices), Upload (POST /upload).
-   Auth: Cognito Hosted UI implicit flow; id_token in sessionStorage; Bearer
-         header on every API call; 401/403 -> re-login.
+   Auth: Cognito Hosted UI implicit or authorization-code + PKCE flow; id_token
+         in browser storage; Bearer header on every API call; 401/403 -> re-login.
    ========================================================================= */
 
 "use strict";
@@ -29,6 +29,9 @@ const state = {
 };
 
 const TOKEN_KEY = "invoice_admin_id_token";
+const PKCE_VERIFIER_KEY = "invoice_admin_pkce_verifier";
+const OAUTH_STATE_KEY = "invoice_admin_oauth_state";
+const OAUTH_EXPECTED_EMAIL_KEY = "invoice_admin_oauth_expected_email";
 
 /* ----------------------------- DOM refs -------------------------------- */
 const $ = (id) => document.getElementById(id);
@@ -58,6 +61,11 @@ function base64UrlDecode(str) {
   }
 }
 
+function base64UrlEncodeBytes(bytes) {
+  const chars = Array.from(new Uint8Array(bytes), (byte) => String.fromCharCode(byte)).join("");
+  return btoa(chars).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 function decodeJwt(token) {
   try {
     const parts = token.split(".");
@@ -75,6 +83,66 @@ function isTokenValid(token) {
   return payload.exp * 1000 > Date.now() + 30_000;
 }
 
+function clearStoredAuth() {
+  try {
+    sessionStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* ignore */
+  }
+  [PKCE_VERIFIER_KEY, OAUTH_STATE_KEY, OAUTH_EXPECTED_EMAIL_KEY].forEach(removeAuthTransactionItem);
+}
+
+function setAuthTransactionItem(key, value) {
+  try { sessionStorage.setItem(key, value); } catch { /* ignore */ }
+  try { localStorage.setItem(key, value); } catch { /* ignore */ }
+}
+
+function getAuthTransactionItem(key) {
+  try {
+    const value = sessionStorage.getItem(key);
+    if (value) return value;
+  } catch {
+    /* ignore */
+  }
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function removeAuthTransactionItem(key) {
+  try { sessionStorage.removeItem(key); } catch { /* ignore */ }
+  try { localStorage.removeItem(key); } catch { /* ignore */ }
+}
+
+function authResponseType() {
+  return (state.cognito?.responseType || "token").toLowerCase() === "code" ? "code" : "token";
+}
+
+function hostedUiDomain() {
+  return String(state.cognito?.domain || "")
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/, "");
+}
+
+function getLoginHint() {
+  const params = new URLSearchParams(window.location.search || "");
+  return (params.get("login_hint") || "").trim();
+}
+
+function randomOAuthString(byteLength = 32) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return base64UrlEncodeBytes(bytes);
+}
+
+async function pkceChallenge(verifier) {
+  const bytes = new TextEncoder().encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return base64UrlEncodeBytes(digest);
+}
+
 /** Pull an id_token out of the URL hash (implicit flow callback). */
 function readTokenFromHash() {
   if (!window.location.hash || window.location.hash.length < 2) return null;
@@ -87,47 +155,125 @@ function readTokenFromHash() {
   return token;
 }
 
-function buildLoginUrl() {
+function readCodeFromQuery() {
+  if (!window.location.search || window.location.search.length < 2) return null;
+  const params = new URLSearchParams(window.location.search);
+  const error = params.get("error");
+  const errorDescription = params.get("error_description");
+  const code = params.get("code");
+  const oauthState = params.get("state");
+  if (!error && !code) return null;
+
+  ["code", "state", "error", "error_description", "sso", "login_hint"].forEach((name) => params.delete(name));
+  const cleanQuery = params.toString();
+  history.replaceState(null, "", `${window.location.pathname}${cleanQuery ? `?${cleanQuery}` : ""}`);
+
+  if (error) throw new Error(errorDescription || error);
+  return { code, state: oauthState };
+}
+
+async function exchangeCodeForToken(code, oauthState) {
   const c = state.cognito;
+  const expectedState = getAuthTransactionItem(OAUTH_STATE_KEY);
+  const verifier = getAuthTransactionItem(PKCE_VERIFIER_KEY);
+  const expectedEmail = getAuthTransactionItem(OAUTH_EXPECTED_EMAIL_KEY);
+  removeAuthTransactionItem(OAUTH_STATE_KEY);
+  removeAuthTransactionItem(PKCE_VERIFIER_KEY);
+  removeAuthTransactionItem(OAUTH_EXPECTED_EMAIL_KEY);
+  if (!expectedState || oauthState !== expectedState) {
+    throw new Error("OAuth state mismatch");
+  }
+  if (!verifier) {
+    throw new Error("PKCE verifier missing");
+  }
+
+  const tokenEndpoint = c.tokenEndpoint || `https://${hostedUiDomain()}/oauth2/token`;
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: c.clientId,
+    code,
+    redirect_uri: c.redirectUri,
+    code_verifier: verifier,
+  });
+
+  const res = await fetch(tokenEndpoint, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.id_token) {
+    throw new Error(data.error_description || data.error || `Token exchange failed (${res.status})`);
+  }
+
+  if (expectedEmail) {
+    const payload = decodeJwt(data.id_token) || {};
+    const actualEmail = String(payload.email || "").toLowerCase();
+    if (actualEmail !== expectedEmail.toLowerCase()) {
+      throw new Error(`Signed in as ${actualEmail || "another account"}, expected ${expectedEmail}. Please sign out and try again.`);
+    }
+  }
+  return data.id_token;
+}
+
+async function buildLoginUrl() {
+  const c = state.cognito;
+  const responseType = authResponseType();
+  const loginHint = getLoginHint();
   const qs = new URLSearchParams({
     client_id: c.clientId,
-    response_type: "token",
+    response_type: responseType,
     scope: c.scope || "openid email profile",
     redirect_uri: c.redirectUri,
   });
-  return `https://${c.domain}/login?${qs.toString()}`;
+
+  if (responseType === "code") {
+    const verifier = randomOAuthString();
+    const oauthState = randomOAuthString();
+    setAuthTransactionItem(PKCE_VERIFIER_KEY, verifier);
+    setAuthTransactionItem(OAUTH_STATE_KEY, oauthState);
+    if (loginHint) setAuthTransactionItem(OAUTH_EXPECTED_EMAIL_KEY, loginHint.toLowerCase());
+    else removeAuthTransactionItem(OAUTH_EXPECTED_EMAIL_KEY);
+    qs.set("code_challenge", await pkceChallenge(verifier));
+    qs.set("code_challenge_method", "S256");
+    qs.set("state", oauthState);
+  }
+  if (loginHint) qs.set("login_hint", loginHint);
+
+  return `https://${hostedUiDomain()}/login?${qs.toString()}`;
 }
 
 function buildLogoutUrl() {
   const c = state.cognito;
   const qs = new URLSearchParams({
     client_id: c.clientId,
-    logout_uri: c.redirectUri,
+    logout_uri: c.logoutUri || c.redirectUri,
   });
-  return `https://${c.domain}/logout?${qs.toString()}`;
+  return `https://${hostedUiDomain()}/logout?${qs.toString()}`;
 }
 
-function redirectToLogin() {
+async function redirectToLogin() {
   bootText.textContent = "Redirecting to sign in…";
   showBootGate();
-  window.location.assign(buildLoginUrl());
+  window.location.assign(await buildLoginUrl());
 }
 
 function logout() {
-  try {
-    sessionStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* ignore */
-  }
+  clearStoredAuth();
   state.idToken = null;
   window.location.assign(buildLogoutUrl());
 }
 
 /** Resolve auth on boot. Returns true if we have a valid token. */
-function resolveAuth() {
+async function resolveAuth() {
   // 1) hash (fresh login callback)
   let token = readTokenFromHash();
-  // 2) sessionStorage
+  // 2) authorization code + PKCE callback
+  if (!token) {
+    const callback = readCodeFromQuery();
+    if (callback?.code) token = await exchangeCodeForToken(callback.code, callback.state);
+  }
+  // 3) sessionStorage
   if (!token) {
     try {
       token = sessionStorage.getItem(TOKEN_KEY);
@@ -149,11 +295,7 @@ function resolveAuth() {
   }
 
   // No valid token.
-  try {
-    sessionStorage.removeItem(TOKEN_KEY);
-  } catch {
-    /* ignore */
-  }
+  clearStoredAuth();
   state.idToken = null;
   return false;
 }
@@ -171,13 +313,9 @@ async function apiFetch(path, options = {}) {
 
   if (res.status === 401 || res.status === 403) {
     // Token rejected/expired -> clear and re-login.
-    try {
-      sessionStorage.removeItem(TOKEN_KEY);
-    } catch {
-      /* ignore */
-    }
+    clearStoredAuth();
     state.idToken = null;
-    redirectToLogin();
+    void redirectToLogin();
     // Throw so callers stop processing; redirect is already underway.
     throw new Error("Unauthorized");
   }
@@ -1407,8 +1545,18 @@ async function boot() {
     return;
   }
 
-  if (!resolveAuth()) {
-    redirectToLogin();
+  let authenticated = false;
+  try {
+    authenticated = await resolveAuth();
+  } catch (err) {
+    console.error(err);
+    clearStoredAuth();
+    bootText.textContent = "Sign-in failed. Please try again.";
+    return;
+  }
+
+  if (!authenticated) {
+    await redirectToLogin();
     return;
   }
 

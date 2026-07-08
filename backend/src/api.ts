@@ -41,12 +41,17 @@ const ATTACHMENT_BUCKET = process.env.ATTACHMENT_BUCKET ?? "";
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES ?? "0");
 const NETSUITE_QUEUE_URL = process.env.NETSUITE_QUEUE_URL ?? "";
 const NETSUITE_LIVE_PUSH_ENABLED = process.env.NETSUITE_LIVE_PUSH_ENABLED === "true";
+const REQUIRED_GROUPS = new Set(["invoice", "invoice-admin"]);
 const s3 = new S3Client({});
 const sqs = new SQSClient({});
 
 export const handler = async (
   event: APIGatewayProxyEventV2
 ): Promise<APIGatewayProxyResultV2> => {
+  if (!hasAppAccess(event)) {
+    return jsonResponse({ message: "Invoice Ingestion access is required." }, 403);
+  }
+
   const path = event.rawPath ?? "";
   if (path === "/stats" && event.requestContext.http.method === "GET") {
     return getStats();
@@ -630,6 +635,30 @@ function jsonResponse(body: any, statusCode = 200): APIGatewayProxyResultV2 {
 function actorFromEvent(event: APIGatewayProxyEventV2): string | undefined {
   const claims = (event.requestContext as any)?.authorizer?.jwt?.claims ?? {};
   return claims.email || claims["cognito:username"] || claims.sub;
+}
+
+function hasAppAccess(event: APIGatewayProxyEventV2): boolean {
+  const claims = (event.requestContext as any)?.authorizer?.jwt?.claims ?? {};
+  return claimGroups(claims["cognito:groups"]).some((group) => REQUIRED_GROUPS.has(group));
+}
+
+function claimGroups(value: unknown): string[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch {
+      // Fall through to Cognito/API Gateway delimiter formats.
+    }
+    const normalized = value.startsWith("[") && value.endsWith("]") ? value.slice(1, -1) : value;
+    return normalized
+      .split(/[,\s]+/)
+      .map((part) => part.trim().replace(/^['"]|['"]$/g, ""))
+      .filter(Boolean);
+  }
+  return [];
 }
 
 function withDerivedFlow(item: any) {

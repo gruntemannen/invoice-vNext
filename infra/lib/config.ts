@@ -1,4 +1,38 @@
-export const config = {
+export interface CognitoAuthConfig {
+  /**
+   * Optional external/shared Cognito issuer, for example:
+   * https://cognito-idp.eu-central-1.amazonaws.com/eu-central-1_Example
+   */
+  issuer?: string;
+  region?: string;
+  userPoolId?: string;
+  clientId?: string;
+  /**
+   * Hosted UI domain host without path, for example:
+   * entirely-invoice.auth.eu-central-1.amazoncognito.com
+   */
+  domain?: string;
+  scope?: string;
+  responseType?: "token" | "code";
+}
+
+export interface InvoiceConfig {
+  memberAccountName: string;
+  memberAccountEmail: string;
+  managementAccountId: string;
+  region: string;
+  projectPrefix: string;
+  bedrockModelId: string;
+  maxUploadBytes: number;
+  dataRetentionDays: number;
+  extractReservedConcurrency: number;
+  viesLookupEnabled: boolean;
+  viesRequestTimeoutMs: number;
+  netSuiteLivePushEnabled: boolean;
+  cognito?: CognitoAuthConfig;
+}
+
+export const config: InvoiceConfig = {
   memberAccountName: "invoice-extractor",
   memberAccountEmail: "your-email@company.com",
   managementAccountId: "YOUR_MGMT_ACCOUNT_ID",
@@ -36,4 +70,16 @@ export const config = {
   // Live NetSuite pushes are disabled by default. When false, API requests still create a
   // durable transaction log record that can be replayed after credentials/config are ready.
   netSuiteLivePushEnabled: false,
+
+  // Optional shared Cognito override. Leave unset to keep creating and using the stack-owned
+  // eu-west-1 admin pool/client. For the future shared Frankfurt pool, set these values here
+  // or pass equivalent CDK context values (see README).
+  //
+  // cognito: {
+  //   region: "eu-central-1",
+  //   userPoolId: "eu-central-1_...",
+  //   clientId: "...",
+  //   domain: "....auth.eu-central-1.amazoncognito.com",
+  //   responseType: "code",
+  // },
 };

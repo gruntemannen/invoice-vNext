@@ -1038,6 +1038,53 @@ a:hover {
   color: var(--muted);
   overflow-wrap: anywhere;
 }
+.approval-change-list {
+  display: grid;
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.approval-change {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.8fr) minmax(120px, 1fr) minmax(100px, 1fr) minmax(120px, 1.2fr);
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+.approval-change:last-child {
+  border-bottom: 0;
+}
+.approval-change-head {
+  background: var(--surface-2);
+  color: var(--faint);
+  font-size: 0.66rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.approval-note-field {
+  margin-top: 22px;
+}
+.approval-note-field textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 78px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+}
+.approval-note-field textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
 .json-box {
   margin: 0;
   background: #000000;
@@ -1143,6 +1190,12 @@ a:hover {
   }
   .duplicate-match {
     grid-template-columns: 1fr;
+  }
+  .approval-change {
+    grid-template-columns: 1fr;
+  }
+  .approval-change-head {
+    display: none;
   }
   .drawer-foot .button.danger {
     margin-right: 0;

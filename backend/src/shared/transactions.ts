@@ -1,5 +1,5 @@
 import { GetCommand, PutCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { docClient } from "./dynamo";
 
 export type NetSuiteTransactionStatus =
@@ -65,23 +65,29 @@ export interface CreateNetSuiteTransactionInput {
   eventMessage: string;
 }
 
+export interface CreateNetSuiteTransactionResult {
+  transaction: NetSuiteTransaction;
+  created: boolean;
+}
+
 const TX_SORT_KEY = "TRANSACTION";
 
 export function canReplay(status?: string): boolean {
   return (
     status === "FAILED_RETRYABLE" ||
-    status === "HELD_FOR_CONFIGURATION" ||
-    status === "HELD_FOR_REVIEW" ||
-    status === "FAILED_PERMANENT"
+    status === "HELD_FOR_CONFIGURATION"
   );
 }
 
 export async function createNetSuiteTransaction(
   tableName: string,
   input: CreateNetSuiteTransactionInput
-): Promise<NetSuiteTransaction> {
+): Promise<CreateNetSuiteTransactionResult> {
   const now = new Date().toISOString();
-  const transactionId = `ns-${randomUUID()}`;
+  const transactionId = buildInvoiceTransactionId(
+    input.invoiceMessageId,
+    input.invoiceAttachmentKey
+  );
   const item: NetSuiteTransaction = {
     messageId: `TX#${transactionId}`,
     attachmentKey: TX_SORT_KEY,
@@ -117,15 +123,32 @@ export async function createNetSuiteTransaction(
     ],
   };
 
-  await docClient.send(
-    new PutCommand({
-      TableName: tableName,
-      Item: stripUndefined(item) as Record<string, any>,
-      ConditionExpression: "attribute_not_exists(messageId)",
-    })
-  );
+  try {
+    await docClient.send(
+      new PutCommand({
+        TableName: tableName,
+        Item: stripUndefined(item) as Record<string, any>,
+        ConditionExpression: "attribute_not_exists(messageId)",
+      })
+    );
+    return { transaction: item, created: true };
+  } catch (error: any) {
+    if (error?.name !== "ConditionalCheckFailedException") throw error;
+    const existing = await getNetSuiteTransaction(tableName, transactionId);
+    if (!existing) throw error;
+    return { transaction: existing, created: false };
+  }
+}
 
-  return item;
+export function buildInvoiceTransactionId(
+  invoiceMessageId: string,
+  invoiceAttachmentKey: string
+): string {
+  const digest = createHash("sha256")
+    .update(`${invoiceMessageId}\n${invoiceAttachmentKey}`)
+    .digest("hex")
+    .slice(0, 32);
+  return `ns-${digest}`;
 }
 
 function stripUndefined(value: unknown): unknown {
@@ -215,6 +238,66 @@ export async function markTransactionQueued(
     ...(replay ? { replayCountIncrement: 1 } : {}),
     event,
   });
+}
+
+export async function refreshHeldNetSuiteTransaction(
+  tableName: string,
+  transactionId: string,
+  update: {
+    status: "HELD_FOR_REVIEW" | "HELD_FOR_CONFIGURATION" | "QUEUED";
+    requestPayload: unknown;
+    validation?: unknown;
+    flow?: unknown;
+    warnings?: string[];
+    message: string;
+  }
+) {
+  const now = new Date().toISOString();
+  await docClient.send(
+    new UpdateCommand({
+      TableName: tableName,
+      Key: { messageId: `TX#${transactionId}`, attachmentKey: TX_SORT_KEY },
+      UpdateExpression:
+        "SET #status = :status, #updatedAt = :updatedAt, #transactionStatusPk = :statusPk, " +
+        "#transactionStatusSk = :statusSk, #requestPayload = :requestPayload, #validation = :validation, " +
+        "#flow = :flow, #warnings = :warnings, #events = list_append(if_not_exists(#events, :emptyEvents), :event)",
+      ConditionExpression:
+        "attribute_exists(messageId) AND #status IN (:heldReview, :heldConfig, :failedPermanent)",
+      ExpressionAttributeNames: {
+        "#status": "status",
+        "#updatedAt": "updatedAt",
+        "#transactionStatusPk": "transactionStatusPk",
+        "#transactionStatusSk": "transactionStatusSk",
+        "#requestPayload": "requestPayload",
+        "#validation": "validation",
+        "#flow": "flow",
+        "#warnings": "warnings",
+        "#events": "events",
+      },
+      ExpressionAttributeValues: {
+        ":status": update.status,
+        ":updatedAt": now,
+        ":statusPk": statusPk(update.status),
+        ":statusSk": `${now}#${transactionId}`,
+        ":requestPayload": stripUndefined(update.requestPayload),
+        ":validation": stripUndefined(update.validation ?? {}),
+        ":flow": stripUndefined(update.flow ?? {}),
+        ":warnings": stripUndefined(update.warnings ?? []),
+        ":event": [
+          {
+            at: now,
+            type: "REFRESHED_AFTER_REVIEW",
+            status: update.status,
+            message: update.message,
+          },
+        ],
+        ":emptyEvents": [],
+        ":heldReview": "HELD_FOR_REVIEW",
+        ":heldConfig": "HELD_FOR_CONFIGURATION",
+        ":failedPermanent": "FAILED_PERMANENT",
+      },
+    })
+  );
 }
 
 export async function markTransactionInFlight(tableName: string, transactionId: string) {

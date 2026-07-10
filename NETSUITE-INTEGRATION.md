@@ -29,17 +29,20 @@ Unsupported tax IDs are skipped with metadata. Lookup outages/timeouts are logge
 metadata, but they do not fail extraction or prevent later NetSuite replay. Review warnings are
 raised for invalid VATs or explicit registry match mismatches.
 
-## Vendor Master Sync
+## Vendor Master Approval Workflow
 
-When a logged NetSuite AP transaction is processed with live push enabled, the worker now performs
-a conservative vendor-master compare before creating/updating the AP record:
+When a completed invoice has a resolved vendor internal ID, the worker performs a conservative,
+read-only vendor-master comparison independently of whether the invoice itself is ready to post:
 
 1. Use the resolved vendor internal id from the transaction payload.
 2. Fetch the NetSuite `vendor` record through the REST Record API.
 3. Compare mapped extracted/VAT-validation fields against the current vendor record.
-4. PATCH only fields that are blank in NetSuite, unless `vendorSync.missingOnly` is explicitly
-   set to `false`.
-5. Store the sync result on the durable NetSuite transaction as `vendorSyncResult`.
+4. Store differences as a `VENDOR_MASTER_APPROVAL` item containing current and proposed values.
+5. Wait for an authenticated admin to approve or reject the proposal in the UI.
+6. After approval, queue the durable operation and PATCH the vendor. Rejected proposals are never
+   sent and remain visible as audit history.
+
+Only blank NetSuite fields are proposed unless `vendorSync.missingOnly` is explicitly `false`.
 
 The default map only fills standard `companyName` and `email`. VAT and bank details vary by
 NetSuite account, so map those to account-specific entity/custom fields in
@@ -74,8 +77,11 @@ PDF/email/upload
   -> NetSuite push envelope
        recordType: vendorBill | vendorPrepayment
        payload: clean NetSuite REST body
-  -> durable transaction outbox
-  -> optional live worker push by externalId
+  -> deterministic durable transaction outbox
+       ready -> optional live worker push by externalId
+       review -> held, never pushed by replay
+  -> read-only vendor comparison
+       changes -> admin approval queue -> approved PATCH
 ```
 
 - `GET /invoices/{messageId}/{attachmentId}/netsuite` returns
@@ -85,8 +91,12 @@ PDF/email/upload
   `externalId`, document classification, business-unit routing, and payload.
 - `configurationHints` lists the exact `netsuite-config.json` paths that need NetSuite
   internal IDs before live push can be enabled.
-- `POST /invoices/{messageId}/{attachmentId}/netsuite/transactions` writes the transaction
-  ledger record before any NetSuite call is queued.
+- Extraction automatically writes the transaction ledger record before any NetSuite call is
+  queued. `POST /invoices/{messageId}/{attachmentId}/netsuite/transactions` returns or refreshes
+  that deterministic record rather than creating duplicates.
+- `GET /approvals?status=PENDING` returns duplicate and vendor-master approvals.
+- `POST /approvals/{approvalId}/decision` stores the reviewer decision and queues an approved
+  vendor update or recalculates an approved duplicate invoice.
 - Replay endpoints support outage recovery:
   `GET /netsuite/transactions`,
   `POST /netsuite/transactions/{transactionId}/replay`, and
@@ -169,17 +179,19 @@ with no fallback emits a NetSuite warning and keeps the invoice in review.
 Duplicate detection hashes vendor, invoice number, currency, and gross total. A match creates a
 `potential_duplicate` blocker and keeps the invoice in AP review by default.
 
-Admins can save one of two invoice-level decisions from the detail drawer:
+Every detected duplicate creates a pending item in the shared approval queue. Admins can make one
+of two final decisions from the queue or invoice detail:
 
-- `HOLD_FOR_REVIEW`: keep the duplicate blocker active. This is the default when no admin
-  decision exists.
+- `REJECT_NETSUITE`: keep the blocker active permanently and record that the duplicate must not
+  be sent to NetSuite.
 - `ALLOW_NETSUITE`: record who approved the duplicate and when, clear only the duplicate blocker,
   and allow the invoice to proceed if no other blockers or warnings remain.
 
-The decision is stored on `extractedJson.meta.duplicateReview` and mirrored on the invoice row.
-NetSuite preview and transaction logging both recompute the AP flow from the stored decision, so
-a duplicate that is still held logs as `HELD_FOR_REVIEW`, while an allowed duplicate can be queued
-when validation, configuration, and live-push settings permit it.
+Before a decision, the invoice remains `HOLD_FOR_REVIEW`. The decision, reviewer, timestamp, and
+note are stored on `extractedJson.meta.duplicateReview` and in the approval record. Approval
+refreshes the existing outbox payload and recomputes every AP control; it does not bypass PO,
+mapping, validation, or other warnings. `HELD_FOR_REVIEW` transactions cannot be submitted through
+the replay endpoint, so rejected and undecided duplicates remain blocked.
 
 ## Configuration
 
@@ -221,24 +233,27 @@ credentials are never stored in DynamoDB or `netsuite-config.json`.
 
 ## Durable Outbox And Replay
 
-NetSuite pushes are database-first:
+NetSuite pushes are database-first and autonomous:
 
-1. The API builds the NetSuite push envelope.
-2. The API writes a `NETSUITE_TRANSACTION` item to DynamoDB.
-3. Only after the transaction is logged does the API enqueue the NetSuite worker.
+1. Extraction builds the NetSuite push envelope.
+2. Extraction writes one deterministic `NETSUITE_TRANSACTION` item to DynamoDB.
+3. Only after the transaction is logged, and only when all controls pass, is the worker queued.
 4. The worker marks the transaction `IN_FLIGHT`, calls NetSuite by idempotent `externalId`,
    then records `SUCCEEDED`, `FAILED_RETRYABLE`, or `FAILED_PERMANENT`.
 5. Retryable outage failures remain queryable and replayable even if SQS later DLQs the message.
 
 Transaction statuses:
 
-- `HELD_FOR_REVIEW`: extracted or mapped data is not ready for NetSuite.
+- `HELD_FOR_REVIEW`: extracted or mapped data is not ready for NetSuite; direct replay is blocked.
 - `HELD_FOR_CONFIGURATION`: live push is disabled; transaction is logged for later replay.
 - `QUEUED`: logged and queued.
 - `IN_FLIGHT`: worker attempt is active.
 - `SUCCEEDED`: NetSuite upsert completed.
 - `FAILED_RETRYABLE`: outage/rate-limit/network/server failure; safe to replay.
-- `FAILED_PERMANENT`: validation/auth/client failure that needs correction before replay.
+- `FAILED_PERMANENT`: validation/auth/client failure that must be corrected and revalidated.
+
+Approval records use `PENDING`, `APPROVED`, `REJECTED`, `APPLYING`, `APPLIED`,
+`FAILED_RETRYABLE`, and `FAILED_PERMANENT`. Only approved vendor changes are writable operations.
 
 ## NetSuite Account Setup
 

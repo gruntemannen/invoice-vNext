@@ -15,19 +15,20 @@ Invoice Extractor currently provides:
 - PDF invoice intake from Amazon SES email or authenticated browser upload.
 - Direct PDF extraction with Claude Sonnet 4.6 on Amazon Bedrock.
 - DynamoDB persistence for source metadata, extracted JSON, confidence, review flags,
-  duplicate fingerprints, NetSuite runtime settings, and NetSuite transaction logs.
+  duplicate fingerprints, approval decisions, NetSuite runtime settings, and transaction logs.
 - EU/Northern Ireland VAT validation through the European Commission VIES API.
 - Swiss `CHE... MWST/TVA/IVA` VAT validation through the Swiss UID PublicServices endpoint.
 - AP review controls for missing data, low confidence, duplicates, PO matching, non-standard
   documents, proformas, and vendor bank details.
-- Admin duplicate handling: hold duplicate invoices for review or allow a reviewed duplicate to
-  continue to NetSuite.
+- Unified admin approval queue for duplicate invoices and proposed vendor-master changes.
+- Duplicate decisions: reject the duplicate or approve it for NetSuite without clearing unrelated
+  validation controls.
 - NetSuite AP payload generation for `vendorBill` and `vendorPrepayment`.
 - Runtime NetSuite endpoint configuration for Test and Prod in the admin console.
-- Durable NetSuite transaction logging before any live push attempt.
+- Automatic, deterministic NetSuite transaction logging after every completed extraction.
 - Replay endpoints for NetSuite outages or retryable failures.
-- Optional live NetSuite worker with OAuth 2.0 M2M, idempotent upsert, and vendor-master
-  compare/fill for configured missing fields.
+- Optional live NetSuite worker with OAuth 2.0 M2M and idempotent invoice upsert.
+- Read-only vendor comparison followed by an admin-approved vendor PATCH workflow.
 
 Live NetSuite push is deliberately controlled by `netSuiteLivePushEnabled`. With the default
 `false`, the app still logs NetSuite transactions and keeps them replayable, but the worker does
@@ -48,12 +49,14 @@ Processing:
       -> EU VIES or Swiss UID VAT validation
       -> duplicate lookup + AP control flags
       -> DynamoDB invoice record
+      -> deterministic NetSuite outbox record
+      -> duplicate approval item when required
 
 Review and integration:
   CloudFront PWA -> Cognito Hosted UI -> JWT-protected API Lambda
       -> invoice audit/detail/download/delete
+      -> unified duplicate/vendor approval queue
       -> NetSuite preview
-      -> durable NetSuite transaction log
       -> optional NetSuite worker push
       -> replay after outage
 ```
@@ -76,17 +79,19 @@ Review and integration:
    - Unsupported tax IDs are skipped with metadata rather than failing extraction.
 8. Duplicate detection hashes vendor, invoice number, currency, and gross total, then checks a
    sparse DynamoDB duplicate index.
-9. Duplicate invoices are held for AP review by default. An admin can mark the duplicate as
-   allowed for NetSuite; this clears only the duplicate blocker, not unrelated validation issues.
+9. Duplicate invoices create a pending approval item and remain blocked. An admin can reject the
+   duplicate or approve it for NetSuite; approval clears only the duplicate blocker.
 10. The AP flow assigns `READY_FOR_NETSUITE` or `NEEDS_REVIEW` and stores reader-facing control
    flags.
-11. The admin console lets AP review the record, download the PDF, preview NetSuite, log a
-    NetSuite transaction, or delete the invoice and PDF.
-12. NetSuite transaction logging writes a `NETSUITE_TRANSACTION` item before anything is queued.
-13. If live push is enabled and the item is ready/configured, the NetSuite worker fetches the
-    transaction, optionally fills configured missing vendor-master fields, performs the idempotent
-    NetSuite upsert, and records success or failure events.
-14. Retryable failures can be replayed individually or in bulk after NetSuite recovers.
+11. The Extract Lambda automatically writes one deterministic `NETSUITE_TRANSACTION` item. A
+    ready invoice is queued; other invoices are stored as held and remain replayable/auditable.
+12. If live push is enabled, vendor data is compared read-only against NetSuite independently of
+    invoice readiness. Proposed changes create a vendor approval item; no vendor PATCH occurs yet.
+13. The admin approval queue shows duplicate evidence and current/proposed vendor field values.
+14. Approved vendor changes are queued and PATCHed by the worker. Rejected changes are retained
+    as audit history and never sent.
+15. Ready invoices are upserted idempotently by external ID. Retryable outage failures can be
+    replayed after NetSuite recovers.
 
 ## Key Components
 
@@ -98,8 +103,11 @@ Review and integration:
 - `backend/src/shared/vies.ts`: EU VIES and Swiss UID VAT validation.
 - `backend/src/shared/flow.ts`: AP review status, auto-book eligibility, and control flags.
 - `backend/src/shared/netsuite.ts`: NetSuite transform, validation, OAuth, SuiteQL, live upsert,
-  business-unit routing, and vendor-master sync.
+  business-unit routing, and vendor-master compare/apply helpers.
+- `backend/src/shared/netsuite-outbox.ts`: automatic deterministic invoice outbox orchestration.
 - `backend/src/shared/transactions.ts`: durable NetSuite outbox, status model, and replay helpers.
+- `backend/src/shared/vendor-approvals.ts`: unified duplicate/vendor approval persistence and
+  state transitions.
 - `backend/src/api.ts`: authenticated API endpoints for audit, upload, config, NetSuite preview,
   transaction logging, and replay.
 - `infra/`: AWS CDK app for buckets, queues, table, Lambdas, API Gateway, Cognito, CloudFront,
@@ -116,7 +124,9 @@ Views:
 - **Dashboard**: totals, success rate, completed/failed/pending counts, average confidence,
   30-day trend, and recent failures.
 - **Audit**: searchable invoice records with detail drawer, extracted JSON, VAT status, control
-  flags, NetSuite preview, durable transaction logging, PDF download, and delete.
+  flags, NetSuite preview, transaction status, PDF download, and delete.
+- **Approvals**: pending and historical duplicate-invoice and vendor-master decisions, including
+  decision evidence, reviewer, timestamp, and note.
 - **Upload**: PDF-only upload through presigned S3 PUT.
 - **Config**: Test and Prod NetSuite endpoint settings.
 
@@ -148,7 +158,7 @@ Implemented:
 - OAuth 2.0 M2M JWT client assertion.
 - SuiteQL helper.
 - Idempotent REST upsert by external ID.
-- Vendor-master compare/fill before AP push when `vendorSync` is configured.
+- Read-only vendor-master comparison and admin-approved updates when `vendorSync` is configured.
 - Durable transaction outbox and replay endpoints.
 
 Default live behavior:
@@ -187,9 +197,11 @@ in AWS Secrets Manager, either from the environment-specific Config value or the
 
 ## Vendor Master Sync
 
-When a live NetSuite transaction has a resolved vendor internal ID, the worker can fetch the
-NetSuite vendor record and fill configured blank fields. It does not overwrite populated fields
-unless `vendorSync.missingOnly` is set to `false`.
+When an invoice has a resolved vendor internal ID, the worker can fetch and compare the NetSuite
+vendor record. Differences are stored in the approval queue with current and proposed values.
+The worker PATCHes the vendor only after an admin approves the proposal. Rejection is final and
+audited. By default only blank NetSuite fields are proposed; populated fields are considered only
+when `vendorSync.missingOnly` is set to `false`.
 
 Supported source fields:
 
@@ -205,7 +217,7 @@ Supported source fields:
 
 The default mapping is intentionally conservative: `name -> companyName` and `email -> email`.
 VAT, bank, and custom entity fields must be mapped to account-specific NetSuite field IDs before
-live updates.
+approved updates.
 
 ## Deployment
 
@@ -335,11 +347,14 @@ Every API route requires `Authorization: Bearer <id_token>`.
 | `DELETE` | `/invoices/{messageId}/{attachmentId}` | Delete invoice row and PDF. |
 | `GET` | `/invoices/{messageId}/{attachmentId}/download` | Return a 15-minute presigned PDF URL. |
 | `POST` | `/upload` | Create a presigned PDF upload URL. |
-| `POST` | `/invoices/{messageId}/{attachmentId}/duplicate-review` | Save `HOLD_FOR_REVIEW` or `ALLOW_NETSUITE` for a duplicate invoice. |
+| `POST` | `/invoices/{messageId}/{attachmentId}/duplicate-review` | Save a duplicate hold, approval, or rejection decision. |
+| `GET` | `/approvals?status=PENDING` | List the unified duplicate/vendor approval queue. |
+| `POST` | `/approvals/{approvalId}/decision` | Approve or reject a pending approval with an optional note. |
+| `POST` | `/approvals/{approvalId}/replay` | Retry an approved vendor update after a retryable failure. |
 | `GET` | `/config/netsuite` | Read NetSuite Test/Prod runtime settings. |
 | `POST` | `/config/netsuite` | Save NetSuite Test/Prod runtime settings. |
 | `GET` | `/invoices/{messageId}/{attachmentId}/netsuite` | Build NetSuite preview, validation, and config hints. |
-| `POST` | `/invoices/{messageId}/{attachmentId}/netsuite/transactions` | Log a durable NetSuite transaction and optionally queue live push. |
+| `POST` | `/invoices/{messageId}/{attachmentId}/netsuite/transactions` | Return/refresh the invoice's deterministic transaction and queue it when eligible. |
 | `GET` | `/netsuite/transactions?status=FAILED_RETRYABLE` | List NetSuite transaction log rows. |
 | `POST` | `/netsuite/transactions/{transactionId}/replay` | Replay one replayable transaction. |
 | `POST` | `/netsuite/transactions/replay?status=FAILED_RETRYABLE&limit=25` | Bulk replay replayable transactions. |
@@ -441,8 +456,10 @@ Important extraction rules:
 - `lineItems.amount` and `lineItems.unitPrice` are net/pre-tax.
 - Proformas set `invoice.transactionIntent` to `VendorPrepayment`.
 - `purchaseOrderNumber` preserves the invoice text; `purchaseOrderLookupKey` is only for matching.
-- Duplicate invoices default to `HOLD_FOR_REVIEW`; `ALLOW_NETSUITE` is an admin decision stored
-  with timestamp and reviewer.
+- Duplicate invoices default to `HOLD_FOR_REVIEW` and enter the approval queue. Admin decisions
+  are `ALLOW_NETSUITE` or `REJECT_NETSUITE`, stored with timestamp, reviewer, and optional note.
+- Rejected duplicates and all other `HELD_FOR_REVIEW` transactions cannot be pushed through the
+  replay API. Approval recalculates the full invoice flow before a transaction can be queued.
 - Vendor names remain in the original language/script.
 
 ## Operations

@@ -8,6 +8,8 @@ import { assessInvoiceFlow, buildDuplicateKey, summarizeDuplicateMatch } from ".
 import { enrichExtractionWithVatLookup } from "./shared/vies";
 import { log } from "./shared/logger";
 import { emitMetric } from "./shared/metrics";
+import { ensureInvoiceNetSuiteTransaction } from "./shared/netsuite-outbox";
+import { createDuplicateInvoiceApproval } from "./shared/vendor-approvals";
 
 const ATTACHMENT_BUCKET = process.env.ATTACHMENT_BUCKET ?? "";
 const TABLE_NAME = process.env.TABLE_NAME ?? "";
@@ -18,6 +20,8 @@ const VIES_LOOKUP_ENABLED = process.env.VIES_LOOKUP_ENABLED !== "false";
 const VIES_API_BASE_URL = process.env.VIES_API_BASE_URL;
 const SWISS_UID_API_BASE_URL = process.env.SWISS_UID_API_BASE_URL;
 const VIES_TIMEOUT_MS = Number(process.env.VIES_TIMEOUT_MS ?? "6000");
+const NETSUITE_QUEUE_URL = process.env.NETSUITE_QUEUE_URL ?? "";
+const NETSUITE_LIVE_PUSH_ENABLED = process.env.NETSUITE_LIVE_PUSH_ENABLED === "true";
 
 export const handler = async (event: SQSEvent) => {
   for (const record of event.Records) {
@@ -172,6 +176,51 @@ export const handler = async (event: SQSEvent) => {
         { messageId, attachmentKey },
         updates
       );
+
+      // 11. Duplicate invoices enter the shared approval queue before any NetSuite push.
+      if (duplicateMatches.length > 0) {
+        await createDuplicateInvoiceApproval(TABLE_NAME, {
+          invoiceMessageId: messageId,
+          invoiceAttachmentKey: attachmentKey,
+          invoiceAttachmentId: attachmentId,
+          vendorName: normalized.vendor?.name ?? undefined,
+          vendorTaxId: normalized.vendor?.taxId ?? undefined,
+          invoiceNumber: normalized.invoice?.invoiceNumber ?? undefined,
+          currency: normalized.invoice?.currency ?? undefined,
+          totalAmount: normalized.invoice?.totalAmount ?? undefined,
+          duplicateMatches,
+        });
+      }
+
+      // 12. Every completed extraction gets one deterministic outbox record. Ready
+      // invoices are queued; review/configuration cases remain durable and replayable.
+      try {
+        const outbox = await ensureInvoiceNetSuiteTransaction({
+          tableName: TABLE_NAME,
+          queueUrl: NETSUITE_QUEUE_URL,
+          livePushEnabled: NETSUITE_LIVE_PUSH_ENABLED,
+          item: { messageId, attachmentKey, attachmentId, ...updates },
+        });
+        emitMetric("NetSuiteOutboxCreated", outbox.created ? 1 : 0, "Count");
+        log.info("NetSuite outbox ensured", {
+          messageId,
+          transactionId: outbox.transaction.transactionId,
+          status: outbox.transaction.status,
+          created: outbox.created,
+        });
+      } catch (outboxError: any) {
+        const message = outboxError?.message ?? String(outboxError);
+        await updateItem(
+          TABLE_NAME,
+          { messageId, attachmentKey },
+          {
+            netSuiteAutomationError: message,
+            netSuiteTransactionUpdatedAt: new Date().toISOString(),
+          }
+        );
+        emitMetric("NetSuiteOutboxFailure", 1, "Count");
+        log.error("Automatic NetSuite outbox failed", { messageId, attachmentKey, error: message });
+      }
 
       emitMetric("ExtractionSuccess", 1, "Count", { Model: modelUsed });
       emitMetric("ExtractionDurationMs", Date.now() - startTime, "Milliseconds");

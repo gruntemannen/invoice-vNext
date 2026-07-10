@@ -39,6 +39,9 @@
           <button class="nav-item" data-view="audit">
             <span class="nav-ico" aria-hidden="true">▤</span> Audit
           </button>
+          <button class="nav-item" data-view="approvals">
+            <span class="nav-ico" aria-hidden="true">AP</span> Approvals
+          </button>
           <button class="nav-item" data-view="upload">
             <span class="nav-ico" aria-hidden="true">↥</span> Upload
           </button>
@@ -148,6 +151,48 @@
             </div>
           </section>
 
+          <!-- ============ APPROVALS ============ -->
+          <section id="view-approvals" class="view hidden">
+            <div id="approvals-error" class="banner error hidden"></div>
+
+            <div class="toolbar">
+              <div>
+                <h2>Approval queue</h2>
+                <p class="muted">Duplicate invoices and proposed NetSuite vendor updates.</p>
+              </div>
+              <select id="approvals-status" class="select">
+                <option value="PENDING">Pending</option>
+                <option value="APPROVED">Approved</option>
+                <option value="REJECTED">Rejected</option>
+                <option value="APPLIED">Applied</option>
+                <option value="FAILED_RETRYABLE">Retry required</option>
+                <option value="ALL">All statuses</option>
+              </select>
+              <span id="approvals-count" class="muted count-pill">0 items</span>
+            </div>
+
+            <div class="panel no-pad">
+              <div class="table-scroll">
+                <table class="table" id="approvals-table">
+                  <thead>
+                    <tr>
+                      <th>Created</th>
+                      <th>Type</th>
+                      <th>Vendor</th>
+                      <th>Reference</th>
+                      <th>Change</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="approvals-body"></tbody>
+                </table>
+              </div>
+              <div class="table-foot">
+                <button id="approvals-load-more" class="button secondary">Load more</button>
+              </div>
+            </div>
+          </section>
+
           <!-- ============ UPLOAD ============ -->
           <section id="view-upload" class="view hidden">
             <div class="panel narrow">
@@ -232,10 +277,41 @@
 
         <div class="drawer-foot">
           <button id="drawer-delete" class="button danger">Delete</button>
-          <button id="drawer-netsuite-log" class="button secondary">Log transaction</button>
+          <button id="drawer-netsuite-log" class="button secondary">Transaction status</button>
           <button id="drawer-netsuite" class="button secondary">NetSuite preview</button>
           <button id="drawer-download" class="button">Download PDF</button>
           <button id="drawer-dismiss" class="button secondary">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ APPROVAL DRAWER ============ -->
+    <div id="approval-drawer-overlay" class="drawer-overlay hidden">
+      <div class="drawer" role="dialog" aria-modal="true" aria-label="Approval detail">
+        <div class="drawer-head">
+          <div>
+            <h2 id="approval-drawer-title">Approval detail</h2>
+            <div class="drawer-meta" id="approval-drawer-meta"></div>
+          </div>
+          <button id="approval-drawer-close" class="icon-btn" aria-label="Close">✕</button>
+        </div>
+        <div class="drawer-body">
+          <div class="meta-grid" id="approval-fields"></div>
+          <div class="drawer-section">
+            <div class="panel-title" id="approval-evidence-title">Evidence</div>
+            <div id="approval-evidence"></div>
+          </div>
+          <label class="field approval-note-field">
+            <span>Decision note</span>
+            <textarea id="approval-note" rows="3" maxlength="500" placeholder="Optional audit note"></textarea>
+          </label>
+          <div id="approval-decision-status" class="status-text" aria-live="polite"></div>
+        </div>
+        <div class="drawer-foot">
+          <button id="approval-reject" class="button danger">Reject</button>
+          <button id="approval-replay" class="button secondary hidden">Retry update</button>
+          <button id="approval-approve" class="button">Approve</button>
+          <button id="approval-dismiss" class="button secondary">Close</button>
         </div>
       </div>
     </div>

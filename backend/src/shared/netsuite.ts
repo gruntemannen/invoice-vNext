@@ -177,6 +177,23 @@ export interface NetSuiteVendorSyncResult {
   responseBody?: unknown;
 }
 
+export interface NetSuiteVendorComparisonChange {
+  sourceField: NetSuiteVendorSyncSourceField;
+  netSuiteField: string;
+  currentValue?: unknown;
+  proposedValue: string;
+}
+
+export interface NetSuiteVendorComparisonResult {
+  status: "SKIPPED" | "NO_CHANGES" | "CHANGES_PROPOSED";
+  vendorId?: string;
+  recordId?: string;
+  comparedFields?: string[];
+  changes?: NetSuiteVendorComparisonChange[];
+  patch?: Record<string, string>;
+  message?: string;
+}
+
 export interface NetSuiteBusinessUnitRoute {
   /** NetSuite internal id for the business-unit custom segment, if used. */
   businessUnitId?: string;
@@ -1558,12 +1575,54 @@ export async function syncNetSuiteVendorMaster(
   plan: NetSuiteVendorSyncPlan | undefined,
   options?: NetSuiteConnectionOptions
 ): Promise<NetSuiteVendorSyncResult> {
+  const comparison = await compareNetSuiteVendorMaster(secret, token, plan, options);
+  if (comparison.status === "SKIPPED") {
+    return { status: "SKIPPED", message: comparison.message };
+  }
+  if (comparison.status === "NO_CHANGES" || !plan || !comparison.patch) {
+    return {
+      status: "NO_CHANGES",
+      vendorId: comparison.vendorId,
+      recordId: comparison.recordId,
+      comparedFields: comparison.comparedFields,
+      message: comparison.message,
+    };
+  }
+
+  const applied = await applyNetSuiteVendorMasterPatch(
+    secret,
+    token,
+    {
+      vendorId: plan.vendorId,
+      recordId: plan.recordId,
+      patch: comparison.patch,
+    },
+    options
+  );
+  return {
+    status: "UPDATED",
+    vendorId: plan.vendorId,
+    recordId: plan.recordId,
+    comparedFields: comparison.comparedFields,
+    updatedFields: Object.keys(comparison.patch),
+    responseStatus: applied.responseStatus,
+    responseBody: applied.responseBody,
+  };
+}
+
+export async function compareNetSuiteVendorMaster(
+  secret: NetSuiteSecret,
+  token: string,
+  plan: NetSuiteVendorSyncPlan | undefined,
+  options?: NetSuiteConnectionOptions
+): Promise<NetSuiteVendorComparisonResult> {
   if (!plan) {
     return { status: "SKIPPED", message: "No vendor sync plan was attached to this transaction." };
   }
 
   const comparedFields: string[] = [];
   const patch: Record<string, string> = {};
+  const changes: NetSuiteVendorComparisonChange[] = [];
   const recordId = plan.recordId || "vendor";
   const vendorUrl = `${restBase(secret, options)}${recordApiPath(options)}/${encodeURIComponent(
     recordId
@@ -1589,8 +1648,15 @@ export async function syncNetSuiteVendorMaster(
     if (!value) continue;
     comparedFields.push(fieldId);
 
-    if (!plan.missingOnly || isMissingNetSuiteValue(readPath(current, fieldId))) {
+    const currentValue = readPath(current, fieldId);
+    if (!plan.missingOnly || isMissingNetSuiteValue(currentValue)) {
       patch[fieldId] = value;
+      changes.push({
+        sourceField: sourceKey as NetSuiteVendorSyncSourceField,
+        netSuiteField: fieldId,
+        currentValue,
+        proposedValue: value,
+      });
     }
   }
 
@@ -1603,6 +1669,69 @@ export async function syncNetSuiteVendorMaster(
       comparedFields,
       message: "NetSuite vendor already has the mapped values or no mapped source values were present.",
     };
+  }
+
+  return {
+    status: "CHANGES_PROPOSED",
+    vendorId: plan.vendorId,
+    recordId,
+    comparedFields,
+    changes,
+    patch,
+    message: "Mapped invoice and VAT data differs from the NetSuite vendor record and requires approval.",
+  };
+}
+
+export async function applyNetSuiteVendorMasterPatch(
+  secret: NetSuiteSecret,
+  token: string,
+  update: {
+    vendorId: string;
+    recordId?: string;
+    patch: Record<string, string>;
+    expectedChanges?: NetSuiteVendorComparisonChange[];
+  },
+  options?: NetSuiteConnectionOptions
+): Promise<{ responseStatus: number; responseBody: unknown }> {
+  const recordId = update.recordId || "vendor";
+  const vendorUrl = `${restBase(secret, options)}${recordApiPath(options)}/${encodeURIComponent(
+    recordId
+  )}/${encodeURIComponent(update.vendorId)}`;
+  let patch = { ...update.patch };
+
+  if (update.expectedChanges?.length) {
+    const currentRes = await fetchWithTimeout(vendorUrl, {
+      method: "GET",
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/json",
+      },
+    }, options?.requestTimeoutMs);
+    if (!currentRes.ok) {
+      const text = await currentRes.text().catch(() => "");
+      throw new Error(`vendor recheck failed: ${currentRes.status} ${text.slice(0, 500)}`);
+    }
+    const current = await currentRes.json().catch(() => ({}));
+    const conflicts: string[] = [];
+    for (const change of update.expectedChanges) {
+      const currentValue = readPath(current, change.netSuiteField);
+      if (sameNetSuiteValue(currentValue, change.proposedValue)) {
+        delete patch[change.netSuiteField];
+        continue;
+      }
+      if (!sameNetSuiteValue(currentValue, change.currentValue)) {
+        conflicts.push(change.netSuiteField);
+      }
+    }
+    if (conflicts.length) {
+      throw new Error(
+        `vendor changed after approval; review again before updating fields: ${conflicts.join(", ")}`
+      );
+    }
+  }
+
+  if (Object.keys(patch).length === 0) {
+    return { responseStatus: 200, responseBody: { message: "Approved values are already present." } };
   }
 
   const patchRes = await fetchWithTimeout(vendorUrl, {
@@ -1622,14 +1751,17 @@ export async function syncNetSuiteVendorMaster(
 
   const responseText = await patchRes.text().catch(() => "");
   return {
-    status: "UPDATED",
-    vendorId: plan.vendorId,
-    recordId,
-    comparedFields,
-    updatedFields,
     responseStatus: patchRes.status,
     responseBody: responseText ? safeParseJson(responseText) : null,
   };
+}
+
+function sameNetSuiteValue(left: unknown, right: unknown): boolean {
+  if (isMissingNetSuiteValue(left) && isMissingNetSuiteValue(right)) return true;
+  if (typeof left === "object" || typeof right === "object") {
+    return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+  }
+  return String(left ?? "").trim() === String(right ?? "").trim();
 }
 
 function readPath(value: unknown, path: string): unknown {

@@ -2,7 +2,10 @@ import { createHash } from "node:crypto";
 
 export type ControlSeverity = "info" | "warning" | "blocker";
 export type ReviewStatus = "READY_FOR_NETSUITE" | "NEEDS_REVIEW";
-export type DuplicateReviewAction = "HOLD_FOR_REVIEW" | "ALLOW_NETSUITE";
+export type DuplicateReviewAction =
+  | "HOLD_FOR_REVIEW"
+  | "ALLOW_NETSUITE"
+  | "REJECT_NETSUITE";
 
 export interface ControlFlag {
   code: string;
@@ -215,6 +218,14 @@ export function assessInvoiceFlow(
           ? `Duplicate invoice allowed for NetSuite by ${duplicateReview.reviewedBy}.`
           : "Duplicate invoice allowed for NetSuite by AP review.",
       });
+    } else if (duplicateReview?.action === "REJECT_NETSUITE") {
+      flags.push({
+        code: "duplicate_rejected",
+        severity: "blocker",
+        message: duplicateReview.reviewedBy
+          ? `Duplicate invoice rejected by ${duplicateReview.reviewedBy}; it will not be sent to NetSuite.`
+          : "Duplicate invoice rejected by AP; it will not be sent to NetSuite.",
+      });
     } else {
       flags.push({
         code: "potential_duplicate",
@@ -274,6 +285,8 @@ export function normalizeDuplicateReview(value: any): DuplicateReviewDecision | 
   const action =
     value?.action === "ALLOW_NETSUITE"
       ? "ALLOW_NETSUITE"
+      : value?.action === "REJECT_NETSUITE"
+        ? "REJECT_NETSUITE"
       : value?.action === "HOLD_FOR_REVIEW"
         ? "HOLD_FOR_REVIEW"
         : null;

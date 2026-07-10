@@ -15,12 +15,19 @@ const state = {
   cognito: null,
   idToken: null,
   userEmail: null,
+  approvalAdmin: false,
   // audit
   invoices: [],
   nextToken: undefined,
   statusFilter: "ALL",
   searchTerm: "",
   loadingMore: false,
+  // approval queue
+  approvals: [],
+  approvalsNextToken: undefined,
+  approvalsStatus: "PENDING",
+  approvalsLoading: false,
+  currentApproval: null,
   // detail drawer
   currentDetail: null,
   // configuration
@@ -30,6 +37,7 @@ const state = {
 
 const TOKEN_KEY = "invoice_admin_id_token";
 const LANDING_HANDOFF_PARAM = "entirely_id_token";
+const APPROVAL_ADMIN_GROUPS = new Set(["invoice-admin", "admin", "identity-admin"]);
 
 /* ----------------------------- DOM refs -------------------------------- */
 const $ = (id) => document.getElementById(id);
@@ -145,13 +153,28 @@ async function resolveAuth() {
     state.idToken = token;
     const payload = decodeJwt(token) || {};
     state.userEmail = payload.email || payload["cognito:username"] || payload.sub || "Signed in";
+    state.approvalAdmin = tokenGroups(payload).some((group) => APPROVAL_ADMIN_GROUPS.has(group));
     return true;
   }
 
   // No valid token.
   clearStoredAuth();
   state.idToken = null;
+  state.approvalAdmin = false;
   return false;
+}
+
+function tokenGroups(payload) {
+  const value = payload?.["cognito:groups"];
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value === "string") {
+    return value
+      .replace(/^\[|\]$/g, "")
+      .split(/[\s,]+/)
+      .map((group) => group.trim().replace(/^['"]|['"]$/g, ""))
+      .filter(Boolean);
+  }
+  return [];
 }
 
 /* ========================================================================
@@ -241,10 +264,17 @@ function confidenceClass(c) {
 function statusClass(status) {
   switch (status) {
     case "COMPLETED":
+    case "APPROVED":
+    case "APPLIED":
+    case "SUCCEEDED":
       return "ok";
     case "FAILED":
+    case "REJECTED":
+    case "FAILED_RETRYABLE":
+    case "FAILED_PERMANENT":
       return "fail";
     case "PENDING":
+    case "APPLYING":
       return "pending";
     default:
       return "pending";
@@ -322,6 +352,9 @@ function renderDuplicateDecision(d) {
   if (review?.action === "ALLOW_NETSUITE") {
     return `<span class="badge ok">Allow NetSuite</span>`;
   }
+  if (review?.action === "REJECT_NETSUITE") {
+    return `<span class="badge fail">Rejected</span>`;
+  }
   return `<span class="badge pending">Hold for review</span>`;
 }
 
@@ -337,7 +370,9 @@ function renderDuplicateReviewPanel(d) {
   }
 
   const review = duplicateReview(d);
-  const action = review?.action === "ALLOW_NETSUITE" ? "ALLOW_NETSUITE" : "HOLD_FOR_REVIEW";
+  const action = ["ALLOW_NETSUITE", "REJECT_NETSUITE"].includes(review?.action)
+    ? review.action
+    : "HOLD_FOR_REVIEW";
   const matches = duplicateMatches(d).slice(0, 3);
   const reviewed = review?.reviewedAt
     ? `Reviewed ${escapeHtml(fmtDate(review.reviewedAt))}${
@@ -354,10 +389,10 @@ function renderDuplicateReviewPanel(d) {
         </div>
       </div>
       <div class="segmented" role="group" aria-label="Duplicate invoice handling">
-        <button type="button" class="${action === "HOLD_FOR_REVIEW" ? "active" : ""}"
-          data-duplicate-action="HOLD_FOR_REVIEW">Hold for review</button>
+        <button type="button" class="${action === "REJECT_NETSUITE" ? "active" : ""}"
+          data-duplicate-action="REJECT_NETSUITE">Reject duplicate</button>
         <button type="button" class="${action === "ALLOW_NETSUITE" ? "active" : ""}"
-          data-duplicate-action="ALLOW_NETSUITE">Allow NetSuite</button>
+          data-duplicate-action="ALLOW_NETSUITE">Approve for NetSuite</button>
       </div>
     </div>
     ${
@@ -421,7 +456,13 @@ function toast(message, kind = "info") {
    NAVIGATION
    ===================================================================== */
 
-const VIEW_TITLES = { dashboard: "Dashboard", audit: "Audit", upload: "Upload", config: "Configuration" };
+const VIEW_TITLES = {
+  dashboard: "Dashboard",
+  audit: "Audit",
+  approvals: "Approvals",
+  upload: "Upload",
+  config: "Configuration",
+};
 
 function switchView(view) {
   document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
@@ -435,6 +476,7 @@ function switchView(view) {
 
   if (view === "dashboard") loadStats();
   if (view === "audit" && state.invoices.length === 0) loadInvoices(true);
+  if (view === "approvals" && state.approvals.length === 0) loadApprovals(true);
   if (view === "config" && !state.netSuiteSettingsLoaded) loadNetSuiteSettings();
 }
 
@@ -737,6 +779,247 @@ function renderAudit() {
 }
 
 /* ========================================================================
+   APPROVAL QUEUE
+   ===================================================================== */
+
+async function loadApprovals(reset) {
+  if (state.approvalsLoading) return;
+  const errBox = $("approvals-error");
+  if (reset) {
+    state.approvals = [];
+    state.approvalsNextToken = undefined;
+  }
+  state.approvalsLoading = true;
+  const button = $("approvals-load-more");
+  button.disabled = true;
+  button.textContent = "Loading...";
+
+  try {
+    const params = new URLSearchParams({ limit: "50" });
+    if (state.approvalsStatus !== "ALL") params.set("status", state.approvalsStatus);
+    if (state.approvalsNextToken) params.set("nextToken", state.approvalsNextToken);
+    const res = await apiFetch(`/approvals?${params.toString()}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || `Approvals request failed (${res.status})`);
+    state.approvals = state.approvals.concat(data.items || []);
+    state.approvalsNextToken = data.nextToken;
+    errBox.classList.add("hidden");
+    renderApprovals();
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    errBox.textContent = "Could not load the approval queue.";
+    errBox.classList.remove("hidden");
+    renderApprovals();
+  } finally {
+    state.approvalsLoading = false;
+    button.textContent = "Load more";
+    button.disabled = !state.approvalsNextToken;
+    button.classList.toggle("hidden", !state.approvalsNextToken);
+  }
+}
+
+function approvalTypeLabel(item) {
+  return item.approvalType === "DUPLICATE_INVOICE" ? "Duplicate invoice" : "Vendor update";
+}
+
+function approvalReference(item) {
+  if (item.approvalType === "DUPLICATE_INVOICE") return item.invoiceNumber || "Invoice";
+  return item.sourceInvoiceNumber || `Vendor ${item.vendorId || ""}`.trim();
+}
+
+function approvalChangeSummary(item) {
+  if (item.approvalType === "DUPLICATE_INVOICE") {
+    const count = Array.isArray(item.duplicateMatches) ? item.duplicateMatches.length : 0;
+    return `${count} possible match${count === 1 ? "" : "es"}`;
+  }
+  const count = Array.isArray(item.changes) ? item.changes.length : 0;
+  return `${count} vendor field${count === 1 ? "" : "s"}`;
+}
+
+function renderApprovals() {
+  const body = $("approvals-body");
+  $("approvals-count").textContent = `${state.approvals.length} item${state.approvals.length === 1 ? "" : "s"}`;
+  body.innerHTML = "";
+  if (state.approvals.length === 0) {
+    body.innerHTML = `<tr><td colspan="6"><div class="empty">No approvals in this status.</div></td></tr>`;
+    return;
+  }
+
+  state.approvals.forEach((item) => {
+    const tr = document.createElement("tr");
+    tr.className = "row-click";
+    tr.innerHTML = `
+      <td>${escapeHtml(fmtDate(item.createdAt))}</td>
+      <td>${escapeHtml(approvalTypeLabel(item))}</td>
+      <td class="cell-strong">${escapeHtml(item.vendorName || "—")}</td>
+      <td>${escapeHtml(approvalReference(item))}</td>
+      <td>${escapeHtml(approvalChangeSummary(item))}</td>
+      <td><span class="badge ${statusClass(item.status)}">${escapeHtml(item.status || "—")}</span></td>
+    `;
+    tr.onclick = () => openApproval(item.approvalId);
+    body.appendChild(tr);
+  });
+}
+
+function openApproval(approvalId) {
+  const item = state.approvals.find((entry) => entry.approvalId === approvalId);
+  if (!item) return;
+  state.currentApproval = item;
+  $("approval-drawer-title").textContent = approvalTypeLabel(item);
+  $("approval-drawer-meta").textContent = item.approvalId;
+  $("approval-note").value = item.reviewNote || "";
+  $("approval-decision-status").textContent = item.lastError || "";
+
+  const fields = [
+    ["Status", `<span class="badge ${statusClass(item.status)}">${escapeHtml(item.status)}</span>`],
+    ["Vendor", escapeHtml(item.vendorName || "—")],
+    ["VAT number", escapeHtml(item.vendorTaxId || "—")],
+    ["Reference", escapeHtml(approvalReference(item))],
+    ["Created", escapeHtml(fmtDate(item.createdAt))],
+    ["Reviewed by", escapeHtml(item.reviewedBy || "—")],
+  ];
+  if (item.environment) fields.splice(4, 0, ["Environment", escapeHtml(item.environment.toUpperCase())]);
+  $("approval-fields").innerHTML = fields
+    .map(([label, value]) => `
+      <div class="meta-item">
+        <span class="meta-label">${escapeHtml(label)}</span>
+        <span class="meta-value">${value}</span>
+      </div>`)
+    .join("");
+
+  if (item.approvalType === "DUPLICATE_INVOICE") {
+    $("approval-evidence-title").textContent = "Possible duplicate invoices";
+    const matches = Array.isArray(item.duplicateMatches) ? item.duplicateMatches : [];
+    $("approval-evidence").innerHTML = matches.length
+      ? `<div class="duplicate-match-list">${matches.map((match) => `
+          <div class="duplicate-match">
+            <span>${escapeHtml(match.invoiceNumber || "Invoice")}</span>
+            <span>${escapeHtml(match.vendorName || "Unknown vendor")}</span>
+            <span>${escapeHtml(fmtAmount(match.totalAmount, match.currency))}</span>
+            <span>${escapeHtml(fmtDate(match.receivedAt))}</span>
+          </div>`).join("")}</div>`
+      : `<div class="empty">No duplicate details were stored.</div>`;
+  } else {
+    $("approval-evidence-title").textContent = "Proposed NetSuite changes";
+    const changes = Array.isArray(item.changes) ? item.changes : [];
+    $("approval-evidence").innerHTML = changes.length
+      ? `<div class="approval-change-list">
+          <div class="approval-change approval-change-head">
+            <span>Source</span><span>NetSuite field</span><span>Current</span><span>Proposed</span>
+          </div>
+          ${changes.map((change) => `
+            <div class="approval-change">
+              <span>${escapeHtml(change.sourceField || "—")}</span>
+              <span>${escapeHtml(change.netSuiteField || "—")}</span>
+              <span>${escapeHtml(formatApprovalValue(change.currentValue))}</span>
+              <span class="cell-strong">${escapeHtml(formatApprovalValue(change.proposedValue))}</span>
+            </div>`).join("")}
+        </div>`
+      : `<div class="empty">No field changes were stored.</div>`;
+  }
+
+  const pending = item.status === "PENDING" && state.approvalAdmin;
+  $("approval-note").disabled = !pending;
+  $("approval-reject").classList.toggle("hidden", !pending);
+  $("approval-approve").classList.toggle("hidden", !pending);
+  const replayable = state.approvalAdmin && (item.approvalType === "VENDOR_MASTER"
+    ? ["APPROVED", "FAILED_RETRYABLE"].includes(item.status)
+    : item.status === "APPROVED");
+  $("approval-replay").classList.toggle("hidden", !replayable);
+  if (!state.approvalAdmin && item.status === "PENDING") {
+    $("approval-decision-status").textContent = "An invoice administrator must decide this item.";
+  }
+  $("approval-reject").textContent = item.approvalType === "DUPLICATE_INVOICE"
+    ? "Reject duplicate"
+    : "Reject changes";
+  $("approval-approve").textContent = item.approvalType === "DUPLICATE_INVOICE"
+    ? "Approve for NetSuite"
+    : "Approve changes";
+  $("approval-drawer-overlay").classList.remove("hidden");
+  document.body.classList.add("no-scroll");
+}
+
+async function replayCurrentApproval() {
+  const item = state.currentApproval;
+  if (!item) return;
+  const button = $("approval-replay");
+  button.disabled = true;
+  $("approval-decision-status").textContent = "Queueing approved update...";
+  try {
+    const res = await apiFetch(`/approvals/${encodeURIComponent(item.approvalId)}/replay`, {
+      method: "POST",
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || `Retry failed (${res.status})`);
+    toast(
+      item.approvalType === "DUPLICATE_INVOICE"
+        ? "Approved duplicate invoice queued again."
+        : "Approved vendor update queued again.",
+      "success"
+    );
+    closeApprovalDrawer();
+    await loadApprovals(true);
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    $("approval-decision-status").textContent = err.message || "Could not queue the update.";
+    toast(err.message || "Could not queue the update.", "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function formatApprovalValue(value) {
+  if (value === null || value === undefined || value === "") return "Blank";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function closeApprovalDrawer() {
+  $("approval-drawer-overlay").classList.add("hidden");
+  document.body.classList.remove("no-scroll");
+  state.currentApproval = null;
+}
+
+async function decideCurrentApproval(decision) {
+  const item = state.currentApproval;
+  if (!item || !["APPROVE", "REJECT"].includes(decision)) return;
+  const buttons = [$("approval-approve"), $("approval-reject")];
+  buttons.forEach((button) => { button.disabled = true; });
+  $("approval-decision-status").textContent = "Saving decision...";
+  try {
+    const res = await apiFetch(`/approvals/${encodeURIComponent(item.approvalId)}/decision`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision, note: $("approval-note").value.trim() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || `Approval failed (${res.status})`);
+    toast(
+      decision === "APPROVE"
+        ? item.approvalType === "DUPLICATE_INVOICE"
+          ? "Duplicate decision approved; NetSuite readiness was recalculated."
+          : data.queued
+            ? "Vendor update approved and queued."
+            : "Vendor update approved."
+        : "Approval rejected.",
+      "success"
+    );
+    closeApprovalDrawer();
+    state.invoices = [];
+    await loadApprovals(true);
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    $("approval-decision-status").textContent = err.message || "Could not save the decision.";
+    toast(err.message || "Could not save the decision.", "error");
+  } finally {
+    buttons.forEach((button) => { button.disabled = false; });
+  }
+}
+
+/* ========================================================================
    DETAIL DRAWER
    ===================================================================== */
 
@@ -868,7 +1151,7 @@ async function previewNetSuite(messageId, attachmentId) {
 async function logNetSuiteTransaction(messageId, attachmentId) {
   const jsonBox = $("drawer-json");
   try {
-    jsonBox.textContent = "Logging NetSuite transaction...";
+    jsonBox.textContent = "Loading NetSuite transaction status...";
     const res = await apiFetch(
       `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}/netsuite/transactions`,
       { method: "POST" }
@@ -876,7 +1159,14 @@ async function logNetSuiteTransaction(messageId, attachmentId) {
     const data = await res.json().catch(() => ({}));
     jsonBox.textContent = JSON.stringify(data, null, 2);
     if (res.ok) {
-      toast(data.queued ? "NetSuite transaction queued." : "NetSuite transaction logged.", "success");
+      toast(
+        data.queued
+          ? "NetSuite transaction queued."
+          : data.created
+            ? "NetSuite transaction created."
+            : "NetSuite transaction status loaded.",
+        "success"
+      );
     } else {
       toast(data.message || "Transaction logging failed.", "error");
     }
@@ -889,7 +1179,10 @@ async function logNetSuiteTransaction(messageId, attachmentId) {
 }
 
 async function saveDuplicateReview(action) {
-  if (!state.currentDetail || !["HOLD_FOR_REVIEW", "ALLOW_NETSUITE"].includes(action)) return;
+  if (
+    !state.currentDetail ||
+    !["HOLD_FOR_REVIEW", "ALLOW_NETSUITE", "REJECT_NETSUITE"].includes(action)
+  ) return;
   const { messageId, attachmentId } = state.currentDetail;
   const panel = $("duplicate-review-panel");
   const msg = panel?.querySelector(".duplicate-review-message");
@@ -922,7 +1215,9 @@ async function saveDuplicateReview(action) {
         ? ready
           ? "Duplicate allowed for NetSuite."
           : "Duplicate allowed; remaining controls still need review."
-        : "Duplicate held for review.",
+        : action === "REJECT_NETSUITE"
+          ? "Duplicate invoice rejected."
+          : "Duplicate held for review.",
       "success"
     );
     await openDetail(messageId, attachmentId);
@@ -1329,6 +1624,7 @@ function wireEvents() {
     const active = document.querySelector(".nav-item.active");
     const view = active ? active.dataset.view : "dashboard";
     if (view === "audit") loadInvoices(true);
+    else if (view === "approvals") loadApprovals(true);
     else if (view === "config") loadNetSuiteSettings();
     else loadStats();
   };
@@ -1344,6 +1640,21 @@ function wireEvents() {
   });
   $("audit-load-more").onclick = () => loadInvoices(false);
 
+  // Approval queue
+  $("approvals-status").addEventListener("change", (e) => {
+    state.approvalsStatus = e.target.value;
+    loadApprovals(true);
+  });
+  $("approvals-load-more").onclick = () => loadApprovals(false);
+  $("approval-drawer-close").onclick = closeApprovalDrawer;
+  $("approval-dismiss").onclick = closeApprovalDrawer;
+  $("approval-approve").onclick = () => decideCurrentApproval("APPROVE");
+  $("approval-reject").onclick = () => decideCurrentApproval("REJECT");
+  $("approval-replay").onclick = replayCurrentApproval;
+  $("approval-drawer-overlay").addEventListener("click", (e) => {
+    if (e.target === $("approval-drawer-overlay")) closeApprovalDrawer();
+  });
+
   // Drawer
   $("drawer-close").onclick = closeDrawer;
   $("drawer-dismiss").onclick = closeDrawer;
@@ -1352,6 +1663,9 @@ function wireEvents() {
   });
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape" && !$("drawer-overlay").classList.contains("hidden")) closeDrawer();
+    if (e.key === "Escape" && !$("approval-drawer-overlay").classList.contains("hidden")) {
+      closeApprovalDrawer();
+    }
   });
 
   // Upload

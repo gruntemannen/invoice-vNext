@@ -1,22 +1,13 @@
 import { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from "aws-lambda";
 import { queryInvoices, updateItem, docClient } from "./shared/dynamo";
-import { DeleteCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
+import { DeleteCommand, GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { S3Client, DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
 import {
-  buildNetSuiteConfigurationHints,
-  transformToNetSuite,
-  validateNetSuiteRequest,
-  type NetSuiteConfig,
-} from "./shared/netsuite";
-import { loadNetSuiteConfig } from "./shared/netsuite-config";
-import {
-  activeNetSuiteEnvironment,
   getNetSuiteRuntimeSettings,
   saveNetSuiteRuntimeSettings,
-  type NetSuiteRuntimeSettings,
 } from "./shared/netsuite-settings";
 import {
   assessInvoiceFlow,
@@ -25,7 +16,6 @@ import {
 } from "./shared/flow";
 import {
   canReplay,
-  createNetSuiteTransaction,
   getNetSuiteTransaction,
   listNetSuiteTransactions,
   markTransactionFailed,
@@ -33,6 +23,20 @@ import {
   summarizeTransaction,
   type NetSuiteTransactionStatus,
 } from "./shared/transactions";
+import {
+  buildNetSuitePreviewForInvoice,
+  ensureInvoiceNetSuiteTransaction,
+} from "./shared/netsuite-outbox";
+import {
+  createDuplicateInvoiceApproval,
+  decideDuplicateInvoiceApproval,
+  decideVendorMasterApproval,
+  getApprovalQueueItem,
+  listApprovalQueue,
+  markVendorApprovalFailed,
+  summarizeApprovalQueueItem,
+  type VendorApprovalStatus,
+} from "./shared/vendor-approvals";
 import { computeStats } from "./shared/stats";
 import { log } from "./shared/logger";
 
@@ -42,6 +46,7 @@ const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES ?? "0");
 const NETSUITE_QUEUE_URL = process.env.NETSUITE_QUEUE_URL ?? "";
 const NETSUITE_LIVE_PUSH_ENABLED = process.env.NETSUITE_LIVE_PUSH_ENABLED === "true";
 const REQUIRED_GROUPS = new Set(["invoice", "invoice-admin"]);
+const APPROVAL_ADMIN_GROUPS = new Set(["invoice-admin", "admin", "identity-admin"]);
 const s3 = new S3Client({});
 const sqs = new SQSClient({});
 
@@ -70,6 +75,23 @@ export const handler = async (
   }
   if (path === "/netsuite/transactions" && event.requestContext.http.method === "GET") {
     return listNetSuiteTransactionLog(event);
+  }
+  if (path === "/approvals" && event.requestContext.http.method === "GET") {
+    return listApprovals(event);
+  }
+  if (
+    path.startsWith("/approvals/") &&
+    path.endsWith("/decision") &&
+    event.requestContext.http.method === "POST"
+  ) {
+    return decideApproval(event);
+  }
+  if (
+    path.startsWith("/approvals/") &&
+    path.endsWith("/replay") &&
+    event.requestContext.http.method === "POST"
+  ) {
+    return replayApproval(event);
   }
   if (path === "/netsuite/transactions/replay" && event.requestContext.http.method === "POST") {
     return replayNetSuiteTransactions(event);
@@ -179,7 +201,7 @@ async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
   }
 
   try {
-    const preview = await buildNetSuitePreview(item);
+    const preview = await buildNetSuitePreviewForInvoice(TABLE_NAME, item);
 
     return jsonResponse({
       netsuiteFormat: preview.bill,
@@ -217,60 +239,23 @@ async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2
   }
 
   try {
-    const preview = await buildNetSuitePreview(item);
-    let status: NetSuiteTransactionStatus = "QUEUED";
-    let eventMessage = "Transaction logged and queued for NetSuite push.";
-
-    if (!preview.validation.valid || preview.flow.reviewStatus !== "READY_FOR_NETSUITE") {
-      status = "HELD_FOR_REVIEW";
-      eventMessage = "Transaction logged but held for AP review.";
-    } else if (!NETSUITE_LIVE_PUSH_ENABLED) {
-      status = "HELD_FOR_CONFIGURATION";
-      eventMessage = "Transaction logged but live NetSuite push is disabled.";
-    }
-
-    const transaction = await createNetSuiteTransaction(TABLE_NAME, {
-      invoiceMessageId: item.messageId,
-      invoiceAttachmentKey: item.attachmentKey,
-      invoiceAttachmentId: item.attachmentId,
-      externalId: preview.request.externalId,
-      requestPayload: preview.request,
-      validation: preview.validation,
-      flow: preview.flow,
-      warnings: preview.warnings,
-      status,
-      eventMessage,
+    const outbox = await ensureInvoiceNetSuiteTransaction({
+      tableName: TABLE_NAME,
+      queueUrl: NETSUITE_QUEUE_URL,
+      livePushEnabled: NETSUITE_LIVE_PUSH_ENABLED,
+      item,
     });
-
-    if (status === "QUEUED") {
-      try {
-        await enqueueNetSuiteTransaction(transaction.transactionId);
-      } catch (err: any) {
-        await markTransactionFailed(
-          TABLE_NAME,
-          transaction.transactionId,
-          true,
-          `Failed to enqueue transaction: ${err?.message ?? String(err)}`
-        );
-        return jsonResponse(
-          {
-            message: "Transaction was logged but could not be queued. It can be replayed.",
-            transaction: summarizeTransaction({ ...transaction, status: "FAILED_RETRYABLE" }),
-          },
-          202
-        );
-      }
-    }
 
     return jsonResponse(
       {
-        transaction: summarizeTransaction(transaction),
-        flow: preview.flow,
-        validation: preview.validation,
-        configurationHints: preview.configurationHints,
-        queued: status === "QUEUED",
+        transaction: outbox.transaction,
+        created: outbox.created,
+        flow: outbox.preview.flow,
+        validation: outbox.preview.validation,
+        configurationHints: outbox.preview.configurationHints,
+        queued: outbox.queued,
       },
-      status === "QUEUED" ? 202 : 200
+      outbox.queued ? 202 : 200
     );
   } catch (error: any) {
     log.error("NetSuite transaction logging failed", {
@@ -311,7 +296,9 @@ async function updateDuplicateReview(event: APIGatewayProxyEventV2) {
 
   const action = parseDuplicateReviewAction(body?.action);
   if (!action) {
-    return jsonResponse({ message: "action must be HOLD_FOR_REVIEW or ALLOW_NETSUITE" }, 400);
+    return jsonResponse({
+      message: "action must be HOLD_FOR_REVIEW, ALLOW_NETSUITE, or REJECT_NETSUITE",
+    }, 400);
   }
 
   const item = await findByAttachmentId(messageId, attachmentId);
@@ -327,13 +314,48 @@ async function updateDuplicateReview(event: APIGatewayProxyEventV2) {
     return jsonResponse({ message: "This invoice has no duplicate matches to review." }, 409);
   }
 
-  const now = new Date().toISOString();
-  const duplicateReview = normalizeDuplicateReview({
+  const result = await saveDuplicateDecision(
+    item,
     action,
-    reviewedAt: now,
-    reviewedBy: actorFromEvent(event),
-    note: trimNote(body?.note),
+    actorFromEvent(event),
+    trimNote(body?.note)
+  );
+
+  const queuedApproval = await createDuplicateInvoiceApproval(TABLE_NAME, {
+    invoiceMessageId: item.messageId,
+    invoiceAttachmentKey: item.attachmentKey,
+    invoiceAttachmentId: item.attachmentId,
+    vendorName: item.vendorName,
+    vendorTaxId: item.vendorTaxId,
+    invoiceNumber: item.invoiceNumber,
+    currency: item.currency,
+    totalAmount: item.totalAmount,
+    duplicateMatches: item.duplicateMatches ?? item.extractedJson?.meta?.duplicateMatches ?? [],
   });
+  if (
+    queuedApproval.approval.status === "PENDING" &&
+    (action === "ALLOW_NETSUITE" || action === "REJECT_NETSUITE")
+  ) {
+    await decideDuplicateInvoiceApproval(
+      TABLE_NAME,
+      queuedApproval.approval.approvalId,
+      action === "ALLOW_NETSUITE" ? "APPROVE" : "REJECT",
+      actorFromEvent(event),
+      trimNote(body?.note)
+    );
+  }
+
+  return jsonResponse(result);
+}
+
+async function saveDuplicateDecision(
+  item: any,
+  action: DuplicateReviewAction,
+  actor?: string,
+  note?: string
+) {
+  const now = new Date().toISOString();
+  const duplicateReview = normalizeDuplicateReview({ action, reviewedAt: now, reviewedBy: actor, note });
   const extractedJson = {
     ...item.extractedJson,
     meta: {
@@ -341,6 +363,7 @@ async function updateDuplicateReview(event: APIGatewayProxyEventV2) {
       duplicateReview,
     },
   };
+  const duplicateCount = item.duplicateCount ?? extractedJson?.meta?.duplicateCount ?? 0;
   const flow = assessInvoiceFlow(extractedJson, {
     confidence: item.confidence,
     warnings: item.warnings ?? extractedJson?.meta?.warnings ?? [],
@@ -366,14 +389,182 @@ async function updateDuplicateReview(event: APIGatewayProxyEventV2) {
     }
   );
 
-  return jsonResponse({
+  const refreshedItem = {
+    ...item,
+    duplicateReview,
+    reviewStatus: flow.reviewStatus,
+    autoBookEligible: flow.autoBookEligible,
+    controlFlags: flow.flags,
+    extractedJson,
+  };
+  const outbox = await ensureInvoiceNetSuiteTransaction({
+    tableName: TABLE_NAME,
+    queueUrl: NETSUITE_QUEUE_URL,
+    livePushEnabled: NETSUITE_LIVE_PUSH_ENABLED,
+    item: refreshedItem,
+  });
+
+  return {
     duplicateReview,
     reviewStatus: flow.reviewStatus,
     autoBookEligible: flow.autoBookEligible,
     controlFlags: flow.flags,
     duplicateCount: flow.duplicateCount,
     flow,
-  });
+    transaction: outbox.transaction,
+    queued: outbox.queued,
+  };
+}
+
+async function listApprovals(event: APIGatewayProxyEventV2) {
+  const limit = Math.min(Number(event.queryStringParameters?.limit ?? 50), 100);
+  const safeLimit = Number.isFinite(limit) && limit > 0 ? limit : 50;
+  const status = parseVendorApprovalStatus(event.queryStringParameters?.status);
+  try {
+    const result = await listApprovalQueue(
+      TABLE_NAME,
+      safeLimit,
+      event.queryStringParameters?.nextToken,
+      status
+    );
+    return jsonResponse({
+      items: result.items.map(summarizeApprovalQueueItem),
+      nextToken: result.nextToken,
+    });
+  } catch (error: any) {
+    if (error?.statusCode === 400) return jsonResponse({ message: error.message }, 400);
+    throw error;
+  }
+}
+
+async function decideApproval(event: APIGatewayProxyEventV2) {
+  if (!hasApprovalAdminAccess(event)) {
+    return jsonResponse({ message: "Invoice admin access is required for approval decisions." }, 403);
+  }
+  const approvalId = pathApprovalId(event.rawPath ?? "", "decision");
+  const approval = await getApprovalQueueItem(TABLE_NAME, approvalId);
+  if (!approval) return jsonResponse({ message: "Approval not found" }, 404);
+  if (approval.status !== "PENDING") {
+    return jsonResponse({ message: "This approval has already been decided." }, 409);
+  }
+
+  let body: any = {};
+  try {
+    body = event.body ? JSON.parse(event.body) : {};
+  } catch {
+    return jsonResponse({ message: "Invalid request body" }, 400);
+  }
+  const decision = body?.decision === "APPROVE" || body?.decision === "REJECT" ? body.decision : null;
+  if (!decision) return jsonResponse({ message: "decision must be APPROVE or REJECT" }, 400);
+  const actor = actorFromEvent(event);
+  const note = trimNote(body?.note);
+
+  try {
+    if (approval.approvalType === "DUPLICATE_INVOICE") {
+      const invoice = await findApprovalInvoice(approval);
+      if (!invoice) return jsonResponse({ message: "Source invoice not found" }, 409);
+      const action: DuplicateReviewAction =
+        decision === "APPROVE" ? "ALLOW_NETSUITE" : "REJECT_NETSUITE";
+      const decided = await decideDuplicateInvoiceApproval(
+        TABLE_NAME,
+        approvalId,
+        decision,
+        actor,
+        note
+      );
+      const invoiceResult = await saveDuplicateDecision(invoice, action, actor, note);
+      return jsonResponse({ approval: summarizeApprovalQueueItem(decided), invoice: invoiceResult });
+    }
+
+    const decided = await decideVendorMasterApproval(
+      TABLE_NAME,
+      approvalId,
+      decision,
+      actor,
+      note
+    );
+    let queued = false;
+    if (decision === "APPROVE" && NETSUITE_LIVE_PUSH_ENABLED) {
+      try {
+        await enqueueVendorApproval(approvalId);
+        queued = true;
+      } catch (error: any) {
+        await markVendorApprovalFailed(
+          TABLE_NAME,
+          approvalId,
+          true,
+          `Failed to enqueue approved vendor update: ${error?.message ?? String(error)}`
+        );
+      }
+    }
+    const current = await getApprovalQueueItem(TABLE_NAME, approvalId);
+    return jsonResponse({
+      approval: summarizeApprovalQueueItem(current ?? decided),
+      queued,
+    });
+  } catch (error: any) {
+    if (error?.name === "ConditionalCheckFailedException") {
+      return jsonResponse({ message: "This approval has already been decided." }, 409);
+    }
+    throw error;
+  }
+}
+
+async function replayApproval(event: APIGatewayProxyEventV2) {
+  if (!hasApprovalAdminAccess(event)) {
+    return jsonResponse({ message: "Invoice admin access is required to replay approvals." }, 403);
+  }
+  if (!NETSUITE_LIVE_PUSH_ENABLED) {
+    return jsonResponse({ message: "NetSuite live push is disabled; enable it before replay." }, 409);
+  }
+  const approvalId = pathApprovalId(event.rawPath ?? "", "replay");
+  const approval = await getApprovalQueueItem(TABLE_NAME, approvalId);
+  if (!approval) {
+    return jsonResponse({ message: "Approval not found" }, 404);
+  }
+  if (approval.approvalType === "DUPLICATE_INVOICE") {
+    if (approval.status !== "APPROVED") {
+      return jsonResponse({ message: `Approval status ${approval.status} cannot be replayed.` }, 409);
+    }
+    const invoice = await findApprovalInvoice(approval);
+    if (!invoice) return jsonResponse({ message: "Source invoice not found" }, 409);
+    const result = await saveDuplicateDecision(
+      invoice,
+      "ALLOW_NETSUITE",
+      actorFromEvent(event),
+      approval.reviewNote
+    );
+    return jsonResponse({ queued: result.queued, approvalId, invoice: result }, 202);
+  }
+  if (approval.status !== "APPROVED" && approval.status !== "FAILED_RETRYABLE") {
+    return jsonResponse({ message: `Approval status ${approval.status} cannot be replayed.` }, 409);
+  }
+  await enqueueVendorApproval(approvalId);
+  return jsonResponse({ queued: true, approvalId }, 202);
+}
+
+async function findApprovalInvoice(approval: {
+  invoiceMessageId: string;
+  invoiceAttachmentKey: string;
+  invoiceAttachmentId?: string;
+}) {
+  if (approval.invoiceAttachmentId) {
+    const invoice = await findByAttachmentId(
+      approval.invoiceMessageId,
+      approval.invoiceAttachmentId
+    );
+    if (invoice) return invoice;
+  }
+  const result = await docClient.send(
+    new GetCommand({
+      TableName: TABLE_NAME,
+      Key: {
+        messageId: approval.invoiceMessageId,
+        attachmentKey: approval.invoiceAttachmentKey,
+      },
+    })
+  );
+  return result.Item ?? null;
 }
 
 async function listNetSuiteTransactionLog(event: APIGatewayProxyEventV2) {
@@ -550,35 +741,6 @@ async function findByAttachmentId(messageId: string, attachmentId: string) {
   return res.Items?.[0] ?? null;
 }
 
-async function buildNetSuitePreview(item: any): Promise<{
-  config: NetSuiteConfig;
-  runtimeSettings: NetSuiteRuntimeSettings;
-  activeEnvironment: ReturnType<typeof activeNetSuiteEnvironment>;
-  bill: ReturnType<typeof transformToNetSuite>["bill"];
-  request: ReturnType<typeof transformToNetSuite>["request"];
-  warnings: string[];
-  configurationHints: ReturnType<typeof buildNetSuiteConfigurationHints>;
-  validation: ReturnType<typeof validateNetSuiteRequest>;
-  flow: ReturnType<typeof assessInvoiceFlow>;
-}> {
-  const config = loadNetSuiteConfig();
-  const runtimeSettings = await getNetSuiteRuntimeSettings(TABLE_NAME);
-  const activeEnvironment = activeNetSuiteEnvironment(runtimeSettings);
-  const { bill, request, warnings } = transformToNetSuite(item.extractedJson, config);
-  request.environment = runtimeSettings.activeEnvironment;
-  const configurationHints = buildNetSuiteConfigurationHints(item.extractedJson, config);
-  const validation = validateNetSuiteRequest(request, config);
-  const flow = assessInvoiceFlow(item.extractedJson, {
-    confidence: item.confidence,
-    warnings: item.warnings ?? item.extractedJson?.meta?.warnings ?? [],
-    duplicateCount: item.duplicateCount ?? item.extractedJson?.meta?.duplicateCount ?? 0,
-    netSuiteWarnings: warnings,
-    netSuiteValidationErrors: validation.errors,
-  });
-
-  return { config, runtimeSettings, activeEnvironment, bill, request, warnings, configurationHints, validation, flow };
-}
-
 async function enqueueNetSuiteTransaction(transactionId: string) {
   if (!NETSUITE_QUEUE_URL) {
     throw new Error("NETSUITE_QUEUE_URL is not configured");
@@ -587,6 +749,16 @@ async function enqueueNetSuiteTransaction(transactionId: string) {
     new SendMessageCommand({
       QueueUrl: NETSUITE_QUEUE_URL,
       MessageBody: JSON.stringify({ transactionId }),
+    })
+  );
+}
+
+async function enqueueVendorApproval(approvalId: string) {
+  if (!NETSUITE_QUEUE_URL) throw new Error("NETSUITE_QUEUE_URL is not configured");
+  await sqs.send(
+    new SendMessageCommand({
+      QueueUrl: NETSUITE_QUEUE_URL,
+      MessageBody: JSON.stringify({ approvalId }),
     })
   );
 }
@@ -606,9 +778,23 @@ function parseTransactionStatus(value?: string): NetSuiteTransactionStatus | und
 }
 
 function parseDuplicateReviewAction(value: unknown): DuplicateReviewAction | undefined {
-  return value === "HOLD_FOR_REVIEW" || value === "ALLOW_NETSUITE"
+  return value === "HOLD_FOR_REVIEW" || value === "ALLOW_NETSUITE" || value === "REJECT_NETSUITE"
     ? value
     : undefined;
+}
+
+function parseVendorApprovalStatus(value?: string): VendorApprovalStatus | undefined {
+  if (!value) return undefined;
+  const allowed: VendorApprovalStatus[] = [
+    "PENDING",
+    "APPROVED",
+    "REJECTED",
+    "APPLYING",
+    "APPLIED",
+    "FAILED_RETRYABLE",
+    "FAILED_PERMANENT",
+  ];
+  return allowed.includes(value as VendorApprovalStatus) ? (value as VendorApprovalStatus) : undefined;
 }
 
 function trimNote(value: unknown): string | undefined {
@@ -618,6 +804,11 @@ function trimNote(value: unknown): string | undefined {
 
 function pathTransactionId(path: string): string {
   const match = path.match(/^\/netsuite\/transactions\/([^/]+)\/replay$/);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+function pathApprovalId(path: string, action: "decision" | "replay"): string {
+  const match = path.match(new RegExp(`^/approvals/([^/]+)/${action}$`));
   return match ? decodeURIComponent(match[1]) : "";
 }
 
@@ -640,6 +831,11 @@ function actorFromEvent(event: APIGatewayProxyEventV2): string | undefined {
 function hasAppAccess(event: APIGatewayProxyEventV2): boolean {
   const claims = (event.requestContext as any)?.authorizer?.jwt?.claims ?? {};
   return claimGroups(claims["cognito:groups"]).some((group) => REQUIRED_GROUPS.has(group));
+}
+
+function hasApprovalAdminAccess(event: APIGatewayProxyEventV2): boolean {
+  const claims = (event.requestContext as any)?.authorizer?.jwt?.claims ?? {};
+  return claimGroups(claims["cognito:groups"]).some((group) => APPROVAL_ADMIN_GROUPS.has(group));
 }
 
 function claimGroups(value: unknown): string[] {

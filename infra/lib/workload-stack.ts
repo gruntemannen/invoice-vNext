@@ -276,6 +276,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
         BEDROCK_MODEL_ID: bedrockModelId,
         VIES_LOOKUP_ENABLED: String(props.viesLookupEnabled),
         VIES_TIMEOUT_MS: String(props.viesRequestTimeoutMs),
+        NETSUITE_QUEUE_URL: netSuiteQueue.queueUrl,
+        NETSUITE_LIVE_PUSH_ENABLED: String(props.netSuiteLivePushEnabled),
       },
       logRetention: lambdaLogRetention,
     });
@@ -309,6 +311,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
     table.grantReadWriteData(apiFn);
     queue.grantSendMessages(ingestFn);
     queue.grantConsumeMessages(extractFn);
+    netSuiteQueue.grantSendMessages(extractFn);
     queue.grantSendMessages(apiFn);
     netSuiteQueue.grantSendMessages(apiFn);
 
@@ -680,6 +683,27 @@ export class InvoiceExtractorStack extends cdk.Stack {
       path: "/netsuite/transactions",
       methods: [apigwv2.HttpMethod.GET],
       integration: new apigwv2Integrations.HttpLambdaIntegration("NetSuiteTransactionListIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/approvals",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("ApprovalListIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/approvals/{approvalId}/decision",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("ApprovalDecisionIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
+      path: "/approvals/{approvalId}/replay",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("ApprovalReplayIntegration", apiFn),
       authorizer: jwtAuthorizer,
     });
 

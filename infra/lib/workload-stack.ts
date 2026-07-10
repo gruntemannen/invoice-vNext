@@ -41,10 +41,6 @@ interface CognitoAuthConfig {
   issuer?: string;
   region?: string;
   userPoolId?: string;
-  clientId?: string;
-  domain?: string;
-  scope?: string;
-  responseType?: "token" | "code" | string;
   landingClientId?: string;
   landingUrl?: string;
 }
@@ -53,22 +49,8 @@ interface ResolvedCognitoAuth {
   issuer: string;
   region: string;
   userPoolId?: string;
-  clientId: string;
-  domain: string;
-  scope: string;
-  responseType: "token" | "code";
   audienceClientIds: string[];
   landingUrl: string;
-}
-
-function normalizeHostedUiDomain(domain?: string): string | undefined {
-  const trimmed = domain?.trim();
-  if (!trimmed) return undefined;
-  if (/^https?:\/\//i.test(trimmed)) {
-    const url = new URL(trimmed);
-    return url.host;
-  }
-  return trimmed.replace(/\/+$/, "");
 }
 
 function normalizeIssuer(issuer?: string): string | undefined {
@@ -103,16 +85,11 @@ function resolveExternalCognitoAuth(config?: CognitoAuthConfig): ResolvedCognito
   const issuer = normalizeIssuer(config.issuer);
   const region = config.region?.trim() || regionFromIssuer(issuer);
   const userPoolId = config.userPoolId?.trim() || userPoolIdFromIssuer(issuer);
-  const clientId = config.clientId?.trim();
   const landingClientId = config.landingClientId?.trim();
   const landingUrl = config.landingUrl?.trim() || "https://d31eg8zeuvav8w.cloudfront.net/?signed_out=1";
-  const domain = normalizeHostedUiDomain(config.domain);
-  const scope = config.scope?.trim() || "openid email profile";
-  const responseType = (config.responseType?.trim() || "code").toLowerCase();
 
   const missing = [
-    !clientId ? "clientId" : undefined,
-    !domain ? "domain" : undefined,
+    !landingClientId ? "landingClientId" : undefined,
     !region && !issuer ? "region or issuer" : undefined,
     !userPoolId && !issuer ? "userPoolId or issuer" : undefined,
   ].filter(Boolean);
@@ -120,20 +97,12 @@ function resolveExternalCognitoAuth(config?: CognitoAuthConfig): ResolvedCognito
   if (missing.length > 0) {
     throw new Error(`External Cognito config is missing required value(s): ${missing.join(", ")}`);
   }
-  if (responseType !== "token" && responseType !== "code") {
-    throw new Error('External Cognito responseType must be "token" or "code"');
-  }
-
   const resolvedRegion = region ?? "external";
   return {
     issuer: issuer ?? `https://cognito-idp.${resolvedRegion}.amazonaws.com/${userPoolId}`,
     region: resolvedRegion,
     userPoolId,
-    clientId: clientId!,
-    domain: domain!,
-    scope,
-    responseType,
-    audienceClientIds: [clientId!, landingClientId].filter((value): value is string => Boolean(value)),
+    audienceClientIds: [landingClientId!],
     landingUrl,
   };
 }
@@ -549,10 +518,6 @@ export class InvoiceExtractorStack extends cdk.Stack {
     siteBucket.grantRead(oai);
 
     const externalCognitoAuth = resolveExternalCognitoAuth(props.cognito);
-    const cognitoDomainPrefix = `${props.projectPrefix}-admin-${cdk.Aws.ACCOUNT_ID}`;
-    const cognitoHostedUiDomain =
-      externalCognitoAuth?.domain ?? `${cognitoDomainPrefix}.auth.${cdk.Aws.REGION}.amazoncognito.com`;
-    const cognitoHostedUiOrigin = `https://${cognitoHostedUiDomain}`;
 
     // Security response headers (HSTS, CSP, frame/referrer/content-type protections).
     const securityHeaders = new cloudfront.ResponseHeadersPolicy(this, "SecurityHeaders", {
@@ -571,11 +536,8 @@ export class InvoiceExtractorStack extends cdk.Stack {
           override: true,
         },
         contentSecurityPolicy: {
-          // script-src 'self' is safe: the page has no inline scripts (see frontend/sw-register.js).
-          // connect-src covers the API Gateway + presigned S3 (both *.amazonaws.com) plus the
-          // configured Cognito token endpoint for authorization-code + PKCE.
           contentSecurityPolicy:
-            `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://*.amazonaws.com ${cognitoHostedUiOrigin}; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'`,
+            `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://*.amazonaws.com; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'`,
           override: true,
         },
       },
@@ -614,30 +576,16 @@ export class InvoiceExtractorStack extends cdk.Stack {
         removalPolicy: cdk.RemovalPolicy.RETAIN,
       });
 
-      userPool.addDomain("AdminUserPoolDomain", {
-        cognitoDomain: { domainPrefix: cognitoDomainPrefix },
-      });
-
       const userPoolClient = userPool.addClient("AdminWebClient", {
         userPoolClientName: `${props.projectPrefix}-admin-web`,
         generateSecret: false, // public SPA client
         authFlows: { userSrp: true },
-        oAuth: {
-          flows: { implicitCodeGrant: true },
-          scopes: [cognito.OAuthScope.OPENID, cognito.OAuthScope.EMAIL, cognito.OAuthScope.PROFILE],
-          callbackUrls: [appUrl, `${appUrl}/`],
-          logoutUrls: [appUrl, `${appUrl}/`],
-        },
       });
 
       auth = {
         issuer: `https://cognito-idp.${cdk.Aws.REGION}.amazonaws.com/${userPool.userPoolId}`,
         region: cdk.Aws.REGION,
         userPoolId: userPool.userPoolId,
-        clientId: userPoolClient.userPoolClientId,
-        domain: cognitoHostedUiDomain,
-        scope: "openid email profile",
-        responseType: "token",
         audienceClientIds: [userPoolClient.userPoolClientId],
         landingUrl: appUrl,
       };
@@ -767,18 +715,13 @@ export class InvoiceExtractorStack extends cdk.Stack {
               apiBaseUrl: httpApi.apiEndpoint,
               maxUploadBytes,
               region: cdk.Aws.REGION,
-              cognito: {
-                region: auth.region,
-                userPoolId: auth.userPoolId,
-                issuer: auth.issuer,
-                clientId: auth.clientId,
-                domain: auth.domain,
-                scope: auth.scope,
-                responseType: auth.responseType,
-                tokenEndpoint: `https://${auth.domain}/oauth2/token`,
-                redirectUri: appUrl,
-                logoutUri: auth.landingUrl,
-              },
+                cognito: {
+                  region: auth.region,
+                  userPoolId: auth.userPoolId,
+                  issuer: auth.issuer,
+                  logoutUri: auth.landingUrl,
+                  landingClientId: auth.audienceClientIds[0],
+                },
             },
             null,
             2
@@ -803,10 +746,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
     new cdk.CfnOutput(this, "AlarmsTopicArn", { value: alarmTopic.topicArn });
     new cdk.CfnOutput(this, "CognitoIssuer", { value: auth.issuer });
     new cdk.CfnOutput(this, "UserPoolId", { value: auth.userPoolId ?? "external-user-pool-id-not-configured" });
-    new cdk.CfnOutput(this, "UserPoolClientId", { value: auth.clientId });
-    new cdk.CfnOutput(this, "CognitoHostedUiDomain", {
-      value: auth.domain,
-    });
+    new cdk.CfnOutput(this, "UserPoolClientId", { value: auth.audienceClientIds[0] });
     new cdk.CfnOutput(this, "NetSuiteSecretName", { value: netsuiteSecret.secretName });
   }
 }

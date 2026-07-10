@@ -45,10 +45,6 @@ function readCognitoContext(): CognitoAuthConfig | undefined {
     ["issuer", "cognitoIssuer"],
     ["region", "cognitoRegion"],
     ["userPoolId", "cognitoUserPoolId"],
-    ["clientId", "cognitoClientId"],
-    ["domain", "cognitoDomain"],
-    ["scope", "cognitoScope"],
-    ["responseType", "cognitoResponseType"],
     ["landingClientId", "cognitoLandingClientId"],
     ["landingUrl", "landingUrl"],
   ];

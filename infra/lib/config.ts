@@ -42,7 +42,7 @@ export const config: InvoiceConfig = {
   // Amazon Bedrock model id used for extraction. Use a cross-region inference profile whose geo
   // prefix matches `region`: us. / eu. / jp. / au. (or "global." for residency-agnostic routing).
   // Examples: "us.anthropic.claude-sonnet-4-6", "global.anthropic.claude-sonnet-4-6".
-  bedrockModelId: "eu.anthropic.claude-sonnet-4-6",
+  bedrockModelId: "eu.anthropic.claude-sonnet-5",
 
   // Maximum size (bytes) for an uploaded or emailed invoice attachment. Default 10 MiB.
   maxUploadBytes: 10 * 1024 * 1024,

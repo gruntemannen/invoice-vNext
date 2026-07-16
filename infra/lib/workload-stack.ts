@@ -243,6 +243,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     const ingestFn = new lambdaNode.NodejsFunction(this, "IngestLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
+      architecture: lambda.Architecture.ARM_64, // pure-JS bundles; Graviton is the group standard
       entry: path.join(__dirname, "../../backend/src/ingest.ts"),
       projectRoot: backendRoot,
       depsLockFilePath: backendLockFile,
@@ -261,6 +262,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     const extractFn = new lambdaNode.NodejsFunction(this, "ExtractLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
+      architecture: lambda.Architecture.ARM_64,
       entry: path.join(__dirname, "../../backend/src/extract.ts"),
       projectRoot: backendRoot,
       depsLockFilePath: backendLockFile,
@@ -282,6 +284,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     const apiFn = new lambdaNode.NodejsFunction(this, "ApiLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
+      architecture: lambda.Architecture.ARM_64,
       entry: path.join(__dirname, "../../backend/src/api.ts"),
       projectRoot: backendRoot,
       depsLockFilePath: backendLockFile,
@@ -324,6 +327,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     const netSuiteWorkerFn = new lambdaNode.NodejsFunction(this, "NetSuiteWorkerLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
+      architecture: lambda.Architecture.ARM_64,
       entry: path.join(__dirname, "../../backend/src/netsuite-worker.ts"),
       projectRoot: backendRoot,
       depsLockFilePath: backendLockFile,
@@ -372,6 +376,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
 
     const uploadIngestFn = new lambdaNode.NodejsFunction(this, "UploadIngestLambda", {
       runtime: lambda.Runtime.NODEJS_20_X,
+      architecture: lambda.Architecture.ARM_64,
       entry: path.join(__dirname, "../../backend/src/upload-ingest.ts"),
       projectRoot: backendRoot,
       depsLockFilePath: backendLockFile,

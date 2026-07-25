@@ -22,16 +22,36 @@ Invoice Extractor currently provides:
   documents, proformas, and vendor bank details.
 - Admin duplicate handling: hold duplicate invoices for review or allow a reviewed duplicate to
   continue to NetSuite.
-- NetSuite AP payload generation for `vendorBill` and `vendorPrepayment`.
+- NetSuite AP payload generation for `vendorBill` and `vendorPrepayment`, including header-level
+  `department`/`class`/`location` (some OneWorld subsidiaries require these as body fields, not
+  just per expense line) and per-business-unit AP/expense account overrides for subsidiaries
+  that don't share a single company-wide account.
 - Runtime NetSuite endpoint configuration for Test and Prod in the admin console.
 - Durable NetSuite transaction logging before any live push attempt.
+- Optional silent auto-booking: a fully clean invoice (no warnings, validated VAT, not a
+  duplicate, high confidence, and not the first transaction seen for that vendor) is logged and
+  queued at extraction time with no manual click. Anything else stays in AP review exactly as
+  before, and the reviewer's action is an explicit "Approve & Send to NetSuite" override rather
+  than a bare "log" step.
+- A single unified lifecycle status per invoice, replacing separate extraction-status/review
+  badges: `Imported` (still extracting) -> `On Hold` (needs review, a config gap, or a
+  retryable NetSuite outage) -> `Processed` (NetSuite confirmed), or `Failed` at any point.
 - Replay endpoints for NetSuite outages or retryable failures.
-- Optional live NetSuite worker with OAuth 2.0 M2M, idempotent upsert, and vendor-master
-  compare/fill for configured missing fields.
+- Optional live NetSuite worker with OAuth 2.0 M2M and idempotent upsert: it checks NetSuite for
+  an existing record by external ID before every push (not just its own transaction ledger),
+  since NetSuite's upsert-by-external-id PUT does not reliably replace sublist/line items on a
+  repeat call, so retrying a call that actually succeeded server-side (e.g. after a client-side
+  timeout) can otherwise double the expense lines.
+- Vendor-master compare/fill for configured missing NetSuite vendor fields, plus a VAT-registry
+  data panel in the admin console showing the officially registered name/address returned by
+  VIES/Swiss UID, a first step toward optionally pushing that data into the NetSuite vendor
+  master.
 
 Live NetSuite push is deliberately controlled by `netSuiteLivePushEnabled`. With the default
 `false`, the app still logs NetSuite transactions and keeps them replayable, but the worker does
-not call NetSuite.
+not call NetSuite. Auto-booking is a separate, narrower toggle (`netSuiteAutoBookEnabled`,
+defaults `false`) layered on top: even with live push on, nothing books itself without a human
+until auto-booking is explicitly enabled.
 
 ## Architecture
 
@@ -79,14 +99,47 @@ Review and integration:
 9. Duplicate invoices are held for AP review by default. An admin can mark the duplicate as
    allowed for NetSuite; this clears only the duplicate blocker, not unrelated validation issues.
 10. The AP flow assigns `READY_FOR_NETSUITE` or `NEEDS_REVIEW` and stores reader-facing control
-   flags.
-11. The admin console lets AP review the record, download the PDF, preview NetSuite, log a
-    NetSuite transaction, or delete the invoice and PDF.
-12. NetSuite transaction logging writes a `NETSUITE_TRANSACTION` item before anything is queued.
-13. If live push is enabled and the item is ready/configured, the NetSuite worker fetches the
-    transaction, optionally fills configured missing vendor-master fields, performs the idempotent
-    NetSuite upsert, and records success or failure events.
-14. Retryable failures can be replayed individually or in bulk after NetSuite recovers.
+   flags. This recomputes fresh every time the invoice is read (list, detail, or preview) rather
+   than trusting a value stored once at extraction time, so a later crosswalk fix is reflected
+   immediately instead of showing stale "Ready" on an invoice that would actually still fail.
+11. If `netSuiteAutoBookEnabled` is on and the invoice is fully clean (see below), extraction
+    itself logs and queues the NetSuite transaction — no human click. Otherwise the invoice
+    waits in AP review.
+12. The admin console lets AP review the record, download the PDF, preview NetSuite, approve and
+    send an invoice that's on hold, or delete the invoice and PDF. The unified `displayStatus`
+    (Imported/On Hold/Processed/Failed) is shown instead of two separate badges.
+13. NetSuite transaction logging writes a `NETSUITE_TRANSACTION` item before anything is queued,
+    and mirrors its id/status/booking-mode onto the invoice row so a repeat click or re-processed
+    extraction can't double-log — a transaction only counts as "already handled" while it's
+    genuinely live or succeeded; a stale held/failed one is superseded by a fresh attempt.
+14. If live push is enabled and the item is ready/configured, the NetSuite worker checks NetSuite
+    for an existing record by external ID first, fetches the transaction, optionally fills
+    configured missing vendor-master fields, performs the upsert only if nothing already exists,
+    and records success or failure events.
+15. Retryable failures can be replayed individually or in bulk after NetSuite recovers.
+
+### Auto-Booking Criteria
+
+An invoice becomes eligible for silent auto-booking (`flow.autoBookEligible`) only when **all**
+of the following hold, computed fresh with the current NetSuite crosswalk state:
+
+- `validateNetSuiteRequest` passes (`validation.valid`) — vendor, subsidiary/entity, `tranDate`,
+  and expense lines all resolved.
+- Zero warning- or blocker-severity control flags — not just zero blockers. An unmapped GL
+  account falling back to a default, a first-time vendor, or an unvalidated VAT number all count
+  as warnings and force `NEEDS_REVIEW`, the same as a hard blocker would.
+- Vendor VAT status is specifically `VALID` (not `SKIPPED`/`ERROR`/`INVALID`) whenever a `taxId`
+  was extracted at all.
+- Not a duplicate (or an admin has already recorded `ALLOW_NETSUITE`).
+- Confidence is at or above `minimumAutoBookConfidence` (default `0.95`).
+- Not the first NetSuite transaction ever seen for this resolved vendor — the first invoice per
+  vendor always holds for one human approval before that vendor becomes eligible for silent
+  auto-booking (`firstTimeVendorHold` in `assessInvoiceFlow`).
+
+A manual "Approve & Send to NetSuite" click is a separate, looser gate: it only refuses on a
+genuine blocker (`flow.hasBlockingFlags`), since the human clicking it *is* the review — a
+first-time vendor or a defaulted GL account doesn't need a second look once someone has already
+looked.
 
 ## Key Components
 
@@ -115,8 +168,11 @@ Views:
 
 - **Dashboard**: totals, success rate, completed/failed/pending counts, average confidence,
   30-day trend, and recent failures.
-- **Audit**: searchable invoice records with detail drawer, extracted JSON, VAT status, control
-  flags, NetSuite preview, durable transaction logging, PDF download, and delete.
+- **Audit**: searchable invoice records with a unified lifecycle status (Imported/On Hold/
+  Processed/Failed), detail drawer, extracted JSON, VAT status plus the full VAT-registry match
+  data (registered name/address, per-field match indicators), control flags, live NetSuite
+  transaction status, NetSuite preview, an "Approve & Send to NetSuite" action that only appears
+  when there's actually something to approve, PDF download, and delete.
 - **Upload**: PDF-only upload through presigned S3 PUT.
 - **Config**: Test and Prod NetSuite endpoint settings.
 
@@ -143,18 +199,26 @@ because they are prepayment requests, not final AP bills.
 
 Implemented:
 
-- NetSuite AP transform and validation.
+- NetSuite AP transform and validation, including header-level `department`/`class`/`location`
+  and per-business-unit AP/expense account overrides for subsidiaries with their own accounts.
 - NetSuite Test/Prod runtime endpoint settings in DynamoDB.
 - OAuth 2.0 M2M JWT client assertion.
 - SuiteQL helper.
-- Idempotent REST upsert by external ID.
+- Check-then-upsert REST push by external ID: the worker looks for an existing record with the
+  same external ID before every PUT, since NetSuite's upsert can append duplicate sublist lines
+  rather than replace them on a retry.
+- Optional silent auto-booking for fully clean invoices, with a first-time-vendor guardrail.
 - Vendor-master compare/fill before AP push when `vendorSync` is configured.
 - Durable transaction outbox and replay endpoints.
 
 Default live behavior:
 
 - `netSuiteLivePushEnabled: false` logs transactions but does not call NetSuite.
-- `netSuiteLivePushEnabled: true` queues ready/configured transactions to the NetSuite worker.
+- `netSuiteLivePushEnabled: true` queues ready/configured transactions to the NetSuite worker,
+  either from a manual "Approve & Send to NetSuite" click or from auto-booking.
+- `netSuiteAutoBookEnabled: false` (default): nothing books itself; every invoice needs a manual
+  approve. `true`: fully clean invoices (see Auto-Booking Criteria above) log and queue with no
+  click, everything else still waits for AP review.
 
 See [NETSUITE-INTEGRATION.md](NETSUITE-INTEGRATION.md) for NetSuite field mapping and the
 sandbox checklist.
@@ -243,6 +307,12 @@ export const config = {
   viesLookupEnabled: true,
   viesRequestTimeoutMs: 6000,
   netSuiteLivePushEnabled: false,
+
+  // Silently logs+queues a NetSuite transaction at extraction time for a fully clean invoice
+  // (see Auto-Booking Criteria) — no button click. Defaults false; only meaningful once
+  // netSuiteLivePushEnabled is also true and the crosswalk is populated enough that this
+  // wouldn't just hold every invoice on missing config anyway.
+  netSuiteAutoBookEnabled: false,
 
   // Optional. Leave unset to create/use the stack-owned admin pool.
   // cognito: {
@@ -367,6 +437,13 @@ NetSuite preview response:
   "originalExtraction": {}
 }
 ```
+
+Invoice list/detail responses include a unified `displayStatus`
+(`IMPORTED`/`FAILED`/`ON_HOLD`/`PROCESSED`), recomputed fresh from the invoice's extraction
+status and the live NetSuite transaction status (not read from a value cached at extraction
+time). Invoice detail additionally includes `netSuiteTransaction` (the current transaction
+summary: `status`, `bookingMode`, `bookedBy`, attempt/replay counts, last error) whenever the
+invoice has a logged transaction.
 
 ## Extracted Data Shape
 
@@ -515,6 +592,40 @@ Warnings are expected while crosswalks and runtime settings are being populated.
 - Check `maxUploadBytes`.
 - Verify the browser is authenticated and the API returns a presigned S3 URL.
 - Check S3 CORS and Upload Ingest Lambda logs.
+
+### NetSuite Push Fails With "Invalid Field Value ... for the following field: account"
+
+Seen live in a OneWorld sandbox: `apAccountId`/`defaults.expenseAccountId` (or a
+`businessUnits.<key>.apAccountId`/`expenseAccountId` override) point at a GL account that isn't
+shared with the transaction's subsidiary. Two different fixes depending on the account:
+
+- The **system-generated special AP account** (NetSuite auto-creates one, e.g. "Sys. Gen.
+  Accounts Payable") should usually be left alone — don't set an explicit `apAccountId` override
+  at all, and let NetSuite resolve it per subsidiary/vendor automatically.
+- A **regular expense/GL account** should be shared with every subsidiary that uses it, either by
+  checking Include Children on a parent subsidiary the others roll up under, or by adding each
+  subsidiary explicitly. This has to be done in the NetSuite UI (Lists → Accounting → Chart of
+  Accounts → edit) — the REST Record API does not support editing an account's Subsidiary field
+  (`PATCH`/`DELETE` on it return 400/405 regardless of payload shape).
+
+### NetSuite Push Fails With "Please enter value(s) for: Department"
+
+Some OneWorld subsidiaries require `Department` (and possibly `Class`/`Location`) as a mandatory
+body field on the transaction, not just per expense line. `VendorBill` sets `department`/`class`/
+`location` at the header from `businessUnits.<key>.departmentId`/`classId`/`locationId` (falling
+back to `defaults.departmentId`/etc.) for exactly this reason — make sure the resolved business
+unit actually has one configured.
+
+### A Retry Duplicated Expense Lines Instead Of Replacing Them
+
+NetSuite's `PUT /record/v1/{recordType}/eid:{externalId}` upsert does not reliably do a full
+sublist replace on a repeat call for the same external ID — it can append a second copy of the
+expense lines instead. This is most likely to surface after a client-side timeout on a request
+that actually completed on NetSuite's end (the abort races the real response). The worker checks
+NetSuite for an existing record by external ID before every push specifically to avoid this, but
+if it happens: fix it directly in NetSuite (the REST API does not support removing a sublist
+line either, `DELETE`/`PATCH` on a line sub-resource return 405/404), then confirm the transaction
+ledger and the NetSuite record agree afterward.
 
 ## Security
 

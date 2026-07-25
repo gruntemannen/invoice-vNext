@@ -29,6 +29,21 @@ Unsupported tax IDs are skipped with metadata. Lookup outages/timeouts are logge
 metadata, but they do not fail extraction or prevent later NetSuite replay. Review warnings are
 raised for invalid VATs or explicit registry match mismatches.
 
+`assessInvoiceFlow` also raises an explicit `vat_not_validated` warning whenever a `taxId` was
+extracted but the status isn't `VALID` (i.e. `SKIPPED`, `ERROR`, or `INVALID`) — a VAT lookup
+that couldn't run or failed is not treated as equivalent to "no check needed"; both force
+`NEEDS_REVIEW` the same as an invalid VAT would.
+
+### Vendor VAT Registry Data (Admin Console)
+
+The invoice detail drawer shows the full registry response used to validate the vendor's VAT
+number — not just the pass/fail badge — whenever `vendor.vatValidation` is present and not
+`SKIPPED`: provider, status, the officially registered name/address (`name`/`address` from
+VIES, when the member state returns them), per-field match indicators
+(name/street/postal code/city/company type: `VALID`/`INVALID`/`NOT_PROCESSED`), and the lookup
+timestamp. This is the same data a future "push to NetSuite vendor master" feature would source
+its fields from — today it's display-only; nothing writes it back to NetSuite automatically.
+
 ## Vendor Master Sync
 
 When a logged NetSuite AP transaction is processed with live push enabled, the worker now performs
@@ -105,10 +120,10 @@ Key exports: `transformToNetSuite`, `validateNetSuiteRequest`, `buildExternalId`
 | `invoice.invoiceNumber` | `tranId` + `externalId` | `externalId` is the idempotency key |
 | `invoice.invoiceDate` | `tranDate` | required |
 | `invoice.currency` | `currency` `{ id }` | via `currenciesByCode` |
-| `invoice.dueDate` / `paymentTerms` | `dueDate` / `terms` `{ id }` | terms via `termsByName` |
-| `buyer.*` | `subsidiary` and business dimensions | routed through recipient/business-unit mapping |
+| `invoice.dueDate` / `paymentTerms` | `dueDate` / `terms` `{ id }` | terms via `termsByName`; unmapped terms are left unset **without a warning** — NetSuite applies the vendor record's own default terms when a bill omits the field, so an unmapped value isn't a review-worthy gap the way an unresolved vendor/currency/account is |
+| `buyer.*` | `subsidiary`, header `department`/`class`/`location`, and business dimensions | routed through recipient/business-unit mapping; header dimensions matter because some OneWorld subsidiaries require `Department` as a mandatory body field, not just per line |
 | `invoice.purchaseOrderNumber` / `invoice.purchaseOrderLookupKey` | warning or PO ref context | the printed PO is preserved; the lookup key is only for NetSuite matching |
-| `lineItems[]` net amounts | `expense.items[]` | GL, department, class, location, and tax code are crosswalked |
+| `lineItems[]` net amounts | `expense.items[]` | GL, department, class, location, and tax code are crosswalked, falling back to the resolved business unit's or the company-wide default account/dimensions |
 
 `invoice.totalAmount` is gross. Expense lines are net. The transform warns when
 `sum(line net) + taxAmount != totalAmount`. If a PO is present, the transform does not alter the
@@ -156,6 +171,8 @@ Each `businessUnits.<key>` route can set:
 - `departmentId`
 - `classId`
 - `locationId`
+- `apAccountId`
+- `expenseAccountId`
 - `customBodyFields`
 - `customLineFields`
 
@@ -163,6 +180,27 @@ If `businessUnitSegmentFieldId` is configured, `businessUnitId` is emitted as `{
 transaction body and expense lines. `defaultBusinessUnitKey` is used only after entity code,
 tax id, company name, email domain, and address matching all miss. Missing recipient routing
 with no fallback emits a NetSuite warning and keeps the invoice in review.
+
+`apAccountId`/`expenseAccountId` override the company-wide `apAccountId`/`defaults.expenseAccountId`
+for this specific business unit's subsidiary. GL accounts are frequently subsidiary-scoped in a
+OneWorld account, so a single global default can be right for the subsidiary it was configured
+against and wrong for every other one — a live push against a different subsidiary can fail with
+`Invalid Field Value ... for the following field: account` if the account isn't shared with that
+subsidiary. Two ways to resolve that, and it's a real design choice, not just a config gap:
+
+- If the org wants **one shared chart of accounts**, fix it in NetSuite directly: share the
+  account with the missing subsidiaries (Lists → Accounting → Chart of Accounts → edit →
+  Subsidiary field; check Include Children if the subsidiaries roll up under a shared parent).
+  The REST API does not support editing this field (`PATCH`/`DELETE` return 400/405 regardless of
+  payload shape), so this has to be a NetSuite UI change.
+- If subsidiaries **genuinely use different accounts** (common across different local GAAP or
+  currencies), set `apAccountId`/`expenseAccountId` on that business unit's route instead.
+
+Separately: NetSuite auto-generates a **system special AP account** per use (e.g. "Sys. Gen.
+Accounts Payable") that resolves the vendor bill's AP posting automatically based on the vendor
+and subsidiary. Don't set an explicit `apAccountId` override for this — leaving it unset and
+letting NetSuite resolve it itself is the correct default; an explicit override can be rejected
+even when the underlying system account would have worked fine on its own.
 
 ## Duplicate Invoice Handling
 
@@ -180,6 +218,30 @@ The decision is stored on `extractedJson.meta.duplicateReview` and mirrored on t
 NetSuite preview and transaction logging both recompute the AP flow from the stored decision, so
 a duplicate that is still held logs as `HELD_FOR_REVIEW`, while an allowed duplicate can be queued
 when validation, configuration, and live-push settings permit it.
+
+## Auto-Booking
+
+`transformToNetSuite`/`validateNetSuiteRequest` are pure functions over already-loaded, non-secret
+config — no NetSuite call needed to know whether an invoice *would* resolve cleanly. `extract.ts`
+runs them inline right after VAT validation and duplicate detection (mirroring what the manual
+"NetSuite Preview" action does), so `reviewStatus`/`autoBookEligible` reflect live crosswalk
+resolution from the moment extraction finishes, not just extraction-quality signals.
+
+When `NETSUITE_AUTO_BOOK_ENABLED` is set and `flow.autoBookEligible` is true (see the Auto-Booking
+Criteria list in the main README), extraction itself logs and queues the NetSuite transaction —
+tagged `bookingMode: "AUTO"` — with no button click. Anything less than fully clean still lands in
+`NEEDS_REVIEW` exactly as before, and the manual "Approve & Send to NetSuite" action in the admin
+console remains available; it's tagged `bookingMode: "MANUAL"` and only refuses on a genuine
+blocker (`flow.hasBlockingFlags`), not on the stricter zero-warnings bar auto-booking uses — a
+human clicking that button already *is* the review a warning exists to prompt.
+
+The first-time-vendor guardrail (`firstTimeVendorHold` in `flow.ts`, checked via
+`hasVendorBookingHistory` in `transactions.ts`) holds the *first* transaction for any newly
+resolved vendor for manual approval, regardless of how clean everything else is, before that
+vendor becomes eligible for silent auto-booking. The history check is a bounded, best-effort scan
+of recent transactions (not a dedicated index) — accurate at this app's current scale, worth
+revisiting if transaction volume grows enough that "recent" stops covering a vendor's true first
+transaction.
 
 ## Configuration
 
@@ -265,6 +327,27 @@ PUT /record/v1/{recordType}/eid:{externalId}
 The durable transaction envelope records `recordType`, so replay uses the same NetSuite record
 type originally built for the invoice.
 
+**NetSuite's upsert-by-external-id PUT does not reliably do a full sublist replace on a repeat
+call for the same external ID** — observed directly in the sandbox: it appended a second copy of
+the expense lines instead of replacing them, doubling the recorded total. This surfaces after a
+client-side timeout on a request that actually completed on NetSuite's end (the abort races the
+real response, so our side records `FAILED_PERMANENT` while NetSuite has already committed the
+record). `upsertNetSuiteRecord` therefore does a `GET` on the same `eid:{externalId}` URL before
+every `PUT`; if the record already exists, that's treated as already succeeded
+(`UpsertResult.alreadyExisted: true`) and the `PUT` is skipped entirely, rather than trusting only
+the DynamoDB transaction ledger's own status to decide whether a push is safe to (re)attempt.
+
+If a duplicate does happen (e.g. from before this check existed), fix it directly in NetSuite —
+the REST API does not support removing a sublist line either (`DELETE`/`PATCH` on a line
+sub-resource return 405/404); a UI edit or void/recreate is the only path.
+
+The transaction ledger also mirrors `netSuiteTransactionId`/`netSuiteTransactionStatus`/
+`netSuiteBookingMode` onto the invoice row so both the manual approve endpoint
+(`createNetSuiteTransactionIfNeeded` in `transactions.ts`) and the auto-book path share one
+idempotency check. A transaction only blocks a fresh attempt while its status is genuinely live
+(`QUEUED`/`IN_FLIGHT`/`SUCCEEDED`); a stale `HELD_FOR_REVIEW`/`HELD_FOR_CONFIGURATION`/`FAILED_*`
+one is superseded by a new, freshly-validated attempt instead of blocking retries forever.
+
 ## Sandbox Validation Checklist
 
 - [ ] Confirm `vendorBill` `expense.items` is writable over REST in the target account.
@@ -276,12 +359,27 @@ type originally built for the invoice.
 - [ ] Confirm SuiteTax versus legacy tax behavior before sending per-line `taxCode`.
 - [ ] Populate and validate recipient/business-unit routing.
 - [ ] Confirm vendor, accounts, departments, classes, locations, and custom segments are shared
-      with the resolved subsidiary in OneWorld.
+      with the resolved subsidiary in OneWorld. Don't assume a single company-wide
+      `apAccountId`/`defaults.expenseAccountId` works for every subsidiary — check each real
+      subsidiary a live invoice will route through, not just the one used to configure it.
+- [ ] Confirm whether `Department` (and `Class`/`Location`) is a **mandatory body field** for the
+      target subsidiary's vendor bill form, not just per expense line — some OneWorld
+      configurations reject a bill with department set only on lines.
+- [ ] Leave `apAccountId` unset for subsidiaries whose AP posting is handled by NetSuite's own
+      system special account; only configure an explicit override where the account genuinely
+      needs one.
+- [ ] Deliberately test a retry (e.g. by replaying a transaction that already succeeded) and
+      confirm it does not create duplicate expense lines in NetSuite — the check-before-upsert
+      guard should make this a no-op, but verify against the actual target account.
 - [ ] Decide whether PO invoices should be transformed from/matched to purchase orders instead
       of directly posted as expense bills.
 - [ ] Compare extracted IBAN/BIC against the NetSuite vendor master before auto-booking.
 - [ ] Validate duplicate handling for same vendor/invoice/amount retries, corrected invoices,
       reminders, and proformas.
+- [ ] If enabling `netSuiteAutoBookEnabled`, confirm the first-time-vendor guardrail actually
+      holds a brand-new vendor's first invoice, and that the crosswalk is populated enough that
+      auto-booking isn't either a no-op (everything still holds on missing config) or overly
+      permissive (holes in the warning coverage let something through that shouldn't auto-book).
 - [ ] Build a companion SuiteScript RESTlet if original PDF attachment is required; REST Record
       API alone cannot upload file bytes.
 - [ ] Keep `netSuiteLivePushEnabled` false until sandbox validation and credentials are complete.

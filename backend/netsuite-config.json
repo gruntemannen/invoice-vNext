@@ -1,6 +1,6 @@
 {
   "_README": "NetSuite AP push config (mirrors NetSuiteConfig in backend/src/shared/netsuite.ts). NON-SECRET values only. Credentials live in Secrets Manager. Standard invoices map to vendorBill. Proforma invoices map to vendorPrepayment, so prepaymentPaymentAccountId must be the NetSuite bank/credit-card account used to fund the prepayment; prepaymentAccountId optionally overrides the prepayment asset account. Single-subsidiary scaffold: leave subsidiaryId empty/null for non-OneWorld; set it only for a true default OneWorld subsidiary. apAccountId = AP account internal id. defaults.expenseAccountId = line fallback/suspense account. businessUnitSegmentFieldId can be a custom segment field such as cseg_business_unit. Recipient routing maps buyer tax ID/name/entity code/email domain/address text to keys in businessUnits, which can set subsidiary, department, class, location, and custom fields. defaultBusinessUnitKey is used only after all recipient mapping options miss. vendorSync compares extracted and VAT-validation vendor data to the NetSuite vendor master and fills mapped blank fields before AP push. Empty objects mean nothing resolves and the transform emits warnings/placeholders.",
-  "subsidiaryId": null,
+  "subsidiaryId": "1",
   "apAccountId": null,
   "prepaymentPaymentAccountId": null,
   "prepaymentAccountId": null,
@@ -23,30 +23,66 @@
     }
   },
   "defaults": {
-    "expenseAccountId": null,
+    "expenseAccountId": "58",
     "departmentId": null,
     "classId": null,
     "locationId": null,
     "taxCodeId": null
   },
   "crosswalks": {
-    "vendorsByTaxId": {},
+    "vendorsByTaxId": {
+      "ATU54002500": "47"
+    },
     "vendorsByName": {},
     "accountsByCode": {},
-    "currenciesByCode": {},
+    "currenciesByCode": {
+      "CHF": "1",
+      "USD": "2",
+      "CAD": "3",
+      "EUR": "4",
+      "GBP": "5",
+      "INR": "6",
+      "SEK": "7",
+      "NOK": "8"
+    },
     "departmentsByCode": {},
     "classesByCode": {},
-    "termsByName": {},
+    "termsByName": {
+      "Net 60": "3",
+      "Pay immediately": "4",
+      "Net 10": "6",
+      "Net 14": "7",
+      "Net 15": "9",
+      "Net 19": "10",
+      "Net 20": "11",
+      "Net 7": "12",
+      "Net 45": "13",
+      "30 Tage netto ohne Abzug": "2"
+    },
     "subsidiariesByTaxId": {},
-    "subsidiariesByName": {},
+    "subsidiariesByName": {
+      "Censhare GmbH": "4"
+    },
     "purchaseOrdersByNumber": {},
     "businessUnitsByTaxId": {},
-    "businessUnitsByName": {},
+    "businessUnitsByName": {
+      "Censhare GmbH": "censhare-gmbh"
+    },
     "businessUnitsByEntityCode": {},
     "businessUnitsByEmailDomain": {},
     "businessUnitsByAddressContains": {}
   },
   "businessUnits": {
+    "censhare-gmbh": {
+      "businessUnitId": null,
+      "businessUnitName": "Censhare GmbH",
+      "subsidiaryId": "4",
+      "departmentId": "34",
+      "classId": null,
+      "locationId": null,
+      "customBodyFields": {},
+      "customLineFields": {}
+    },
     "_example": {
       "businessUnitId": null,
       "businessUnitName": "Example Business Unit",

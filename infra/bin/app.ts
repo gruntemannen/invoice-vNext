@@ -85,6 +85,7 @@ if (shouldDeploy("InvoiceExtractorStack")) {
     viesLookupEnabled: config.viesLookupEnabled,
     viesRequestTimeoutMs: config.viesRequestTimeoutMs,
     netSuiteLivePushEnabled: config.netSuiteLivePushEnabled,
+    netSuiteAutoBookEnabled: config.netSuiteAutoBookEnabled,
     cognito: cognitoConfig,
   });
 }

@@ -34,6 +34,7 @@ interface InvoiceExtractorStackProps extends cdk.StackProps {
   viesLookupEnabled: boolean;
   viesRequestTimeoutMs: number;
   netSuiteLivePushEnabled: boolean;
+  netSuiteAutoBookEnabled: boolean;
   cognito?: CognitoAuthConfig;
 }
 
@@ -278,6 +279,9 @@ export class InvoiceExtractorStack extends cdk.Stack {
         BEDROCK_MODEL_ID: bedrockModelId,
         VIES_LOOKUP_ENABLED: String(props.viesLookupEnabled),
         VIES_TIMEOUT_MS: String(props.viesRequestTimeoutMs),
+        NETSUITE_QUEUE_URL: netSuiteQueue.queueUrl,
+        NETSUITE_LIVE_PUSH_ENABLED: String(props.netSuiteLivePushEnabled),
+        NETSUITE_AUTO_BOOK_ENABLED: String(props.netSuiteAutoBookEnabled),
       },
       logRetention: lambdaLogRetention,
     });
@@ -314,6 +318,7 @@ export class InvoiceExtractorStack extends cdk.Stack {
     queue.grantConsumeMessages(extractFn);
     queue.grantSendMessages(apiFn);
     netSuiteQueue.grantSendMessages(apiFn);
+    netSuiteQueue.grantSendMessages(extractFn);
 
     // NetSuite OAuth 2.0 (M2M) credentials for the scaffolded push path. Populate the secret
     // value after deploy (or in a sandbox): { accountId, clientId, certificateId, privateKeyPem, alg }.

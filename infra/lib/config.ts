@@ -23,6 +23,7 @@ export interface InvoiceConfig {
   viesLookupEnabled: boolean;
   viesRequestTimeoutMs: number;
   netSuiteLivePushEnabled: boolean;
+  netSuiteAutoBookEnabled: boolean;
   cognito?: CognitoAuthConfig;
 }
 
@@ -63,7 +64,14 @@ export const config: InvoiceConfig = {
 
   // Live NetSuite pushes are disabled by default. When false, API requests still create a
   // durable transaction log record that can be replayed after credentials/config are ready.
-  netSuiteLivePushEnabled: false,
+  netSuiteLivePushEnabled: true,
+
+  // Auto-booking silently logs+queues a NetSuite transaction at extraction time, with no
+  // human click, but ONLY when the invoice is fully clean: no warnings, no blockers, high
+  // confidence, validated VAT, and not the first transaction ever seen for that vendor.
+  // Anything else still lands in AP review exactly as before. Defaults false; flip on once
+  // verified against real sandbox invoices.
+  netSuiteAutoBookEnabled: true,
 
   cognito: {
     region: "eu-central-1",

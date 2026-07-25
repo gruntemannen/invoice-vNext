@@ -29,6 +29,8 @@ function normalizeBusinessUnits(input: any): Record<string, NetSuiteBusinessUnit
       departmentId: blankToUndefined(route.departmentId),
       classId: blankToUndefined(route.classId),
       locationId: blankToUndefined(route.locationId),
+      apAccountId: blankToUndefined(route.apAccountId),
+      expenseAccountId: blankToUndefined(route.expenseAccountId),
       customBodyFields: normalizeCustomFields(route.customBodyFields),
       customLineFields: normalizeCustomFields(route.customLineFields),
     };

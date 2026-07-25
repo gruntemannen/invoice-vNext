@@ -185,6 +185,14 @@ export interface NetSuiteBusinessUnitRoute {
   departmentId?: string;
   classId?: string;
   locationId?: string;
+  /**
+   * Override the header AP account and/or default line expense account for this
+   * business unit's subsidiary. GL accounts in a OneWorld account are frequently
+   * subsidiary-scoped, so a single company-wide apAccountId/expenseAccountId
+   * default can be wrong for every subsidiary but the one it was set from.
+   */
+  apAccountId?: string;
+  expenseAccountId?: string;
   customBodyFields?: Record<string, NetSuiteCustomFieldValue>;
   customLineFields?: Record<string, NetSuiteCustomFieldValue>;
 }
@@ -271,6 +279,12 @@ export interface VendorBill {
   currency?: NetSuiteRef;
   terms?: NetSuiteRef;
   account?: NetSuiteRef; // AP account
+  // Some OneWorld subsidiaries require Department as a mandatory body field,
+  // not just per expense line — VendorPrepayment already set this; VendorBill
+  // never did until a live push against such a subsidiary surfaced the gap.
+  department?: NetSuiteRef;
+  class?: NetSuiteRef;
+  location?: NetSuiteRef;
   // TODO(sandbox): header-level `taxCode` / SuiteTax `taxDetails` — only one of
   // the two models applies depending on whether SuiteTax is installed. We emit
   // neither at the header today; reconciliation is surfaced as a warning instead.
@@ -778,7 +792,8 @@ export function buildNetSuiteConfigurationHints(
   const buyerName = String(buyer?.name ?? "").trim();
   const buyerEntityCode = String(buyer?.entityCode ?? "").trim();
   const buyerDomain = emailDomain(buyer?.email);
-  const routeResolved = Boolean(resolveBusinessUnitRouting(buyer, config, []));
+  const hintBusinessUnitRouting = resolveBusinessUnitRouting(buyer, config, []);
+  const routeResolved = Boolean(hintBusinessUnitRouting);
   const subsidiaryResolved =
     routeResolved ||
     hasMapping(cw.subsidiariesByTaxId, buyerTaxId) ||
@@ -840,7 +855,9 @@ export function buildNetSuiteConfigurationHints(
       const accountCode = String(line?.account ?? "").trim();
       return !accountCode || !hasMapping(cw.accountsByCode, accountCode);
     }) &&
+    !hintBusinessUnitRouting?.expenseAccountId &&
     !config.defaults?.expenseAccountId &&
+    !hintBusinessUnitRouting?.apAccountId &&
     !config.apAccountId;
   if (linesMissingAccount) {
     hints.push({
@@ -960,19 +977,25 @@ export function transformToNetSuite(
     warnings.push(`Currency "${currencyCode}" not in crosswalk; currency ref left unset.`);
   }
 
-  // --- Terms --------------------------------------------------------------
+  // --- Terms ----------------------------------------------------------------
+  // Only set `terms` when the extracted text has an explicit crosswalk match.
+  // Leaving it unset when unmapped is not a gap: NetSuite applies the vendor
+  // record's own default terms to a bill that omits the field, so an unmapped
+  // value doesn't need AP review the way an unresolved vendor/currency/account
+  // does. No warning here by design.
   let terms: NetSuiteRef | undefined;
   const paymentTerms: string = invoice?.paymentTerms ?? "";
   if (paymentTerms && cw.termsByName[paymentTerms]) {
     terms = { id: cw.termsByName[paymentTerms] };
-  } else if (paymentTerms) {
-    warnings.push(`Payment terms "${paymentTerms}" not in crosswalk; terms ref left unset.`);
   }
 
   // --- Header AP account --------------------------------------------------
+  // Prefer the business unit's subsidiary-scoped account, since GL accounts are
+  // frequently restricted per subsidiary in a OneWorld account.
   let account: NetSuiteRef | undefined;
-  if (config.apAccountId) {
-    account = { id: config.apAccountId };
+  const resolvedApAccountId = businessUnitRouting?.apAccountId ?? config.apAccountId;
+  if (resolvedApAccountId) {
+    account = { id: resolvedApAccountId };
   }
 
   // --- Subsidiary/entity routing -----------------------------------------
@@ -1018,15 +1041,19 @@ export function transformToNetSuite(
     const lineNo = toNumber(line?.lineNumber) || index + 1;
     const amount = round2(toNumber(line?.amount));
 
-    // GL account resolution
+    // GL account resolution. The business unit's subsidiary-scoped default (if
+    // configured) wins over the company-wide default/AP account, for the same
+    // subsidiary-restricted-accounts reason as the header account above.
     let lineAccount: NetSuiteRef | undefined;
     const glCode: string = line?.account ?? "";
+    const fallbackExpenseAccountId =
+      businessUnitRouting?.expenseAccountId ?? config.defaults?.expenseAccountId ?? resolvedApAccountId;
     if (glCode && cw.accountsByCode[glCode]) {
       lineAccount = { id: cw.accountsByCode[glCode] };
-    } else if (config.defaults?.expenseAccountId || config.apAccountId) {
+    } else if (fallbackExpenseAccountId) {
       // Fall back to a configured default/suspense account so the bill still
       // balances, but flag it for review.
-      const fallbackAccountId = config.defaults?.expenseAccountId ?? config.apAccountId ?? "";
+      const fallbackAccountId = fallbackExpenseAccountId;
       lineAccount = { id: fallbackAccountId };
       warnings.push(
         `Line ${lineNo}: GL account "${glCode}" not in crosswalk; fell back to default account ${fallbackAccountId}.`
@@ -1178,6 +1205,15 @@ export function transformToNetSuite(
   if (currency) bill.currency = currency;
   if (terms) bill.terms = terms;
   if (account) bill.account = account;
+  if (businessUnitRouting?.departmentId || config.defaults?.departmentId) {
+    bill.department = asRef(businessUnitRouting?.departmentId ?? config.defaults?.departmentId);
+  }
+  if (businessUnitRouting?.classId || config.defaults?.classId) {
+    bill.class = asRef(businessUnitRouting?.classId ?? config.defaults?.classId);
+  }
+  if (businessUnitRouting?.locationId || config.defaults?.locationId) {
+    bill.location = asRef(businessUnitRouting?.locationId ?? config.defaults?.locationId);
+  }
   applyBusinessUnitSegment(bill as unknown as Record<string, unknown>, config, businessUnitRouting);
   applyCustomFields(bill as unknown as Record<string, unknown>, businessUnitRouting?.customBodyFields);
 
@@ -1670,6 +1706,15 @@ export interface UpsertResult {
   location: string | null;
   /** Parsed body when present (NetSuite often returns 204 with no body). */
   body: unknown;
+  /**
+   * True when a record with this externalId was already found in NetSuite and
+   * the PUT was skipped entirely. NetSuite's upsert-by-externalId PUT does not
+   * reliably replace sublist (line) items on a repeat call — it can append a
+   * second copy instead — so a retry (e.g. after a client-side timeout where
+   * the first PUT actually succeeded server-side) must not re-PUT once the
+   * record exists.
+   */
+  alreadyExisted?: boolean;
 }
 
 export function asNetSuitePushRequest(
@@ -1749,6 +1794,33 @@ export async function upsertNetSuiteRecord(
   const url = `${restBase(secret, options)}${recordApiPath(options)}/${recordIdFor(request, options)}/eid:${encodeURIComponent(
     safeEid
   )}`;
+
+  // Check first: a prior attempt may have timed out client-side after NetSuite
+  // had already committed the record. PUTting again in that case risks
+  // duplicating sublist items rather than replacing them (observed directly in
+  // the sandbox). If it already exists, treat this as already succeeded.
+  const existingRes = await fetchWithTimeout(
+    url,
+    { method: "GET", headers: { authorization: `Bearer ${token}` } },
+    options?.requestTimeoutMs
+  );
+  if (existingRes.ok) {
+    const existingText = await existingRes.text().catch(() => "");
+    let existingBody: unknown = null;
+    if (existingText) {
+      try {
+        existingBody = JSON.parse(existingText);
+      } catch {
+        existingBody = existingText;
+      }
+    }
+    return {
+      status: existingRes.status,
+      location: existingRes.headers.get("location") ?? existingRes.url,
+      body: existingBody,
+      alreadyExisted: true,
+    };
+  }
 
   const res = await fetchWithTimeout(url, {
     method: "PUT",

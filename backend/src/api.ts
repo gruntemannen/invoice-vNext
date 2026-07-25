@@ -25,7 +25,7 @@ import {
 } from "./shared/flow";
 import {
   canReplay,
-  createNetSuiteTransaction,
+  createNetSuiteTransactionIfNeeded,
   getNetSuiteTransaction,
   listNetSuiteTransactions,
   markTransactionFailed,
@@ -120,8 +120,17 @@ async function listInvoices(event: APIGatewayProxyEventV2) {
     }
     throw err;
   }
-  const items = result.items.map((rawItem: any) => {
+  const items = await Promise.all(result.items.map(async (rawItem: any) => {
     const item = withDerivedFlow(rawItem);
+    // The mirrored netSuiteTransactionStatus only reflects the status at creation
+    // time — the worker updates the transaction record as it progresses but never
+    // writes back to the invoice row. Read the transaction live so the list can't
+    // show a stale "queued" for something that has since succeeded or failed.
+    let netSuiteTransactionStatus = item.netSuiteTransactionStatus;
+    if (item.netSuiteTransactionId) {
+      const transaction = await getNetSuiteTransaction(TABLE_NAME, item.netSuiteTransactionId);
+      if (transaction) netSuiteTransactionStatus = transaction.status;
+    }
     return {
       messageId: item.messageId,
       attachmentId: item.attachmentId,
@@ -130,9 +139,12 @@ async function listInvoices(event: APIGatewayProxyEventV2) {
       from: item.from,
       subject: item.subject,
       status: item.status,
+      displayStatus: computeDisplayStatus(item, netSuiteTransactionStatus),
       reviewStatus: item.reviewStatus ?? item.extractedJson?.meta?.reviewStatus,
       autoBookEligible: item.autoBookEligible ?? item.extractedJson?.meta?.autoBookEligible,
       controlFlags: item.controlFlags ?? item.extractedJson?.meta?.controlFlags ?? [],
+      netSuiteTransactionStatus,
+      netSuiteBookingMode: item.netSuiteBookingMode,
       confidence: item.confidence,
       warnings: item.warnings ?? [],
       vendorName: item.vendorName,
@@ -149,7 +161,7 @@ async function listInvoices(event: APIGatewayProxyEventV2) {
       totalAmount: item.totalAmount,
       duplicateCount: item.duplicateCount ?? item.extractedJson?.meta?.duplicateCount ?? 0,
     };
-  });
+  }));
 
   return jsonResponse({ items, nextToken: result.nextToken });
 }
@@ -166,7 +178,20 @@ async function getInvoiceDetail(event: APIGatewayProxyEventV2) {
   if (!item) {
     return jsonResponse({ message: "Not found" }, 404);
   }
-  return jsonResponse(withDerivedFlow(item));
+
+  const derived = withDerivedFlow(item);
+  if (item.netSuiteTransactionId) {
+    const transaction = await getNetSuiteTransaction(TABLE_NAME, item.netSuiteTransactionId);
+    if (transaction) {
+      return jsonResponse({
+        ...derived,
+        netSuiteTransaction: summarizeTransaction(transaction),
+        // Prefer the live transaction status over the (possibly lagging) mirrored one.
+        displayStatus: computeDisplayStatus(item, transaction.status),
+      });
+    }
+  }
+  return jsonResponse(derived);
 }
 
 async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
@@ -221,7 +246,11 @@ async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2
     let status: NetSuiteTransactionStatus = "QUEUED";
     let eventMessage = "Transaction logged and queued for NetSuite push.";
 
-    if (!preview.validation.valid || preview.flow.reviewStatus !== "READY_FOR_NETSUITE") {
+    // A human clicking this IS the review — only a real blocker (missing vendor,
+    // unresolved duplicate, unresolved NetSuite placeholder, etc.) should refuse
+    // the push. Advisory warnings the auto-book path holds on are fine to send
+    // once someone has looked at them.
+    if (preview.flow.hasBlockingFlags) {
       status = "HELD_FOR_REVIEW";
       eventMessage = "Transaction logged but held for AP review.";
     } else if (!NETSUITE_LIVE_PUSH_ENABLED) {
@@ -229,18 +258,32 @@ async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2
       eventMessage = "Transaction logged but live NetSuite push is disabled.";
     }
 
-    const transaction = await createNetSuiteTransaction(TABLE_NAME, {
-      invoiceMessageId: item.messageId,
-      invoiceAttachmentKey: item.attachmentKey,
-      invoiceAttachmentId: item.attachmentId,
-      externalId: preview.request.externalId,
-      requestPayload: preview.request,
-      validation: preview.validation,
-      flow: preview.flow,
-      warnings: preview.warnings,
-      status,
-      eventMessage,
-    });
+    const { transaction, created } = await createNetSuiteTransactionIfNeeded(
+      TABLE_NAME,
+      { messageId: item.messageId, attachmentKey: item.attachmentKey, attachmentId: item.attachmentId, netSuiteTransactionId: item.netSuiteTransactionId },
+      {
+        externalId: preview.request.externalId,
+        requestPayload: preview.request,
+        validation: preview.validation,
+        flow: preview.flow,
+        warnings: preview.warnings,
+        status,
+        eventMessage,
+        bookingMode: "MANUAL",
+        bookedBy: actorFromEvent(event),
+      }
+    );
+
+    if (!created) {
+      return jsonResponse({
+        message: "This invoice already has a logged NetSuite transaction.",
+        transaction: summarizeTransaction(transaction),
+        flow: preview.flow,
+        validation: preview.validation,
+        configurationHints: preview.configurationHints,
+        queued: false,
+      });
+    }
 
     if (status === "QUEUED") {
       try {
@@ -661,15 +704,57 @@ function claimGroups(value: unknown): string[] {
   return [];
 }
 
+/**
+ * Overall lifecycle status shown to AP, distinct from the raw extraction
+ * `status` and from `reviewStatus` (both still available underneath):
+ *   IMPORTED  - still being extracted (not COMPLETED yet)
+ *   FAILED    - extraction failed, or NetSuite rejected it permanently
+ *   ON_HOLD   - extracted but not yet successfully in NetSuite: needs AP review,
+ *               a config gap, an outage/retryable failure, or simply not sent yet
+ *   PROCESSED - the NetSuite transaction succeeded
+ */
+export type DisplayStatus = "IMPORTED" | "FAILED" | "ON_HOLD" | "PROCESSED";
+
+function computeDisplayStatus(item: any, netSuiteStatus: string | null | undefined): DisplayStatus {
+  if (item.status === "FAILED" || netSuiteStatus === "FAILED_PERMANENT") return "FAILED";
+  if (item.status !== "COMPLETED") return "IMPORTED";
+  if (netSuiteStatus === "SUCCEEDED") return "PROCESSED";
+  return "ON_HOLD";
+}
+
+/**
+ * Recomputes reviewStatus/flags fresh every time, folding in current NetSuite
+ * crosswalk resolution (transformToNetSuite/validateNetSuiteRequest are pure and
+ * only need the already-loaded config, no extra NetSuite/DB calls). This is what
+ * fixes reviewStatus going stale on older invoices extracted before a crosswalk
+ * was filled in — the stored value never used to get NetSuite warnings folded in
+ * at all, and only recomputed when nothing had been stored yet.
+ */
 function withDerivedFlow(item: any) {
-  if (!item || item.reviewStatus || item.status !== "COMPLETED" || !item.extractedJson) {
-    return item;
+  if (!item) return item;
+  if (item.status !== "COMPLETED" || !item.extractedJson) {
+    return { ...item, displayStatus: computeDisplayStatus(item, item.netSuiteTransactionStatus) };
+  }
+
+  let netSuiteWarnings: string[] | undefined;
+  let netSuiteValidationErrors: string[] | undefined;
+  try {
+    const config = loadNetSuiteConfig();
+    const { request, warnings } = transformToNetSuite(item.extractedJson, config);
+    const validation = validateNetSuiteRequest(request, config);
+    netSuiteWarnings = warnings;
+    netSuiteValidationErrors = validation.errors;
+  } catch {
+    // Leave NetSuite-specific signals out if the transform itself throws; the
+    // extraction-only flags below still apply.
   }
 
   const flow = assessInvoiceFlow(item.extractedJson, {
     confidence: item.confidence,
     warnings: item.warnings ?? item.extractedJson?.meta?.warnings ?? [],
     duplicateCount: item.duplicateCount ?? item.extractedJson?.meta?.duplicateCount ?? 0,
+    netSuiteWarnings,
+    netSuiteValidationErrors,
   });
 
   return {
@@ -678,5 +763,6 @@ function withDerivedFlow(item: any) {
     autoBookEligible: flow.autoBookEligible,
     controlFlags: flow.flags,
     duplicateCount: flow.duplicateCount,
+    displayStatus: computeDisplayStatus(item, item.netSuiteTransactionStatus),
   };
 }

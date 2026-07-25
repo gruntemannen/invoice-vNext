@@ -65,6 +65,7 @@ export const handler = async (event: SQSEvent) => {
         transactionId,
         externalId: transaction.externalId,
         vendorSyncStatus: vendorSync.status,
+        alreadyExisted: result.alreadyExisted ?? false,
       });
     } catch (err: any) {
       const message = err?.message ?? String(err);
@@ -87,7 +88,7 @@ class RetryableNetSuiteError extends Error {}
 function isRetryableNetSuiteError(err: any): boolean {
   if (err instanceof RetryableNetSuiteError) return true;
   const msg = String(err?.message ?? err ?? "").toLowerCase();
-  if (/(timeout|timed out|econnreset|etimedout|network|socket|fetch failed)/i.test(msg)) return true;
+  if (/(timeout|timed out|aborted|econnreset|etimedout|network|socket|fetch failed)/i.test(msg)) return true;
   const status = msg.match(/(?:failed|request failed):\s*(\d{3})/i)?.[1];
   if (!status) return false;
   const code = Number(status);

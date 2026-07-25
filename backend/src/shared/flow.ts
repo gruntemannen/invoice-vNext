@@ -25,6 +25,15 @@ export interface DuplicateMatch {
 export interface FlowAssessment {
   reviewStatus: ReviewStatus;
   autoBookEligible: boolean;
+  /**
+   * True only when a blocker-severity flag is present (missing vendor, unresolved
+   * duplicate, unresolved NetSuite placeholder, etc.) — data that genuinely can't
+   * go to NetSuite. False when only warning-severity flags exist (unmapped GL
+   * account defaulted, first-time vendor, etc.), which a human can review and
+   * knowingly approve past. `reviewStatus` stays the stricter "any flag at all"
+   * signal used to gate silent auto-booking.
+   */
+  hasBlockingFlags: boolean;
   duplicateKey: string | null;
   duplicateCount: number;
   duplicateReview: DuplicateReviewDecision | null;
@@ -39,6 +48,12 @@ export interface FlowAssessmentOptions {
   netSuiteWarnings?: string[];
   netSuiteValidationErrors?: string[];
   minimumAutoBookConfidence?: number;
+  /**
+   * True when this is the first NetSuite transaction ever seen for this resolved
+   * vendor. Forces NEEDS_REVIEW so a human approves booking for a vendor at least
+   * once before it becomes eligible for silent auto-booking.
+   */
+  firstTimeVendorHold?: boolean;
 }
 
 export interface DuplicateReviewDecision {
@@ -107,6 +122,24 @@ export function assessInvoiceFlow(
       code: "missing_vendor",
       severity: "blocker",
       message: "Vendor/supplier could not be identified.",
+    });
+  }
+
+  const vatStatus = vendor.vatValidation?.status;
+  if (hasValue(vendor.taxId) && vatStatus !== "VALID") {
+    flags.push({
+      code: "vat_not_validated",
+      severity: "warning",
+      message: `Vendor VAT status is ${vatStatus ?? "unknown"}; NetSuite push requires a validated VAT number.`,
+    });
+  }
+
+  if (options.firstTimeVendorHold) {
+    flags.push({
+      code: "first_time_vendor_auto_book_hold",
+      severity: "warning",
+      message:
+        "This is the first NetSuite transaction seen for this vendor; holding for AP review before this vendor becomes eligible for silent auto-booking.",
     });
   }
 
@@ -263,6 +296,7 @@ export function assessInvoiceFlow(
   return {
     reviewStatus,
     autoBookEligible,
+    hasBlockingFlags: blocking,
     duplicateKey,
     duplicateCount,
     duplicateReview,

@@ -1,4 +1,5 @@
 import { SQSEvent } from "aws-lambda";
+import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { getObject } from "./shared/s3";
 import { queryDuplicateInvoices, updateItem } from "./shared/dynamo";
 import { invokeBedrock, DocumentInput } from "./shared/bedrock";
@@ -6,6 +7,9 @@ import { buildExtractionPrompt, buildRepairPrompt } from "./shared/prompts";
 import { calculateConfidence } from "./shared/confidence";
 import { assessInvoiceFlow, buildDuplicateKey, summarizeDuplicateMatch } from "./shared/flow";
 import { enrichExtractionWithVatLookup } from "./shared/vies";
+import { transformToNetSuite, validateNetSuiteRequest } from "./shared/netsuite";
+import { loadNetSuiteConfig } from "./shared/netsuite-config";
+import { createNetSuiteTransactionIfNeeded, hasVendorBookingHistory } from "./shared/transactions";
 import { log } from "./shared/logger";
 import { emitMetric } from "./shared/metrics";
 
@@ -18,6 +22,10 @@ const VIES_LOOKUP_ENABLED = process.env.VIES_LOOKUP_ENABLED !== "false";
 const VIES_API_BASE_URL = process.env.VIES_API_BASE_URL;
 const SWISS_UID_API_BASE_URL = process.env.SWISS_UID_API_BASE_URL;
 const VIES_TIMEOUT_MS = Number(process.env.VIES_TIMEOUT_MS ?? "6000");
+const NETSUITE_QUEUE_URL = process.env.NETSUITE_QUEUE_URL ?? "";
+const NETSUITE_LIVE_PUSH_ENABLED = process.env.NETSUITE_LIVE_PUSH_ENABLED === "true";
+const NETSUITE_AUTO_BOOK_ENABLED = process.env.NETSUITE_AUTO_BOOK_ENABLED === "true";
+const sqs = new SQSClient({});
 
 export const handler = async (event: SQSEvent) => {
   for (const record of event.Records) {
@@ -122,10 +130,44 @@ export const handler = async (event: SQSEvent) => {
         }
       }
 
+      // 9b. NetSuite transform/validation is a pure function over already-loaded,
+      // non-secret config, so it can run inline instead of waiting for a human to
+      // open the invoice and click "Preview". This lets reviewStatus reflect
+      // crosswalk resolution (vendor/currency/subsidiary/account) immediately.
+      let netSuitePreview: {
+        request: ReturnType<typeof transformToNetSuite>["request"];
+        warnings: string[];
+        validation: ReturnType<typeof validateNetSuiteRequest>;
+      } | null = null;
+      try {
+        const netSuiteConfig = loadNetSuiteConfig();
+        const { request, warnings: transformWarnings } = transformToNetSuite(normalized, netSuiteConfig);
+        const validation = validateNetSuiteRequest(request, netSuiteConfig);
+        netSuitePreview = { request, warnings: transformWarnings, validation };
+      } catch (err: any) {
+        log.warn("NetSuite transform failed during extraction", {
+          messageId,
+          error: err?.message ?? String(err),
+        });
+      }
+
+      const vendorEntityId = (netSuitePreview?.request?.payload as any)?.entity?.id;
+      let firstTimeVendorHold = false;
+      if (NETSUITE_AUTO_BOOK_ENABLED && vendorEntityId) {
+        try {
+          firstTimeVendorHold = !(await hasVendorBookingHistory(TABLE_NAME, vendorEntityId));
+        } catch (err: any) {
+          log.warn("Vendor booking history lookup failed", { messageId, error: err?.message ?? String(err) });
+        }
+      }
+
       const flow = assessInvoiceFlow(normalized, {
         confidence,
         warnings,
         duplicateCount: duplicateMatches.length,
+        netSuiteWarnings: netSuitePreview?.warnings,
+        netSuiteValidationErrors: netSuitePreview?.validation.errors,
+        firstTimeVendorHold,
       });
       normalized.meta.reviewStatus = flow.reviewStatus;
       normalized.meta.autoBookEligible = flow.autoBookEligible;
@@ -172,6 +214,59 @@ export const handler = async (event: SQSEvent) => {
         { messageId, attachmentKey },
         updates
       );
+
+      // 10b. Auto-book: only when explicitly enabled, the invoice is fully clean
+      // (no warnings, no blockers, high confidence, not a first-time vendor), and
+      // the NetSuite transform actually validated. Everything else stays exactly
+      // as before — held for AP review, no transaction created until a human acts.
+      if (NETSUITE_AUTO_BOOK_ENABLED && flow.autoBookEligible && netSuitePreview?.validation.valid) {
+        try {
+          let txStatus: "QUEUED" | "HELD_FOR_CONFIGURATION" = "QUEUED";
+          let txEventMessage = "Transaction auto-logged and queued for NetSuite push.";
+          if (!NETSUITE_LIVE_PUSH_ENABLED) {
+            txStatus = "HELD_FOR_CONFIGURATION";
+            txEventMessage = "Transaction auto-logged but live NetSuite push is disabled.";
+          }
+
+          const { transaction, created } = await createNetSuiteTransactionIfNeeded(
+            TABLE_NAME,
+            { messageId, attachmentKey, attachmentId },
+            {
+              externalId: netSuitePreview.request.externalId,
+              requestPayload: netSuitePreview.request,
+              validation: netSuitePreview.validation,
+              flow,
+              warnings: netSuitePreview.warnings,
+              status: txStatus,
+              eventMessage: txEventMessage,
+              bookingMode: "AUTO",
+            }
+          );
+
+          if (created && txStatus === "QUEUED") {
+            if (!NETSUITE_QUEUE_URL) {
+              throw new Error("NETSUITE_QUEUE_URL is not configured");
+            }
+            await sqs.send(
+              new SendMessageCommand({
+                QueueUrl: NETSUITE_QUEUE_URL,
+                MessageBody: JSON.stringify({ transactionId: transaction.transactionId }),
+              })
+            );
+          }
+          log.info("Invoice auto-booked to NetSuite", {
+            messageId,
+            transactionId: transaction.transactionId,
+            status: txStatus,
+            created,
+          });
+        } catch (err: any) {
+          log.warn("Auto-book failed; invoice remains available for manual approval", {
+            messageId,
+            error: err?.message ?? String(err),
+          });
+        }
+      }
 
       emitMetric("ExtractionSuccess", 1, "Count", { Model: modelUsed });
       emitMetric("ExtractionDurationMs", Date.now() - startTime, "Milliseconds");

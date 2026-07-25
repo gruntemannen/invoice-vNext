@@ -1,6 +1,8 @@
 import { GetCommand, PutCommand, QueryCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto";
-import { docClient } from "./dynamo";
+import { docClient, updateItem } from "./dynamo";
+
+export type NetSuiteBookingMode = "AUTO" | "MANUAL";
 
 export type NetSuiteTransactionStatus =
   | "HELD_FOR_REVIEW"
@@ -36,6 +38,8 @@ export interface NetSuiteTransaction {
   validation?: unknown;
   flow?: unknown;
   warnings?: string[];
+  bookingMode: NetSuiteBookingMode;
+  bookedBy?: string;
   createdAt: string;
   updatedAt: string;
   attemptCount: number;
@@ -63,6 +67,8 @@ export interface CreateNetSuiteTransactionInput {
   warnings?: string[];
   status: NetSuiteTransactionStatus;
   eventMessage: string;
+  bookingMode: NetSuiteBookingMode;
+  bookedBy?: string;
 }
 
 const TX_SORT_KEY = "TRANSACTION";
@@ -99,6 +105,8 @@ export async function createNetSuiteTransaction(
     validation: input.validation,
     flow: input.flow,
     warnings: input.warnings ?? [],
+    bookingMode: input.bookingMode,
+    bookedBy: input.bookedBy,
     createdAt: now,
     updatedAt: now,
     attemptCount: 0,
@@ -126,6 +134,79 @@ export async function createNetSuiteTransaction(
   );
 
   return item;
+}
+
+export interface InvoiceItemRef {
+  messageId: string;
+  attachmentKey: string;
+  attachmentId?: string;
+  netSuiteTransactionId?: string;
+}
+
+// Statuses where a transaction has genuinely reached or is actively pursuing NetSuite —
+// creating a second one here would risk a real double-push. Anything else (held for
+// review/configuration, or failed) is safe to supersede with a freshly-validated attempt,
+// e.g. after AP fixes a crosswalk gap or config that caused the original hold.
+const LIVE_TRANSACTION_STATUSES: NetSuiteTransactionStatus[] = ["QUEUED", "IN_FLIGHT", "SUCCEEDED"];
+
+/**
+ * Creates a NetSuite transaction for this invoice, unless one already exists in a
+ * live/terminal-success state (tracked via the mirrored `netSuiteTransactionId` on
+ * the invoice item). Both the manual "approve & send" endpoint and the
+ * extraction-time auto-book path share this so a re-processed extraction or a
+ * repeated click can't double-push. A prior HELD_FOR_REVIEW/HELD_FOR_CONFIGURATION/
+ * FAILED_* transaction is superseded by a fresh one instead of blocking retries.
+ */
+export async function createNetSuiteTransactionIfNeeded(
+  tableName: string,
+  invoiceItem: InvoiceItemRef,
+  input: Omit<CreateNetSuiteTransactionInput, "invoiceMessageId" | "invoiceAttachmentKey" | "invoiceAttachmentId">
+): Promise<{ transaction: NetSuiteTransaction; created: boolean }> {
+  if (invoiceItem.netSuiteTransactionId) {
+    const existing = await getNetSuiteTransaction(tableName, invoiceItem.netSuiteTransactionId);
+    if (existing && LIVE_TRANSACTION_STATUSES.includes(existing.status)) {
+      return { transaction: existing, created: false };
+    }
+  }
+
+  const transaction = await createNetSuiteTransaction(tableName, {
+    ...input,
+    invoiceMessageId: invoiceItem.messageId,
+    invoiceAttachmentKey: invoiceItem.attachmentKey,
+    invoiceAttachmentId: invoiceItem.attachmentId,
+  });
+
+  await updateItem(
+    tableName,
+    { messageId: invoiceItem.messageId, attachmentKey: invoiceItem.attachmentKey },
+    {
+      netSuiteTransactionId: transaction.transactionId,
+      netSuiteTransactionStatus: transaction.status,
+      netSuiteBookingMode: transaction.bookingMode,
+      netSuiteTransactionUpdatedAt: transaction.updatedAt,
+    }
+  );
+
+  return { transaction, created: true };
+}
+
+/**
+ * Approximates "has a human ever approved (or has NetSuite ever accepted) a
+ * transaction for this vendor" by scanning the most recent transactions. Bounded
+ * and best-effort by design — see NETSUITE-INTEGRATION.md for the tradeoff.
+ */
+export async function hasVendorBookingHistory(
+  tableName: string,
+  vendorEntityId: string | undefined,
+  scanLimit = 300
+): Promise<boolean> {
+  if (!vendorEntityId) return false;
+  const { items } = await listNetSuiteTransactions(tableName, scanLimit);
+  return items.some((item) => {
+    const entityId = (item.requestPayload as any)?.payload?.entity?.id;
+    if (entityId !== vendorEntityId) return false;
+    return item.status === "SUCCEEDED" || item.bookingMode === "MANUAL";
+  });
 }
 
 function stripUndefined(value: unknown): unknown {
@@ -287,6 +368,8 @@ export function summarizeTransaction(item: NetSuiteTransaction) {
   return {
     transactionId: item.transactionId,
     status: item.status,
+    bookingMode: item.bookingMode,
+    bookedBy: item.bookedBy,
     invoiceMessageId: item.invoiceMessageId,
     invoiceAttachmentId: item.invoiceAttachmentId,
     externalId: item.externalId,

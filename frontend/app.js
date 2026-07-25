@@ -238,36 +238,34 @@ function confidenceClass(c) {
   return "low";
 }
 
-function statusClass(status) {
+// Unified lifecycle status: IMPORTED (still extracting) -> ON_HOLD (needs AP review, a
+// config gap, or an outage/retryable NetSuite failure) -> PROCESSED (NetSuite succeeded),
+// or FAILED at any point extraction/NetSuite permanently rejects it. Replaces the old
+// separate "Status" (extraction-only) + "Review" badges, which didn't tell AP whether an
+// invoice had actually reached NetSuite.
+function displayStatusClass(status) {
   switch (status) {
-    case "COMPLETED":
+    case "PROCESSED":
       return "ok";
     case "FAILED":
       return "fail";
-    case "PENDING":
-      return "pending";
+    case "ON_HOLD":
+    case "IMPORTED":
     default:
       return "pending";
   }
 }
 
-function reviewClass(status) {
+function fmtDisplayStatus(status) {
   switch (status) {
-    case "READY_FOR_NETSUITE":
-      return "ok";
-    case "NEEDS_REVIEW":
-      return "pending";
-    default:
-      return "pending";
-  }
-}
-
-function fmtReviewStatus(status) {
-  switch (status) {
-    case "READY_FOR_NETSUITE":
-      return "Ready";
-    case "NEEDS_REVIEW":
-      return "Review";
+    case "IMPORTED":
+      return "Imported";
+    case "FAILED":
+      return "Failed";
+    case "ON_HOLD":
+      return "On hold";
+    case "PROCESSED":
+      return "Processed";
     default:
       return "—";
   }
@@ -301,6 +299,131 @@ function renderVatValidation(d) {
   const provider = validation.provider === "CH_UID" ? "Swiss UID" : validation.provider === "EU_VIES" ? "VIES" : "";
   const match = validation.matches?.traderName === "INVALID" ? " name mismatch" : "";
   return `<span class="badge ${cls}">${escapeHtml(status)}</span> ${escapeHtml(provider ? provider + " " : "")}${escapeHtml(number)}${escapeHtml(match)}`;
+}
+
+function netSuiteTransactionStatus(d) {
+  return d.netSuiteTransaction?.status ?? d.netSuiteTransactionStatus ?? null;
+}
+
+function netSuiteBookingMode(d) {
+  return d.netSuiteTransaction?.bookingMode ?? d.netSuiteBookingMode ?? null;
+}
+
+function netSuiteStatusClass(status) {
+  switch (status) {
+    case "SUCCEEDED":
+    case "QUEUED":
+      return "ok";
+    case "FAILED_RETRYABLE":
+    case "FAILED_PERMANENT":
+      return "fail";
+    default:
+      return "pending";
+  }
+}
+
+function fmtNetSuiteStatus(status) {
+  switch (status) {
+    case "QUEUED":
+      return "Queued";
+    case "IN_FLIGHT":
+      return "Sending…";
+    case "SUCCEEDED":
+      return "Sent to NetSuite";
+    case "FAILED_RETRYABLE":
+      return "Failed (retryable)";
+    case "FAILED_PERMANENT":
+      return "Failed";
+    case "HELD_FOR_REVIEW":
+      return "Held for review";
+    case "HELD_FOR_CONFIGURATION":
+      return "Held (live push disabled)";
+    default:
+      return status || "—";
+  }
+}
+
+function renderNetSuiteStatus(d) {
+  const status = netSuiteTransactionStatus(d);
+  if (!status) return "Not sent yet";
+  const mode = netSuiteBookingMode(d);
+  const modeTag = mode === "AUTO" ? " · auto-booked" : mode === "MANUAL" ? " · manually approved" : "";
+  return `<span class="badge ${netSuiteStatusClass(status)}">${escapeHtml(fmtNetSuiteStatus(status))}</span>${escapeHtml(modeTag)}`;
+}
+
+// Renders the actual registry response used to validate the vendor's VAT number
+// (EU VIES / Swiss UID) — the officially registered name/address, not just the
+// pass/fail badge shown in the summary grid. This is what a future "push to
+// NetSuite vendor master" feature would source its fields from.
+function matchBadgeClass(match) {
+  switch (match) {
+    case "VALID":
+      return "ok";
+    case "INVALID":
+      return "fail";
+    default:
+      return "pending";
+  }
+}
+
+function renderVatRegistryPanel(d) {
+  const panel = $("vat-registry-panel");
+  if (!panel) return;
+
+  const v = d.extractedJson?.vendor?.vatValidation;
+  if (!v || !v.status || v.status === "SKIPPED") {
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return;
+  }
+
+  const providerLabel = v.provider === "CH_UID" ? "Swiss UID (FTA)" : v.provider === "EU_VIES" ? "EU VIES" : v.provider || "—";
+  const matchRows = Object.entries(v.matches ?? {})
+    .filter(([, value]) => value && value !== "NOT_PROCESSED")
+    .map(
+      ([key, value]) =>
+        `<div class="meta-item">
+          <span class="meta-label">${escapeHtml(key.replace(/^trader/, "").replace(/([A-Z])/g, " $1").trim())}</span>
+          <span class="meta-value"><span class="badge ${matchBadgeClass(value)}">${escapeHtml(value)}</span></span>
+        </div>`
+    )
+    .join("");
+
+  const registeredName = v.name || v.traderName;
+  const registeredAddress = v.address;
+
+  panel.classList.remove("hidden");
+  panel.innerHTML = `
+    <div class="panel-title">Vendor VAT registry data (${escapeHtml(providerLabel)})</div>
+    <div class="meta-grid">
+      <div class="meta-item">
+        <span class="meta-label">Status</span>
+        <span class="meta-value"><span class="badge ${v.status === "VALID" ? "ok" : v.status === "INVALID" ? "fail" : "pending"}">${escapeHtml(v.status)}</span></span>
+      </div>
+      <div class="meta-item">
+        <span class="meta-label">VAT number</span>
+        <span class="meta-value">${escapeHtml(v.normalizedVat || "—")}</span>
+      </div>
+      <div class="meta-item">
+        <span class="meta-label">Registered name</span>
+        <span class="meta-value">${escapeHtml(registeredName || "—")}</span>
+      </div>
+      <div class="meta-item">
+        <span class="meta-label">Registered address</span>
+        <span class="meta-value">${escapeHtml(registeredAddress || "—")}</span>
+      </div>
+      ${matchRows}
+      <div class="meta-item">
+        <span class="meta-label">Checked at</span>
+        <span class="meta-value">${escapeHtml(fmtDate(v.checkedAt))}</span>
+      </div>
+    </div>
+    ${
+      v.message
+        ? `<div class="flag-stack"><span class="flag info">${escapeHtml(v.message)}</span></div>`
+        : ""
+    }
+  `;
 }
 
 function duplicateReview(d) {
@@ -711,7 +834,7 @@ function renderAudit() {
   body.innerHTML = "";
 
   if (rows.length === 0) {
-    body.innerHTML = `<tr><td colspan="7"><div class="empty">No invoices match your filters.</div></td></tr>`;
+    body.innerHTML = `<tr><td colspan="6"><div class="empty">No invoices match your filters.</div></td></tr>`;
     return;
   }
 
@@ -723,8 +846,7 @@ function renderAudit() {
       <td class="cell-strong">${escapeHtml(it.vendorName || "—")}</td>
       <td>${escapeHtml(it.invoiceNumber || "—")}</td>
       <td class="num">${escapeHtml(fmtAmount(it.totalAmount, it.currency))}</td>
-      <td><span class="badge ${statusClass(it.status)}">${escapeHtml(it.status || "—")}</span></td>
-      <td><span class="badge ${reviewClass(it.reviewStatus)}">${escapeHtml(fmtReviewStatus(it.reviewStatus))}</span></td>
+      <td><span class="badge ${displayStatusClass(it.displayStatus)}">${escapeHtml(fmtDisplayStatus(it.displayStatus))}</span></td>
       <td class="num">${
         it.status === "COMPLETED"
           ? `<span class="conf ${confidenceClass(it.confidence)}">${fmtPct(it.confidence)}</span>`
@@ -741,8 +863,7 @@ function renderAudit() {
    ===================================================================== */
 
 const DETAIL_FIELDS = [
-  ["Status", (d) => `<span class="badge ${statusClass(d.status)}">${escapeHtml(d.status || "—")}</span>`],
-  ["Review", (d) => `<span class="badge ${reviewClass(d.reviewStatus)}">${escapeHtml(fmtReviewStatus(d.reviewStatus))}</span>`],
+  ["Status", (d) => `<span class="badge ${displayStatusClass(d.displayStatus)}">${escapeHtml(fmtDisplayStatus(d.displayStatus))}</span>`],
   ["Vendor", (d) => escapeHtml(d.vendorName || "—")],
   ["Vendor VAT", renderVatValidation],
   ["Buyer", (d) => escapeHtml(d.buyerName || d.extractedJson?.buyer?.name || "—")],
@@ -753,6 +874,7 @@ const DETAIL_FIELDS = [
   ["Confidence", (d) => (d.status === "COMPLETED" ? escapeHtml(fmtPct(d.confidence)) : "—")],
   ["Duplicates", (d) => escapeHtml(String(d.duplicateCount ?? d.extractedJson?.meta?.duplicateCount ?? 0))],
   ["Duplicate decision", renderDuplicateDecision],
+  ["NetSuite", renderNetSuiteStatus],
   ["Controls", (d) => renderControlFlags(d.controlFlags ?? d.extractedJson?.meta?.controlFlags ?? [])],
   ["From", (d) => escapeHtml(d.from || "—")],
   ["Subject", (d) => escapeHtml(d.subject || "—")],
@@ -774,6 +896,8 @@ async function openDetail(messageId, attachmentId) {
   $("drawer-meta").textContent = "";
   $("duplicate-review-panel").classList.add("hidden");
   $("duplicate-review-panel").innerHTML = "";
+  $("vat-registry-panel").classList.add("hidden");
+  $("vat-registry-panel").innerHTML = "";
   overlay.classList.remove("hidden");
   document.body.classList.add("no-scroll");
 
@@ -791,6 +915,7 @@ async function openDetail(messageId, attachmentId) {
       </div>`
     ).join("");
     renderDuplicateReviewPanel(d);
+    renderVatRegistryPanel(d);
 
     let jsonPayload;
     if (d.status === "FAILED") {
@@ -809,8 +934,22 @@ async function openDetail(messageId, attachmentId) {
     // Wire download lazily (presigned URL fetched on click to keep it fresh).
     $("drawer-download").onclick = () => downloadPdf(messageId, attachmentId);
     $("drawer-netsuite").onclick = () => previewNetSuite(messageId, attachmentId);
-    $("drawer-netsuite-log").onclick = () => logNetSuiteTransaction(messageId, attachmentId);
     $("drawer-delete").onclick = () => deleteInvoice(messageId, attachmentId);
+
+    const logButton = $("drawer-netsuite-log");
+    // Only a genuinely live/succeeded transaction means there's nothing left to do —
+    // a stale HELD_FOR_REVIEW/HELD_FOR_CONFIGURATION/FAILED_* one can still be superseded.
+    const liveStatuses = ["QUEUED", "IN_FLIGHT", "SUCCEEDED"];
+    const alreadySent = liveStatuses.includes(netSuiteTransactionStatus(d));
+    if (alreadySent) {
+      // Nothing left to approve — the status is already shown in the fields above.
+      logButton.classList.add("hidden");
+    } else {
+      logButton.classList.remove("hidden");
+      logButton.textContent =
+        d.reviewStatus === "NEEDS_REVIEW" ? "Approve & send to NetSuite" : "Send to NetSuite";
+      logButton.onclick = () => logNetSuiteTransaction(messageId, attachmentId);
+    }
   } catch (err) {
     if (err.message === "Unauthorized") return;
     console.error(err);
@@ -868,7 +1007,7 @@ async function previewNetSuite(messageId, attachmentId) {
 async function logNetSuiteTransaction(messageId, attachmentId) {
   const jsonBox = $("drawer-json");
   try {
-    jsonBox.textContent = "Logging NetSuite transaction...";
+    jsonBox.textContent = "Sending to NetSuite...";
     const res = await apiFetch(
       `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}/netsuite/transactions`,
       { method: "POST" }
@@ -876,15 +1015,17 @@ async function logNetSuiteTransaction(messageId, attachmentId) {
     const data = await res.json().catch(() => ({}));
     jsonBox.textContent = JSON.stringify(data, null, 2);
     if (res.ok) {
-      toast(data.queued ? "NetSuite transaction queued." : "NetSuite transaction logged.", "success");
+      toast(data.queued ? "Sent to NetSuite — queued for push." : "NetSuite transaction logged.", "success");
+      // Refresh the drawer so the status field and button state reflect the new transaction.
+      await openDetail(messageId, attachmentId);
     } else {
-      toast(data.message || "Transaction logging failed.", "error");
+      toast(data.message || "Sending to NetSuite failed.", "error");
     }
   } catch (err) {
     if (err.message === "Unauthorized") return;
     console.error(err);
-    jsonBox.textContent = "Transaction logging failed.";
-    toast("Transaction logging failed.", "error");
+    jsonBox.textContent = "Sending to NetSuite failed.";
+    toast("Sending to NetSuite failed.", "error");
   }
 }
 

@@ -1249,10 +1249,19 @@ export function transformToNetSuite(
 /**
  * Pre-flight validation of a built vendor bill.
  *
- * Requires: entity (vendor), tranDate, and at least one expense line. Subsidiary
- * is required ONLY when config.subsidiaryId is set (single-subsidiary scaffold;
- * non-OneWorld accounts have no subsidiary field). Also rejects any unresolved
- * placeholder refs that slipped through.
+ * Requires: entity (vendor), tranDate, at least one expense line, and
+ * department. Subsidiary is required ONLY when config.subsidiaryId is set
+ * (single-subsidiary scaffold; non-OneWorld accounts have no subsidiary
+ * field). Also rejects any unresolved placeholder refs that slipped through.
+ *
+ * Department is treated as unconditionally required based on direct evidence
+ * from this account, not a general NetSuite rule: two independent live push
+ * failures across two different subsidiaries (1 and 4) both rejected the bill
+ * with "Please enter value(s) for: Department" when it was left unset. Both
+ * times, the invoice's business-unit routing hadn't resolved a departmentId
+ * and no defaults.departmentId was configured, so nothing caught it before
+ * NetSuite did. This check moves that failure to a pre-flight blocker (AP
+ * review, clear reason) instead of a wasted live push with a cryptic error.
  */
 export function validateNetSuiteVendorBill(
   bill: VendorBill,
@@ -1265,6 +1274,9 @@ export function validateNetSuiteVendorBill(
   }
   if (!bill.tranDate) {
     errors.push("tranDate is required");
+  }
+  if (!bill.department?.id) {
+    errors.push("department is required");
   }
 
   const lines = bill.expense?.items ?? [];

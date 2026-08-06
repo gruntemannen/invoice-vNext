@@ -36,6 +36,7 @@ interface InvoiceExtractorStackProps extends cdk.StackProps {
   netSuiteLivePushEnabled: boolean;
   netSuiteAutoBookEnabled: boolean;
   cognito?: CognitoAuthConfig;
+  inboundEmailAddress?: string;
 }
 
 interface CognitoAuthConfig {
@@ -432,6 +433,9 @@ export class InvoiceExtractorStack extends cdk.Stack {
     receiptRuleSet.addRule("StoreRawEmails", {
       enabled: true,
       scanEnabled: true,
+      // Unset = catch-all for every address at whatever domain's MX points here. Set this to
+      // scope inbound processing to one specific address instead (see config.ts).
+      recipients: props.inboundEmailAddress ? [props.inboundEmailAddress] : undefined,
       actions: [
         new sesActions.S3({
           bucket: rawBucket,

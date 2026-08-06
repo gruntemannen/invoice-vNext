@@ -25,6 +25,12 @@ export interface InvoiceConfig {
   netSuiteLivePushEnabled: boolean;
   netSuiteAutoBookEnabled: boolean;
   cognito?: CognitoAuthConfig;
+
+  // If set, the SES receipt rule only accepts mail addressed to this exact address (e.g.
+  // "invoices@yourdomain.com") instead of acting as a catch-all for every address at whatever
+  // domain's MX records point here. Leave unset for catch-all (fine for a domain dedicated
+  // solely to this purpose; scope it once you're pointing a shared/production domain here).
+  inboundEmailAddress?: string;
 }
 
 export const config: InvoiceConfig = {
@@ -72,6 +78,11 @@ export const config: InvoiceConfig = {
   // Anything else still lands in AP review exactly as before. Defaults false; flip on once
   // verified against real sandbox invoices.
   netSuiteAutoBookEnabled: true,
+
+  // entirely-test.com is a throwaway Route53-registered domain used to stand up email
+  // ingestion before the real corporate domain is wired. Scoped to one address rather than
+  // catch-all since it's a temporary stand-in, not a domain dedicated solely to this purpose.
+  inboundEmailAddress: "invoices@entirely-test.com",
 
   cognito: {
     region: "eu-central-1",

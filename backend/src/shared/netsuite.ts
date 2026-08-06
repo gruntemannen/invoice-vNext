@@ -953,11 +953,19 @@ export function transformToNetSuite(
     );
   }
 
-  // --- Vendor (entity) resolution: prefer taxId, then name ----------------
+  // --- Vendor (entity) resolution: per-invoice override, then taxId, then name
+  // A per-invoice `resolvedNetSuiteVendorId` is stamped by an explicit AP action
+  // (creating the vendor in NetSuite from VAT-registry data — see
+  // createNetSuiteVendor / api.ts's netsuite/vendor endpoint) and always wins
+  // over the static crosswalk, since it reflects a specific human decision for
+  // this exact invoice rather than a general vendor-name/taxId mapping.
   let entity: NetSuiteRef | undefined;
   const taxId: string = vendor?.taxId ?? "";
   const vendorName: string = vendor?.name ?? "";
-  if (taxId && cw.vendorsByTaxId[taxId]) {
+  const resolvedVendorId: string = String(vendor?.resolvedNetSuiteVendorId ?? "").trim();
+  if (resolvedVendorId) {
+    entity = { id: resolvedVendorId };
+  } else if (taxId && cw.vendorsByTaxId[taxId]) {
     entity = { id: cw.vendorsByTaxId[taxId] };
   } else if (vendorName && cw.vendorsByName[vendorName]) {
     entity = { id: cw.vendorsByName[vendorName] };
@@ -1666,6 +1674,111 @@ export async function syncNetSuiteVendorMaster(
     responseStatus: patchRes.status,
     responseBody: responseText ? safeParseJson(responseText) : null,
   };
+}
+
+// ===========================================================================
+// Explicit, AP-triggered vendor creation from VAT-registry data
+// ===========================================================================
+
+export interface NetSuiteVendorCreationInput {
+  companyName: string;
+  vatRegNumber?: string;
+  email?: string;
+  subsidiaryId?: string;
+}
+
+export interface NetSuiteVendorCreationResult {
+  vendorId: string;
+  companyName: string;
+}
+
+const VAT_REGISTRY_PLACEHOLDER_VALUES = new Set(["---", "NOT_PROCESSED"]);
+
+function cleanRegistryValue(value: unknown): string | undefined {
+  const trimmed = String(value ?? "").trim();
+  return trimmed && !VAT_REGISTRY_PLACEHOLDER_VALUES.has(trimmed) ? trimmed : undefined;
+}
+
+/**
+ * Builds the vendor-creation payload for an invoice's vendor, preferring the
+ * officially registered name from the VAT registry lookup (VIES/Swiss UID)
+ * over the name as printed on the invoice, since that's the point of doing
+ * the lookup at all. Falls back to the extracted name when the registry
+ * didn't echo one back (VIES's response for some member states only
+ * confirms validity without returning registered details). Returns undefined
+ * when there's no usable name at all - nothing to create from.
+ */
+export function deriveNetSuiteVendorCreationInput(
+  extracted: any,
+  subsidiaryId?: string
+): NetSuiteVendorCreationInput | undefined {
+  const vendor = extracted?.vendor ?? {};
+  const vatValidation = vendor?.vatValidation ?? {};
+  const registeredName =
+    cleanRegistryValue(vatValidation.name) ?? cleanRegistryValue(vatValidation.traderName);
+  const companyName = registeredName ?? cleanRegistryValue(vendor.name);
+  if (!companyName) return undefined;
+
+  return {
+    companyName,
+    vatRegNumber: cleanRegistryValue(vendor.taxId),
+    email: cleanRegistryValue(vendor.email),
+    subsidiaryId,
+  };
+}
+
+/**
+ * Creates a new NetSuite vendor record. This is always an explicit, AP-triggered
+ * action (see api.ts's POST .../netsuite/vendor endpoint) - never automatic
+ * during extraction or push. Deliberately does not search for an existing
+ * match first: AP choosing to click this already means "I've looked, there's
+ * no existing vendor for this." Only sets companyName/vatRegNumber/email/
+ * subsidiary - address and bank details are left for AP to fill in NetSuite
+ * directly, or via the existing vendor-master compare/fill sync on a
+ * subsequent push once resolvedNetSuiteVendorId is stamped.
+ */
+export async function createNetSuiteVendor(
+  secret: NetSuiteSecret,
+  token: string,
+  input: NetSuiteVendorCreationInput,
+  options?: NetSuiteConnectionOptions
+): Promise<NetSuiteVendorCreationResult> {
+  const vendorUrl = `${restBase(secret, options)}${recordApiPath(options)}/vendor`;
+
+  const body: Record<string, unknown> = {
+    companyName: input.companyName,
+    isPerson: false,
+  };
+  if (input.vatRegNumber) body.vatRegNumber = input.vatRegNumber;
+  if (input.email) body.email = input.email;
+  if (input.subsidiaryId) body.subsidiary = { id: input.subsidiaryId };
+
+  const res = await fetchWithTimeout(
+    vendorUrl,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        accept: "application/json",
+      },
+      body: JSON.stringify(body),
+    },
+    options?.requestTimeoutMs
+  );
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`vendor create failed: ${res.status} ${text.slice(0, 500)}`);
+  }
+
+  const location = res.headers.get("location") ?? "";
+  const vendorId = location.split("/").filter(Boolean).pop();
+  if (!vendorId) {
+    throw new Error("vendor create succeeded but no Location header was returned");
+  }
+
+  return { vendorId, companyName: input.companyName };
 }
 
 function readPath(value: unknown, path: string): unknown {

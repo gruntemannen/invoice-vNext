@@ -7,11 +7,15 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { v4 as uuidv4 } from "uuid";
 import {
   buildNetSuiteConfigurationHints,
+  createNetSuiteVendor,
+  deriveNetSuiteVendorCreationInput,
+  getAccessToken,
   transformToNetSuite,
   validateNetSuiteRequest,
   type NetSuiteConfig,
 } from "./shared/netsuite";
 import { loadNetSuiteConfig } from "./shared/netsuite-config";
+import { loadNetSuiteSecret } from "./shared/netsuite-secret";
 import {
   activeNetSuiteEnvironment,
   getNetSuiteRuntimeSettings,
@@ -41,6 +45,7 @@ const ATTACHMENT_BUCKET = process.env.ATTACHMENT_BUCKET ?? "";
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES ?? "0");
 const NETSUITE_QUEUE_URL = process.env.NETSUITE_QUEUE_URL ?? "";
 const NETSUITE_LIVE_PUSH_ENABLED = process.env.NETSUITE_LIVE_PUSH_ENABLED === "true";
+const NETSUITE_SECRET_ARN = process.env.NETSUITE_SECRET_ARN ?? "";
 const REQUIRED_GROUPS = new Set(["invoice", "invoice-admin"]);
 const s3 = new S3Client({});
 const sqs = new SQSClient({});
@@ -87,6 +92,13 @@ export const handler = async (
     event.requestContext.http.method === "POST"
   ) {
     return createNetSuiteTransactionForInvoice(event);
+  }
+  if (
+    path.startsWith("/invoices/") &&
+    path.endsWith("/netsuite/vendor") &&
+    event.requestContext.http.method === "POST"
+  ) {
+    return createNetSuiteVendorForInvoice(event);
   }
   if (
     path.startsWith("/invoices/") &&
@@ -322,6 +334,84 @@ async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2
       error: error?.message ?? String(error),
     });
     return jsonResponse({ message: "Failed to log NetSuite transaction" }, 500);
+  }
+}
+
+/**
+ * Explicit, AP-triggered action: create a new NetSuite vendor from this
+ * invoice's VAT-registry lookup data (officially registered name where VIES/
+ * Swiss UID returned one, falling back to the extracted name), then stamp the
+ * new vendor id onto the invoice so the next preview/push uses it instead of
+ * the static crosswalk. Never runs automatically - only this button calls it.
+ */
+async function createNetSuiteVendorForInvoice(event: APIGatewayProxyEventV2) {
+  const messageId = event.pathParameters?.messageId ?? "";
+  const attachmentId = event.pathParameters?.attachmentId ?? "";
+
+  const item = await findByAttachmentId(messageId, attachmentId);
+  if (!item) {
+    return jsonResponse({ message: "Not found" }, 404);
+  }
+  if (item.status !== "COMPLETED" || !item.extractedJson) {
+    return jsonResponse({ message: "Invoice extraction is not complete." }, 409);
+  }
+
+  try {
+    const preview = await buildNetSuitePreview(item);
+
+    if (preview.bill.entity?.id) {
+      return jsonResponse(
+        { message: "This invoice's vendor is already resolved; not creating a duplicate." },
+        409
+      );
+    }
+
+    const vendorInput = deriveNetSuiteVendorCreationInput(item.extractedJson, preview.bill.subsidiary?.id);
+    if (!vendorInput) {
+      return jsonResponse(
+        { message: "Not enough vendor data on this invoice (no name and no VAT-registry name) to create a NetSuite vendor." },
+        400
+      );
+    }
+
+    const secret = await loadNetSuiteSecret(preview.activeEnvironment.secretArn || NETSUITE_SECRET_ARN);
+    const token = await getAccessToken(secret, preview.activeEnvironment);
+    const created = await createNetSuiteVendor(secret, token, vendorInput, preview.activeEnvironment);
+
+    const updatedExtractedJson = {
+      ...item.extractedJson,
+      vendor: { ...item.extractedJson.vendor, resolvedNetSuiteVendorId: created.vendorId },
+    };
+    await updateItem(
+      TABLE_NAME,
+      { messageId: item.messageId, attachmentKey: item.attachmentKey },
+      { extractedJson: updatedExtractedJson, updatedAt: new Date().toISOString() }
+    );
+
+    const refreshedPreview = await buildNetSuitePreview({ ...item, extractedJson: updatedExtractedJson });
+
+    log.info("NetSuite vendor created from invoice", {
+      messageId,
+      attachmentId,
+      vendorId: created.vendorId,
+      companyName: created.companyName,
+      actor: actorFromEvent(event),
+    });
+
+    return jsonResponse({
+      created: true,
+      vendorId: created.vendorId,
+      companyName: created.companyName,
+      flow: refreshedPreview.flow,
+      validation: refreshedPreview.validation,
+    });
+  } catch (error: any) {
+    log.error("NetSuite vendor creation failed", {
+      messageId,
+      attachmentId,
+      error: error?.message ?? String(error),
+    });
+    return jsonResponse({ message: `Failed to create NetSuite vendor: ${error?.message ?? String(error)}` }, 502);
   }
 }
 

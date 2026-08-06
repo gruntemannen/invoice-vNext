@@ -392,6 +392,13 @@ function renderVatRegistryPanel(d) {
   const registeredName = v.name || v.traderName;
   const registeredAddress = v.address;
 
+  // Vendor isn't resolved to a NetSuite entity yet — this is the specific
+  // signal to offer AP the option to create one from this registry data.
+  // Never shown automatically triggers anything; it's just a button.
+  const vendorUnresolved = (d.controlFlags ?? []).some((f) =>
+    String(f?.message ?? "").startsWith("Vendor not resolved")
+  );
+
   panel.classList.remove("hidden");
   panel.innerHTML = `
     <div class="panel-title">Vendor VAT registry data (${escapeHtml(providerLabel)})</div>
@@ -423,7 +430,63 @@ function renderVatRegistryPanel(d) {
         ? `<div class="flag-stack"><span class="flag info">${escapeHtml(v.message)}</span></div>`
         : ""
     }
+    ${
+      vendorUnresolved
+        ? `<div style="margin-top:12px">
+             <button id="create-vendor-btn" class="button secondary" type="button">
+               Create vendor in NetSuite from this registry data
+             </button>
+             <div class="flag-stack">
+               <span class="flag info">
+                 Creates a new NetSuite vendor named "${escapeHtml(registeredName || d.vendorName || "—")}"
+                 with VAT number ${escapeHtml(v.normalizedVat || "—")}. Address and bank details are not
+                 set — add those in NetSuite directly, or they'll be filled in on a later push if
+                 vendor-master sync is configured.
+               </span>
+             </div>
+           </div>`
+        : ""
+    }
   `;
+
+  if (vendorUnresolved) {
+    $("create-vendor-btn").addEventListener("click", () =>
+      createNetSuiteVendorFromRegistry(d.messageId, d.attachmentId)
+    );
+  }
+}
+
+async function createNetSuiteVendorFromRegistry(messageId, attachmentId) {
+  const button = $("create-vendor-btn");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Creating vendor…";
+  }
+  try {
+    const res = await apiFetch(
+      `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}/netsuite/vendor`,
+      { method: "POST" }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.created) {
+      toast(`Vendor "${data.companyName}" created in NetSuite (id ${data.vendorId}).`, "success");
+      await openDetail(messageId, attachmentId);
+    } else {
+      toast(data.message || "Creating the vendor failed.", "error");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "Create vendor in NetSuite from this registry data";
+      }
+    }
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    toast("Creating the vendor failed.", "error");
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Create vendor in NetSuite from this registry data";
+    }
+  }
 }
 
 function duplicateReview(d) {

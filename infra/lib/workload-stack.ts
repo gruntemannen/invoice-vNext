@@ -684,6 +684,13 @@ export class InvoiceExtractorStack extends cdk.Stack {
     });
 
     httpApi.addRoutes({
+      path: "/invoices/{messageId}/{attachmentId}/netsuite/vendor",
+      methods: [apigwv2.HttpMethod.POST],
+      integration: new apigwv2Integrations.HttpLambdaIntegration("NetSuiteVendorCreateIntegration", apiFn),
+      authorizer: jwtAuthorizer,
+    });
+
+    httpApi.addRoutes({
       path: "/invoices/{messageId}/{attachmentId}/duplicate-review",
       methods: [apigwv2.HttpMethod.POST],
       integration: new apigwv2Integrations.HttpLambdaIntegration("DuplicateReviewIntegration", apiFn),

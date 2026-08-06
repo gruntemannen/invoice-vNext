@@ -63,6 +63,8 @@ const DEFAULT_VIES_BASE_URL = "https://ec.europa.eu/taxation_customs/vies/rest-a
 const DEFAULT_SWISS_UID_BASE_URL = "https://www.uid-wse.admin.ch/V5.0/PublicServices.svc";
 const SWISS_UID_SOAP_ACTION =
   "http://www.uid.admin.ch/xmlns/uid-wse/IPublicServices/ValidateVatNumber";
+const SWISS_UID_GETBYUID_SOAP_ACTION =
+  "http://www.uid.admin.ch/xmlns/uid-wse/IPublicServices/GetByUID";
 const DEFAULT_TIMEOUT_MS = 6000;
 const SWISS_UID_CHECKSUM_WEIGHTS = [5, 4, 3, 2, 7, 6, 5, 4];
 
@@ -331,6 +333,20 @@ export async function checkSwissVatNumber(
       };
     }
 
+    // Registered name/address is a best-effort enrichment on top of the
+    // validity check above, not a requirement for it. A valid VAT number with
+    // an enrichment failure (rate limit, unregistered API consumer, transient
+    // fault) still returns VALID - it just won't have name/address filled in,
+    // same as VIES member states that don't echo back trader details.
+    let organisation: SwissOrganisationDetails | undefined;
+    if (valid) {
+      try {
+        organisation = await getSwissOrganisationDetails(input.digits, options);
+      } catch {
+        // Non-fatal - see comment above.
+      }
+    }
+
     return {
       provider: "CH_UID",
       status: valid ? "VALID" : "INVALID",
@@ -343,6 +359,8 @@ export async function checkSwissVatNumber(
       uid: input.uid,
       vatSuffix: input.vatSuffix,
       checksumValid: true,
+      name: organisation?.name,
+      address: organisation?.address,
     };
   } catch (err: any) {
     return {
@@ -534,6 +552,79 @@ function buildSwissVatSoapEnvelope(vatNumber: string): string {
     </ValidateVatNumber>
   </s:Body>
 </s:Envelope>`;
+}
+
+interface SwissOrganisationDetails {
+  name?: string;
+  address?: string;
+}
+
+/**
+ * Registered organisation name/address, via GetByUID - a separate operation
+ * from ValidateVatNumber (which only returns a boolean). The `uid` parameter
+ * is NOT a plain string despite looking like one in the WSDL's operation
+ * summary: it's the eCH-0097 uidStructureType complex type (a category enum
+ * + the bare numeric id, no "CHE-" prefix or dots) - passing a plain string
+ * gets routed to the operation but null-reference-crashes server-side rather
+ * than returning a clean fault, which is what made this easy to get wrong.
+ */
+function buildSwissGetByUidSoapEnvelope(digits: string): string {
+  return `<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body>
+    <GetByUID xmlns="http://www.uid.admin.ch/xmlns/uid-wse">
+      <uid xmlns:ech0097="http://www.ech.ch/xmlns/eCH-0097/5">
+        <ech0097:uidOrganisationIdCategorie>CHE</ech0097:uidOrganisationIdCategorie>
+        <ech0097:uidOrganisationId>${escapeXml(digits)}</ech0097:uidOrganisationId>
+      </uid>
+    </GetByUID>
+  </s:Body>
+</s:Envelope>`;
+}
+
+async function getSwissOrganisationDetails(
+  digits: string,
+  options: ViesLookupOptions = {}
+): Promise<SwissOrganisationDetails | undefined> {
+  const url = options.swissBaseUrl || DEFAULT_SWISS_UID_BASE_URL;
+  const body = buildSwissGetByUidSoapEnvelope(digits);
+
+  const res = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "text/xml; charset=utf-8",
+        accept: "text/xml",
+        soapaction: `"${SWISS_UID_GETBYUID_SOAP_ACTION}"`,
+      },
+      body,
+    },
+    options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  );
+
+  const responseText = await res.text().catch(() => "");
+  if (!res.ok) {
+    throw new Error(extractSoapFault(responseText) || `GetByUID failed with HTTP ${res.status}`);
+  }
+
+  const organisationName = extractTextTag(responseText, "organisationName");
+  if (!organisationName) return undefined;
+
+  const addressParts = [
+    extractTextTag(responseText, "addressLine1"),
+    [extractTextTag(responseText, "street"), extractTextTag(responseText, "houseNumber")]
+      .filter(Boolean)
+      .join(" "),
+    [extractTextTag(responseText, "swissZipCode"), extractTextTag(responseText, "town")]
+      .filter(Boolean)
+      .join(" "),
+  ].filter(Boolean);
+
+  return {
+    name: organisationName,
+    address: addressParts.length ? addressParts.join(", ") : undefined,
+  };
 }
 
 function formatSwissUid(digits: string): string {

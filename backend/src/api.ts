@@ -366,7 +366,11 @@ async function createNetSuiteVendorForInvoice(event: APIGatewayProxyEventV2) {
       );
     }
 
-    const vendorInput = deriveNetSuiteVendorCreationInput(item.extractedJson, preview.bill.subsidiary?.id);
+    const vendorInput = deriveNetSuiteVendorCreationInput(
+      item.extractedJson,
+      preview.bill.subsidiary?.id,
+      preview.bill.currency?.id
+    );
     if (!vendorInput) {
       return jsonResponse(
         { message: "Not enough vendor data on this invoice (no name and no VAT-registry name) to create a NetSuite vendor." },

@@ -1685,6 +1685,17 @@ export interface NetSuiteVendorCreationInput {
   vatRegNumber?: string;
   email?: string;
   subsidiaryId?: string;
+  /**
+   * The currency this invoice needs to bill in. Required for the vendor to
+   * actually be usable on this bill: a NetSuite vendor's `currency` field
+   * defaults to the subsidiary's base currency when left unset on create, and
+   * a bill in any OTHER currency then fails with "Invalid Field Value ... for
+   * ... currency" - the vendor has to be enabled for that currency first, not
+   * just have a subsidiary in common with the bill. This was caught by a
+   * failed live push right after this feature shipped: a vendor auto-created
+   * for a USD invoice defaulted to CHF-only and the push rejected the bill.
+   */
+  currencyId?: string;
 }
 
 export interface NetSuiteVendorCreationResult {
@@ -1710,7 +1721,8 @@ function cleanRegistryValue(value: unknown): string | undefined {
  */
 export function deriveNetSuiteVendorCreationInput(
   extracted: any,
-  subsidiaryId?: string
+  subsidiaryId?: string,
+  currencyId?: string
 ): NetSuiteVendorCreationInput | undefined {
   const vendor = extracted?.vendor ?? {};
   const vatValidation = vendor?.vatValidation ?? {};
@@ -1724,6 +1736,7 @@ export function deriveNetSuiteVendorCreationInput(
     vatRegNumber: cleanRegistryValue(vendor.taxId),
     email: cleanRegistryValue(vendor.email),
     subsidiaryId,
+    currencyId,
   };
 }
 
@@ -1752,6 +1765,10 @@ export async function createNetSuiteVendor(
   if (input.vatRegNumber) body.vatRegNumber = input.vatRegNumber;
   if (input.email) body.email = input.email;
   if (input.subsidiaryId) body.subsidiary = { id: input.subsidiaryId };
+  // Setting `currency` explicitly (rather than leaving it to default to the
+  // subsidiary's base currency) is what actually makes the vendor usable on
+  // this invoice's bill - see the currencyId doc comment on the input type.
+  if (input.currencyId) body.currency = { id: input.currencyId };
 
   const res = await fetchWithTimeout(
     vendorUrl,

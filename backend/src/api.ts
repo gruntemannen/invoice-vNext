@@ -10,6 +10,7 @@ import {
   createNetSuiteVendor,
   deriveNetSuiteVendorCreationInput,
   getAccessToken,
+  suiteql,
   transformToNetSuite,
   validateNetSuiteRequest,
   type NetSuiteConfig,
@@ -99,6 +100,16 @@ export const handler = async (
     event.requestContext.http.method === "POST"
   ) {
     return createNetSuiteVendorForInvoice(event);
+  }
+  if (path === "/netsuite/departments" && event.requestContext.http.method === "GET") {
+    return listNetSuiteDepartments();
+  }
+  if (
+    path.startsWith("/invoices/") &&
+    path.endsWith("/netsuite/department") &&
+    event.requestContext.http.method === "POST"
+  ) {
+    return setNetSuiteDepartmentOverride(event);
   }
   if (
     path.startsWith("/invoices/") &&
@@ -417,6 +428,90 @@ async function createNetSuiteVendorForInvoice(event: APIGatewayProxyEventV2) {
     });
     return jsonResponse({ message: `Failed to create NetSuite vendor: ${error?.message ?? String(error)}` }, 502);
   }
+}
+
+/**
+ * Live list of active NetSuite departments, for the manual department
+ * selector in the admin console. Not cached - this is an infrequent,
+ * human-driven interaction, not a hot path, and a live list is always
+ * correct rather than possibly stale.
+ */
+async function listNetSuiteDepartments() {
+  try {
+    const runtimeSettings = await getNetSuiteRuntimeSettings(TABLE_NAME);
+    const activeEnvironment = activeNetSuiteEnvironment(runtimeSettings);
+    const secret = await loadNetSuiteSecret(activeEnvironment.secretArn || NETSUITE_SECRET_ARN);
+    const token = await getAccessToken(secret, activeEnvironment);
+    const { items } = await suiteql(
+      secret,
+      token,
+      "SELECT id, name FROM department WHERE isinactive = 'F' ORDER BY name",
+      activeEnvironment
+    );
+    return jsonResponse({
+      departments: items.map((i) => ({ id: String(i.id), name: String(i.name) })),
+    });
+  } catch (error: any) {
+    log.error("Listing NetSuite departments failed", { error: error?.message ?? String(error) });
+    return jsonResponse({ message: `Failed to list NetSuite departments: ${error?.message ?? String(error)}` }, 502);
+  }
+}
+
+/**
+ * Explicit, AP-triggered action: manually set the department for this
+ * invoice's NetSuite push, for when business-unit routing can't resolve one
+ * and there's no configured default (department is a hard NetSuite
+ * requirement on this account's vendor bill form - see
+ * validateNetSuiteVendorBill). Stamped onto extractedJson.netSuiteOverrides,
+ * which transformToNetSuite checks ahead of business-unit routing/defaults.
+ */
+async function setNetSuiteDepartmentOverride(event: APIGatewayProxyEventV2) {
+  const messageId = event.pathParameters?.messageId ?? "";
+  const attachmentId = event.pathParameters?.attachmentId ?? "";
+
+  const item = await findByAttachmentId(messageId, attachmentId);
+  if (!item) {
+    return jsonResponse({ message: "Not found" }, 404);
+  }
+  if (item.status !== "COMPLETED" || !item.extractedJson) {
+    return jsonResponse({ message: "Invoice extraction is not complete." }, 409);
+  }
+
+  let body: any;
+  try {
+    body = event.body ? JSON.parse(event.body) : {};
+  } catch {
+    return jsonResponse({ message: "Invalid JSON body." }, 400);
+  }
+  const departmentId = String(body?.departmentId ?? "").trim();
+  if (!departmentId) {
+    return jsonResponse({ message: "departmentId is required." }, 400);
+  }
+
+  const updatedExtractedJson = {
+    ...item.extractedJson,
+    netSuiteOverrides: { ...item.extractedJson.netSuiteOverrides, departmentId },
+  };
+  await updateItem(
+    TABLE_NAME,
+    { messageId: item.messageId, attachmentKey: item.attachmentKey },
+    { extractedJson: updatedExtractedJson, updatedAt: new Date().toISOString() }
+  );
+
+  const refreshedPreview = await buildNetSuitePreview({ ...item, extractedJson: updatedExtractedJson });
+
+  log.info("NetSuite department override set", {
+    messageId,
+    attachmentId,
+    departmentId,
+    actor: actorFromEvent(event),
+  });
+
+  return jsonResponse({
+    departmentId,
+    flow: refreshedPreview.flow,
+    validation: refreshedPreview.validation,
+  });
 }
 
 async function getNetSuiteSettings() {

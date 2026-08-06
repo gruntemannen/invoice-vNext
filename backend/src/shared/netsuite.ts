@@ -942,6 +942,14 @@ export function transformToNetSuite(
   const buyer = extracted?.buyer ?? {};
   const invoice = extracted?.invoice ?? {};
   const lineItems: any[] = Array.isArray(extracted?.lineItems) ? extracted.lineItems : [];
+  // Per-invoice manual overrides, set by an explicit AP action (e.g. the
+  // department selector in the admin console — see api.ts's
+  // POST .../netsuite/department) when business-unit routing can't resolve
+  // a dimension and there's no configured default. Always wins over routing/
+  // config, same rationale as vendor.resolvedNetSuiteVendorId below: it
+  // reflects a specific human decision for this exact invoice.
+  const overrides: { departmentId?: string; classId?: string; locationId?: string } =
+    extracted?.netSuiteOverrides ?? {};
 
   const externalId = buildExternalId(extracted);
   const document = classifyDocument(invoice);
@@ -1076,7 +1084,9 @@ export function transformToNetSuite(
     // Department
     let department: NetSuiteRef | undefined;
     const deptCode: string = line?.department ?? "";
-    if (deptCode && cw.departmentsByCode[deptCode]) {
+    if (overrides.departmentId) {
+      department = { id: overrides.departmentId };
+    } else if (deptCode && cw.departmentsByCode[deptCode]) {
       department = { id: cw.departmentsByCode[deptCode] };
     } else if (businessUnitRouting?.departmentId || config.defaults?.departmentId) {
       department = { id: businessUnitRouting?.departmentId ?? config.defaults?.departmentId ?? "" };
@@ -1164,8 +1174,10 @@ export function transformToNetSuite(
     if (config.prepaymentAccountId) {
       prepayment.prepaymentAccount = { id: config.prepaymentAccountId };
     }
-    if (businessUnitRouting?.departmentId || config.defaults?.departmentId) {
-      prepayment.department = asRef(businessUnitRouting?.departmentId ?? config.defaults?.departmentId);
+    if (overrides.departmentId || businessUnitRouting?.departmentId || config.defaults?.departmentId) {
+      prepayment.department = asRef(
+        overrides.departmentId ?? businessUnitRouting?.departmentId ?? config.defaults?.departmentId
+      );
     }
     if (businessUnitRouting?.classId || config.defaults?.classId) {
       prepayment.class = asRef(businessUnitRouting?.classId ?? config.defaults?.classId);
@@ -1213,8 +1225,10 @@ export function transformToNetSuite(
   if (currency) bill.currency = currency;
   if (terms) bill.terms = terms;
   if (account) bill.account = account;
-  if (businessUnitRouting?.departmentId || config.defaults?.departmentId) {
-    bill.department = asRef(businessUnitRouting?.departmentId ?? config.defaults?.departmentId);
+  if (overrides.departmentId || businessUnitRouting?.departmentId || config.defaults?.departmentId) {
+    bill.department = asRef(
+      overrides.departmentId ?? businessUnitRouting?.departmentId ?? config.defaults?.departmentId
+    );
   }
   if (businessUnitRouting?.classId || config.defaults?.classId) {
     bill.class = asRef(businessUnitRouting?.classId ?? config.defaults?.classId);

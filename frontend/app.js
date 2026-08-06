@@ -26,6 +26,8 @@ const state = {
   // configuration
   netSuiteSettings: null,
   netSuiteSettingsLoaded: false,
+  // department selector (cached — list rarely changes, avoid refetching every drawer open)
+  netSuiteDepartments: null,
 };
 
 const TOKEN_KEY = "invoice_admin_id_token";
@@ -486,6 +488,103 @@ async function createNetSuiteVendorFromRegistry(messageId, attachmentId) {
       button.disabled = false;
       button.textContent = "Create vendor in NetSuite from this registry data";
     }
+  }
+}
+
+async function fetchNetSuiteDepartments() {
+  if (state.netSuiteDepartments) return state.netSuiteDepartments;
+  const res = await apiFetch("/netsuite/departments");
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.message || "Failed to load departments.");
+  state.netSuiteDepartments = data.departments ?? [];
+  return state.netSuiteDepartments;
+}
+
+async function renderDepartmentSelectorPanel(d) {
+  const panel = $("department-selector-panel");
+  if (!panel) return;
+
+  // Only ever shown when NetSuite itself has rejected (or would reject) the
+  // push specifically for a missing department — this is not a general
+  // "pick a department for every invoice" control, only a fix for the one
+  // real gap: business-unit routing didn't resolve one and there's no
+  // configured default.
+  const departmentRequired = (d.controlFlags ?? []).some(
+    (f) => f?.severity === "blocker" && String(f?.message ?? "") === "department is required"
+  );
+  if (!departmentRequired) {
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return;
+  }
+
+  panel.classList.remove("hidden");
+  panel.innerHTML = `
+    <div class="panel-title">Department required</div>
+    <div class="flag-stack">
+      <span class="flag warning">
+        This invoice's buyer didn't match a configured business unit, so no department was set —
+        NetSuite requires one to post this bill. Pick one below to unblock it.
+      </span>
+    </div>
+    <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
+      <select id="department-select" style="flex:1"><option value="">Loading departments…</option></select>
+      <button id="department-save-btn" class="button secondary" type="button" disabled>Save</button>
+    </div>
+  `;
+
+  const select = $("department-select");
+  const saveBtn = $("department-save-btn");
+  saveBtn.addEventListener("click", () => saveDepartmentOverride(d.messageId, d.attachmentId));
+
+  try {
+    const departments = await fetchNetSuiteDepartments();
+    select.innerHTML =
+      `<option value="">Select a department…</option>` +
+      departments
+        .map((dep) => `<option value="${escapeHtml(dep.id)}">${escapeHtml(dep.name)}</option>`)
+        .join("");
+    saveBtn.disabled = false;
+  } catch (err) {
+    console.error(err);
+    select.innerHTML = `<option value="">Failed to load departments</option>`;
+  }
+}
+
+async function saveDepartmentOverride(messageId, attachmentId) {
+  const select = $("department-select");
+  const saveBtn = $("department-save-btn");
+  const departmentId = select?.value;
+  if (!departmentId) {
+    toast("Pick a department first.", "error");
+    return;
+  }
+  saveBtn.disabled = true;
+  saveBtn.textContent = "Saving…";
+  try {
+    const res = await apiFetch(
+      `/invoices/${encodeURIComponent(messageId)}/${encodeURIComponent(attachmentId)}/netsuite/department`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ departmentId }),
+      }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      toast("Department set.", "success");
+      await openDetail(messageId, attachmentId);
+    } else {
+      toast(data.message || "Saving the department failed.", "error");
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Save";
+    }
+  } catch (err) {
+    if (err.message === "Unauthorized") return;
+    console.error(err);
+    toast("Saving the department failed.", "error");
+    saveBtn.disabled = false;
+    saveBtn.textContent = "Save";
   }
 }
 
@@ -961,6 +1060,8 @@ async function openDetail(messageId, attachmentId) {
   $("duplicate-review-panel").innerHTML = "";
   $("vat-registry-panel").classList.add("hidden");
   $("vat-registry-panel").innerHTML = "";
+  $("department-selector-panel").classList.add("hidden");
+  $("department-selector-panel").innerHTML = "";
   overlay.classList.remove("hidden");
   document.body.classList.add("no-scroll");
 
@@ -979,6 +1080,7 @@ async function openDetail(messageId, attachmentId) {
     ).join("");
     renderDuplicateReviewPanel(d);
     renderVatRegistryPanel(d);
+    renderDepartmentSelectorPanel(d);
 
     let jsonPayload;
     if (d.status === "FAILED") {

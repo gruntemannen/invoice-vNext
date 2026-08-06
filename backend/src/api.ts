@@ -927,12 +927,18 @@ function withDerivedFlow(item: any) {
 
   let netSuiteWarnings: string[] | undefined;
   let netSuiteValidationErrors: string[] | undefined;
+  // What the transform actually resolved. The drawer needs this to show the
+  // department that will really be sent (which may come from an override, a
+  // business-unit route, or a config default) rather than inferring it from
+  // the absence of a blocker flag.
+  let resolved: { departmentId?: string } = {};
   try {
     const config = loadNetSuiteConfig();
-    const { request, warnings } = transformToNetSuite(item.extractedJson, config);
+    const { bill, request, warnings } = transformToNetSuite(item.extractedJson, config);
     const validation = validateNetSuiteRequest(request, config);
     netSuiteWarnings = warnings;
     netSuiteValidationErrors = validation.errors;
+    resolved = { departmentId: (bill as any)?.department?.id };
   } catch {
     // Leave NetSuite-specific signals out if the transform itself throws; the
     // extraction-only flags below still apply.
@@ -953,5 +959,6 @@ function withDerivedFlow(item: any) {
     controlFlags: flow.flags,
     duplicateCount: flow.duplicateCount,
     displayStatus: computeDisplayStatus(item, item.netSuiteTransactionStatus),
+    netSuiteResolved: resolved,
   };
 }

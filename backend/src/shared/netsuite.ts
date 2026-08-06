@@ -1071,13 +1071,21 @@ export function transformToNetSuite(
       // balances, but flag it for review.
       const fallbackAccountId = fallbackExpenseAccountId;
       lineAccount = { id: fallbackAccountId };
+      // Distinguish "the invoice named an account we don't know" from "the
+      // invoice named no account at all" — the latter is the common case for
+      // simple subscription/service invoices and reads as noise when it's
+      // reported as an unmatched crosswalk lookup of the empty string.
       warnings.push(
-        `Line ${lineNo}: GL account "${glCode}" not in crosswalk; fell back to default account ${fallbackAccountId}.`
+        glCode
+          ? `Line ${lineNo}: GL account "${glCode}" not in crosswalk; fell back to default account ${fallbackAccountId}.`
+          : `Line ${lineNo}: no GL account on the invoice; used default account ${fallbackAccountId}.`
       );
     } else {
       lineAccount = { id: UNRESOLVED_PLACEHOLDER };
       warnings.push(
-        `Line ${lineNo}: GL account "${glCode}" unresolved and no default configured; placeholder "${UNRESOLVED_PLACEHOLDER}" inserted.`
+        glCode
+          ? `Line ${lineNo}: GL account "${glCode}" unresolved and no default configured; placeholder "${UNRESOLVED_PLACEHOLDER}" inserted.`
+          : `Line ${lineNo}: no GL account on the invoice and no default configured; placeholder "${UNRESOLVED_PLACEHOLDER}" inserted.`
       );
     }
 

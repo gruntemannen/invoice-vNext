@@ -741,6 +741,44 @@ a:hover {
   color: var(--red);
 }
 
+/* Collapsed advisory notes on an invoice that's already posted to NetSuite. */
+.flag-details > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 4px 0;
+  user-select: none;
+}
+.flag-details > summary:hover {
+  color: var(--text);
+}
+.flag-details[open] > summary {
+  margin-bottom: 5px;
+}
+
+/* Department picker in the invoice drawer. */
+.department-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+.department-row select {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+}
+.department-row select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 /* ------------------------------ Upload -------------------------------- */
 .dropzone {
   border: 2px dashed var(--border-strong);

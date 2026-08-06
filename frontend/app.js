@@ -273,20 +273,39 @@ function fmtDisplayStatus(status) {
   }
 }
 
-function renderControlFlags(flags) {
-  if (!Array.isArray(flags) || flags.length === 0) return "—";
-  const visibleFlags = flags.filter((flag) => {
+function renderControlFlags(d) {
+  const flags = (d.controlFlags ?? d.extractedJson?.meta?.controlFlags ?? []).filter((flag) => {
     const text = String(flag?.message || flag?.code || "");
     return !text.includes("sanitized_purchase_order_number");
   });
-  if (visibleFlags.length === 0) return "—";
-  return `<div class="flag-stack">${visibleFlags
-    .slice(0, 5)
-    .map((flag) => {
-      const severity = ["info", "warning", "blocker"].includes(flag.severity) ? flag.severity : "info";
-      return `<span class="flag ${severity}">${escapeHtml(flag.message || flag.code || "Review required")}</span>`;
-    })
-    .join("")}</div>`;
+  if (flags.length === 0) return "—";
+
+  const chip = (flag) => {
+    const severity = ["info", "warning", "blocker"].includes(flag.severity) ? flag.severity : "info";
+    return `<span class="flag ${severity}">${escapeHtml(flag.message || flag.code || "Review required")}</span>`;
+  };
+
+  // Blockers are what's actually stopping this invoice, so they lead. Everything
+  // else is advisory. Note this no longer silently truncates at 5 — a hidden
+  // blocker is exactly the thing you'd want to see.
+  const blockers = flags.filter((f) => f.severity === "blocker");
+  const advisory = flags.filter((f) => f.severity !== "blocker");
+
+  const parts = [];
+  if (blockers.length) parts.push(`<div class="flag-stack">${blockers.map(chip).join("")}</div>`);
+  if (advisory.length) {
+    // Once the bill is posted in NetSuite these are history, not to-dos — keep
+    // them available but out of the way so the live state reads clearly.
+    parts.push(
+      d.displayStatus === "PROCESSED"
+        ? `<details class="flag-details">
+             <summary>${advisory.length} advisory note${advisory.length === 1 ? "" : "s"} from extraction</summary>
+             <div class="flag-stack">${advisory.map(chip).join("")}</div>
+           </details>`
+        : `<div class="flag-stack">${advisory.map(chip).join("")}</div>`
+    );
+  }
+  return parts.join("");
 }
 
 function renderVatValidation(d) {
@@ -500,35 +519,59 @@ async function fetchNetSuiteDepartments() {
   return state.netSuiteDepartments;
 }
 
+// This account's department names are prefixed by function ("Sales-Management",
+// "Engineering-Backend", ...). A flat list of 40 is hard to scan, so group by
+// that prefix and show the short label inside each group.
+function groupDepartments(departments) {
+  const groups = new Map();
+  for (const dep of departments) {
+    const idx = dep.name.indexOf("-");
+    const group = idx > 0 ? dep.name.slice(0, idx).trim() : "Other";
+    const label = idx > 0 ? dep.name.slice(idx + 1).trim() : dep.name;
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push({ id: dep.id, label });
+  }
+  return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+}
+
 async function renderDepartmentSelectorPanel(d) {
   const panel = $("department-selector-panel");
   if (!panel) return;
 
-  // Only ever shown when NetSuite itself has rejected (or would reject) the
-  // push specifically for a missing department — this is not a general
-  // "pick a department for every invoice" control, only a fix for the one
-  // real gap: business-unit routing didn't resolve one and there's no
-  // configured default.
-  const departmentRequired = (d.controlFlags ?? []).some(
-    (f) => f?.severity === "blocker" && String(f?.message ?? "") === "department is required"
-  );
-  if (!departmentRequired) {
+  if (d.status !== "COMPLETED") {
     panel.classList.add("hidden");
     panel.innerHTML = "";
     return;
   }
 
+  // What the transform actually resolved — empty means nothing set, which
+  // NetSuite rejects on this account's vendor bill form.
+  const currentId = d.netSuiteResolved?.departmentId || "";
+  const posted = netSuiteTransactionStatus(d) === "SUCCEEDED";
+
   panel.classList.remove("hidden");
   panel.innerHTML = `
-    <div class="panel-title">Department required</div>
-    <div class="flag-stack">
-      <span class="flag warning">
-        This invoice's buyer didn't match a configured business unit, so no department was set —
-        NetSuite requires one to post this bill. Pick one below to unblock it.
-      </span>
-    </div>
-    <div style="margin-top:10px; display:flex; gap:8px; align-items:center;">
-      <select id="department-select" style="flex:1"><option value="">Loading departments…</option></select>
+    <div class="panel-title">Department</div>
+    ${
+      !currentId
+        ? `<div class="flag-stack"><span class="flag blocker">
+             This invoice's buyer didn't match a configured business unit, so no department was set.
+             NetSuite requires one to post this bill — pick one to unblock it.
+           </span></div>`
+        : ""
+    }
+    ${
+      posted
+        ? `<div class="flag-stack"><span class="flag info">
+             This bill is already posted in NetSuite. Changing the department here won't update the
+             posted record — change it in NetSuite directly.
+           </span></div>`
+        : ""
+    }
+    <div class="department-row">
+      <select id="department-select" ${posted ? "disabled" : ""}>
+        <option value="">Loading departments…</option>
+      </select>
       <button id="department-save-btn" class="button secondary" type="button" disabled>Save</button>
     </div>
   `;
@@ -539,12 +582,26 @@ async function renderDepartmentSelectorPanel(d) {
 
   try {
     const departments = await fetchNetSuiteDepartments();
-    select.innerHTML =
-      `<option value="">Select a department…</option>` +
-      departments
-        .map((dep) => `<option value="${escapeHtml(dep.id)}">${escapeHtml(dep.name)}</option>`)
-        .join("");
-    saveBtn.disabled = false;
+    const options = [`<option value="">Select a department…</option>`];
+    for (const [group, items] of groupDepartments(departments)) {
+      options.push(`<optgroup label="${escapeHtml(group)}">`);
+      for (const item of items.sort((a, b) => a.label.localeCompare(b.label))) {
+        options.push(
+          `<option value="${escapeHtml(item.id)}"${item.id === currentId ? " selected" : ""}>${escapeHtml(item.label)}</option>`
+        );
+      }
+      options.push(`</optgroup>`);
+    }
+    select.innerHTML = options.join("");
+
+    if (!posted) {
+      // Only enable Save once the choice actually differs from what's already set.
+      const syncSaveState = () => {
+        saveBtn.disabled = !select.value || select.value === currentId;
+      };
+      select.addEventListener("change", syncSaveState);
+      syncSaveState();
+    }
   } catch (err) {
     console.error(err);
     select.innerHTML = `<option value="">Failed to load departments</option>`;
@@ -1037,7 +1094,7 @@ const DETAIL_FIELDS = [
   ["Duplicates", (d) => escapeHtml(String(d.duplicateCount ?? d.extractedJson?.meta?.duplicateCount ?? 0))],
   ["Duplicate decision", renderDuplicateDecision],
   ["NetSuite", renderNetSuiteStatus],
-  ["Controls", (d) => renderControlFlags(d.controlFlags ?? d.extractedJson?.meta?.controlFlags ?? [])],
+  ["Controls", renderControlFlags],
   ["From", (d) => escapeHtml(d.from || "—")],
   ["Subject", (d) => escapeHtml(d.subject || "—")],
   ["Received", (d) => escapeHtml(fmtDate(d.receivedAt))],

@@ -28,11 +28,14 @@ Invoice Extractor currently provides:
   that don't share a single company-wide account.
 - Runtime NetSuite endpoint configuration for Test and Prod in the admin console.
 - Durable NetSuite transaction logging before any live push attempt.
-- Optional silent auto-booking: a fully clean invoice (no warnings, validated VAT, not a
-  duplicate, high confidence, and not the first transaction seen for that vendor) is logged and
-  queued at extraction time with no manual click. Anything else stays in AP review exactly as
-  before, and the reviewer's action is an explicit "Approve & Send to NetSuite" override rather
-  than a bare "log" step.
+- Optional silent auto-booking: any invoice with no blocker-severity flag (an unresolved
+  duplicate, or a hard NetSuite validation failure like a missing required vendor entity) and
+  high enough extraction confidence is logged and queued at extraction time with no manual
+  click. Warning-severity flags (PO not matched, a GL account defaulted, first-time vendor, VAT
+  not yet validated) still surface for AP visibility but no longer hold this back — only a
+  genuine duplicate or a push that would actually fail at NetSuite does. Anything blocked stays
+  in AP review exactly as before, and the reviewer's action is an explicit "Approve & Send to
+  NetSuite" override rather than a bare "log" step.
 - A single unified lifecycle status per invoice, replacing separate extraction-status/review
   badges: `Imported` (still extracting) -> `On Hold` (needs review, a config gap, or a
   retryable NetSuite outage) -> `Processed` (NetSuite confirmed), or `Failed` at any point.
@@ -120,26 +123,25 @@ Review and integration:
 
 ### Auto-Booking Criteria
 
-An invoice becomes eligible for silent auto-booking (`flow.autoBookEligible`) only when **all**
-of the following hold, computed fresh with the current NetSuite crosswalk state:
+An invoice becomes eligible for silent auto-booking (`flow.autoBookEligible`) when, computed
+fresh with the current NetSuite crosswalk state:
 
-- `validateNetSuiteRequest` passes (`validation.valid`) — vendor, subsidiary/entity, `tranDate`,
-  and expense lines all resolved.
-- Zero warning- or blocker-severity control flags — not just zero blockers. An unmapped GL
-  account falling back to a default, a first-time vendor, or an unvalidated VAT number all count
-  as warnings and force `NEEDS_REVIEW`, the same as a hard blocker would.
-- Vendor VAT status is specifically `VALID` (not `SKIPPED`/`ERROR`/`INVALID`) whenever a `taxId`
-  was extracted at all.
-- Not a duplicate (or an admin has already recorded `ALLOW_NETSUITE`).
+- There is **no blocker-severity control flag** (`flow.hasBlockingFlags` is false) — the only
+  things that count as blockers are an unresolved duplicate (unless an admin has already
+  recorded `ALLOW_NETSUITE`) and a hard NetSuite validation failure (`validateNetSuiteRequest`
+  finding a genuinely missing required field, e.g. an unresolved vendor entity).
 - Confidence is at or above `minimumAutoBookConfidence` (default `0.95`).
-- Not the first NetSuite transaction ever seen for this resolved vendor — the first invoice per
-  vendor always holds for one human approval before that vendor becomes eligible for silent
-  auto-booking (`firstTimeVendorHold` in `assessInvoiceFlow`).
 
-A manual "Approve & Send to NetSuite" click is a separate, looser gate: it only refuses on a
-genuine blocker (`flow.hasBlockingFlags`), since the human clicking it *is* the review — a
-first-time vendor or a defaulted GL account doesn't need a second look once someone has already
-looked.
+That's it — this is deliberately loose. Warning-severity control flags (an unmapped GL account
+falling back to a default, a first-time vendor, an unvalidated VAT number, an unmatched PO) do
+**not** block auto-booking; they still surface in `flow.flags`/`reviewStatus` for AP to see, but
+the transaction gets logged and queued regardless. The only thing that stops an invoice for
+review is a genuine duplicate or a push that would actually fail at NetSuite — everything else
+goes through automatically.
+
+A manual "Approve & Send to NetSuite" click uses the exact same gate (`flow.hasBlockingFlags`) —
+there's no separate, stricter bar for auto-booking anymore. A human clicking that button and the
+system auto-booking are refusing on the same condition.
 
 ## Key Components
 
@@ -207,7 +209,8 @@ Implemented:
 - Check-then-upsert REST push by external ID: the worker looks for an existing record with the
   same external ID before every PUT, since NetSuite's upsert can append duplicate sublist lines
   rather than replace them on a retry.
-- Optional silent auto-booking for fully clean invoices, with a first-time-vendor guardrail.
+- Optional silent auto-booking, blocked only by a genuine duplicate or a hard NetSuite
+  validation failure — not by warning-severity flags like first-time vendor or PO mismatch.
 - Vendor-master compare/fill before AP push when `vendorSync` is configured.
 - Durable transaction outbox and replay endpoints.
 
@@ -217,8 +220,9 @@ Default live behavior:
 - `netSuiteLivePushEnabled: true` queues ready/configured transactions to the NetSuite worker,
   either from a manual "Approve & Send to NetSuite" click or from auto-booking.
 - `netSuiteAutoBookEnabled: false` (default): nothing books itself; every invoice needs a manual
-  approve. `true`: fully clean invoices (see Auto-Booking Criteria above) log and queue with no
-  click, everything else still waits for AP review.
+  approve. `true`: anything without a blocker-severity flag (see Auto-Booking Criteria above)
+  logs and queues with no click; only a duplicate or a hard NetSuite validation failure still
+  waits for AP review.
 
 See [NETSUITE-INTEGRATION.md](NETSUITE-INTEGRATION.md) for NetSuite field mapping and the
 sandbox checklist.
@@ -308,10 +312,11 @@ export const config = {
   viesRequestTimeoutMs: 6000,
   netSuiteLivePushEnabled: false,
 
-  // Silently logs+queues a NetSuite transaction at extraction time for a fully clean invoice
-  // (see Auto-Booking Criteria) — no button click. Defaults false; only meaningful once
-  // netSuiteLivePushEnabled is also true and the crosswalk is populated enough that this
-  // wouldn't just hold every invoice on missing config anyway.
+  // Silently logs+queues a NetSuite transaction at extraction time for anything without a
+  // blocker-severity flag (see Auto-Booking Criteria) — no button click. Only a duplicate or a
+  // hard NetSuite validation failure holds it back; warnings don't. Defaults false; only
+  // meaningful once netSuiteLivePushEnabled is also true and the crosswalk is populated enough
+  // that this wouldn't just hold every invoice on missing config anyway.
   netSuiteAutoBookEnabled: false,
 
   // Optional. Leave unset to create/use the stack-owned admin pool.

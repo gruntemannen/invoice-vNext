@@ -215,10 +215,13 @@ export const handler = async (event: SQSEvent) => {
         updates
       );
 
-      // 10b. Auto-book: only when explicitly enabled, the invoice is fully clean
-      // (no warnings, no blockers, high confidence, not a first-time vendor), and
-      // the NetSuite transform actually validated. Everything else stays exactly
-      // as before — held for AP review, no transaction created until a human acts.
+      // 10b. Auto-book: only when explicitly enabled, there's no blocker-severity
+      // flag (unresolved duplicate, missing required NetSuite field, etc.), the
+      // NetSuite transform actually validated, and confidence clears the threshold.
+      // Warning-severity flags (PO not matched, GL account defaulted, first-time
+      // vendor, VAT not yet validated) no longer hold this back — only a genuine
+      // duplicate or a hard NetSuite validation failure does. Anything blocked
+      // stays held for AP review, no transaction created until a human acts.
       if (NETSUITE_AUTO_BOOK_ENABLED && flow.autoBookEligible && netSuitePreview?.validation.valid) {
         try {
           let txStatus: "QUEUED" | "HELD_FOR_CONFIGURATION" = "QUEUED";

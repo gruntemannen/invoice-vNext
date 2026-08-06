@@ -23,15 +23,26 @@ export interface DuplicateMatch {
 }
 
 export interface FlowAssessment {
+  /**
+   * "Any flag at all" signal (blocker or warning) — drives what AP sees as needing
+   * a look. Independent of `autoBookEligible`: a warning-only invoice can still be
+   * auto-booked while showing NEEDS_REVIEW so AP retains visibility.
+   */
   reviewStatus: ReviewStatus;
+  /**
+   * True whenever there's no blocker-severity flag and confidence clears the
+   * threshold — this is what actually gates the automatic NetSuite push.
+   * Warning-severity flags (unmapped GL account defaulted, PO not matched,
+   * first-time vendor, VAT not yet validated, etc.) do NOT block this; only
+   * `hasBlockingFlags` does.
+   */
   autoBookEligible: boolean;
   /**
    * True only when a blocker-severity flag is present (missing vendor, unresolved
    * duplicate, unresolved NetSuite placeholder, etc.) — data that genuinely can't
-   * go to NetSuite. False when only warning-severity flags exist (unmapped GL
-   * account defaulted, first-time vendor, etc.), which a human can review and
-   * knowingly approve past. `reviewStatus` stays the stricter "any flag at all"
-   * signal used to gate silent auto-booking.
+   * go to NetSuite. This is the actual auto-book gate (see `autoBookEligible`) and
+   * also what stops a human from manually overriding past it — a blocker has to be
+   * resolved (fix the crosswalk, allow the duplicate) rather than approved past.
    */
   hasBlockingFlags: boolean;
   duplicateKey: string | null;
@@ -50,8 +61,8 @@ export interface FlowAssessmentOptions {
   minimumAutoBookConfidence?: number;
   /**
    * True when this is the first NetSuite transaction ever seen for this resolved
-   * vendor. Forces NEEDS_REVIEW so a human approves booking for a vendor at least
-   * once before it becomes eligible for silent auto-booking.
+   * vendor. Surfaced as an informational warning flag only — does not block
+   * auto-booking (only blocker-severity flags do; see `autoBookEligible`).
    */
   firstTimeVendorHold?: boolean;
 }
@@ -139,7 +150,7 @@ export function assessInvoiceFlow(
       code: "first_time_vendor_auto_book_hold",
       severity: "warning",
       message:
-        "This is the first NetSuite transaction seen for this vendor; holding for AP review before this vendor becomes eligible for silent auto-booking.",
+        "This is the first NetSuite transaction seen for this vendor. Booked automatically; flagged here for AP awareness.",
     });
   }
 
@@ -288,8 +299,15 @@ export function assessInvoiceFlow(
   const warnings = flags.some((flag) => flag.severity === "warning");
   const reviewStatus: ReviewStatus = blocking || warnings ? "NEEDS_REVIEW" : "READY_FOR_NETSUITE";
   const minConfidence = options.minimumAutoBookConfidence ?? DEFAULT_AUTO_BOOK_CONFIDENCE;
+  // Auto-book gates only on blocker-severity flags — data that genuinely can't go to
+  // NetSuite (an unresolved duplicate, a missing required field like vendor entity).
+  // Warning-severity flags (unmapped GL account defaulted, PO not matched, first-time
+  // vendor, VAT not yet validated, etc.) still surface via reviewStatus/flags for AP
+  // to see, but no longer block the automatic push — only `blocking` does. This is
+  // intentionally looser than `reviewStatus === READY_FOR_NETSUITE`, which required
+  // zero flags of any kind.
   const autoBookEligible =
-    reviewStatus === "READY_FOR_NETSUITE" &&
+    !blocking &&
     typeof confidence === "number" &&
     confidence >= minConfidence;
 

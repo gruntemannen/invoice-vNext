@@ -229,19 +229,22 @@ resolution from the moment extraction finishes, not just extraction-quality sign
 
 When `NETSUITE_AUTO_BOOK_ENABLED` is set and `flow.autoBookEligible` is true (see the Auto-Booking
 Criteria list in the main README), extraction itself logs and queues the NetSuite transaction —
-tagged `bookingMode: "AUTO"` — with no button click. Anything less than fully clean still lands in
-`NEEDS_REVIEW` exactly as before, and the manual "Approve & Send to NetSuite" action in the admin
-console remains available; it's tagged `bookingMode: "MANUAL"` and only refuses on a genuine
-blocker (`flow.hasBlockingFlags`), not on the stricter zero-warnings bar auto-booking uses — a
-human clicking that button already *is* the review a warning exists to prompt.
+tagged `bookingMode: "AUTO"` — with no button click. `autoBookEligible` now gates only on
+blocker-severity flags (`flow.hasBlockingFlags`) plus a confidence threshold — the exact same bar
+the manual "Approve & Send to NetSuite" button uses. A genuine duplicate or a hard NetSuite
+validation failure (missing required field, e.g. an unresolved vendor entity) is the only thing
+that holds an invoice back; warning-severity flags (PO not matched, GL account defaulted,
+first-time vendor, VAT not yet validated) surface for AP visibility but no longer block the
+automatic push. This was a deliberate loosening from an earlier, stricter "zero flags of any
+kind" bar — see `flow.ts`'s `autoBookEligible` comment for the current rule.
 
-The first-time-vendor guardrail (`firstTimeVendorHold` in `flow.ts`, checked via
-`hasVendorBookingHistory` in `transactions.ts`) holds the *first* transaction for any newly
-resolved vendor for manual approval, regardless of how clean everything else is, before that
-vendor becomes eligible for silent auto-booking. The history check is a bounded, best-effort scan
-of recent transactions (not a dedicated index) — accurate at this app's current scale, worth
-revisiting if transaction volume grows enough that "recent" stops covering a vendor's true first
-transaction.
+The first-time-vendor signal (`firstTimeVendorHold` in `flow.ts`, checked via
+`hasVendorBookingHistory` in `transactions.ts`) is informational only now — it no longer holds
+the vendor's first transaction for manual approval, it just flags it (`first_time_vendor_auto_book_hold`,
+warning severity) so AP can see it happened. The history check itself is unchanged: a bounded,
+best-effort scan of recent transactions (not a dedicated index) — accurate at this app's current
+scale, worth revisiting if transaction volume grows enough that "recent" stops covering a
+vendor's true first transaction.
 
 ## Configuration
 
@@ -376,10 +379,11 @@ one is superseded by a new, freshly-validated attempt instead of blocking retrie
 - [ ] Compare extracted IBAN/BIC against the NetSuite vendor master before auto-booking.
 - [ ] Validate duplicate handling for same vendor/invoice/amount retries, corrected invoices,
       reminders, and proformas.
-- [ ] If enabling `netSuiteAutoBookEnabled`, confirm the first-time-vendor guardrail actually
-      holds a brand-new vendor's first invoice, and that the crosswalk is populated enough that
-      auto-booking isn't either a no-op (everything still holds on missing config) or overly
-      permissive (holes in the warning coverage let something through that shouldn't auto-book).
+- [ ] If enabling `netSuiteAutoBookEnabled`, confirm the crosswalk is populated enough that
+      auto-booking isn't either a no-op (everything still holds on missing vendor/account
+      config) or pushing invoices that need a human look — since only a duplicate or a hard
+      NetSuite validation failure blocks it now, review what's actually landing in NetSuite
+      unattended before relying on this for real vendor bills.
 - [ ] Build a companion SuiteScript RESTlet if original PDF attachment is required; REST Record
       API alone cannot upload file bytes.
 - [ ] Keep `netSuiteLivePushEnabled` false until sandbox validation and credentials are complete.

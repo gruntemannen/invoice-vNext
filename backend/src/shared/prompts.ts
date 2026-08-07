@@ -96,6 +96,18 @@ Rules:
 - netAmount = subtotal before tax/discounts when shown.
 - taxAmount = VAT/consumption tax amount.
 - lineItems amounts = pre-tax amounts.
+- EVERY monetary field — netAmount, taxAmount, totalAmount, and each line's amount and unitPrice —
+  must be in the SINGLE currency you report in invoice.currency. Never mix currencies across
+  fields.
+- Cross-border invoices frequently print the same amounts twice, once in the seller's local
+  currency and once in the currency the invoice is settled in (for example an Indian supplier
+  billing a European customer showing both INR and EUR). When that happens, choose the currency
+  the invoice is actually payable in — the one on the "total due"/"amount payable" line and
+  matching the bank details — set invoice.currency to it, and read every other amount from that
+  same column. Do NOT take totalAmount from one currency and netAmount from the other.
+- Sanity-check before returning: netAmount + taxAmount should equal totalAmount, and the line
+  amounts should sum to netAmount. If they don't, you have most likely mixed currencies or
+  misread a figure — re-read the document rather than returning inconsistent numbers.
 - For Proforma invoices, set invoiceType to "Proforma". For reminders/dunning notices/Mahnung, set "Reminder". For vendor statements, set "Statement".
 - Treat Proforma invoices as prepayment requests: set transactionIntent to "VendorPrepayment". Standard payable invoices should use "VendorBill".
 - purchaseOrderNumber = the PO/order reference exactly as printed on the invoice, null if not present.

@@ -674,23 +674,17 @@ a:hover {
   font-weight: 600;
 }
 
-/* Email grouping: one header per message, then its attachments beneath. */
-.table tbody tr.email-group td {
+/* Email grouping: one collapsed summary line per multi-invoice message. */
+.table tbody tr.email-summary td {
   background: var(--surface-2);
-  padding: 9px 16px;
-  border-bottom: 1px solid var(--border);
 }
-.email-group-subject {
-  font-weight: 600;
-  font-size: 12.5px;
-}
-.email-group-meta {
-  display: block;
-  font-size: 11px;
+.email-caret {
+  display: inline-block;
+  width: 12px;
   color: var(--muted);
-  margin-top: 2px;
+  font-size: 10px;
 }
-/* Attachment count on a lone invoice row, where there's no group header. */
+/* Secondary line under a vendor name: attachment counts and group summaries. */
 .row-attachments {
   display: block;
   font-size: 11px;

@@ -28,6 +28,9 @@ const state = {
   netSuiteSettingsLoaded: false,
   // department selector (cached — list rarely changes, avoid refetching every drawer open)
   netSuiteDepartments: null,
+  // messageIds whose invoice rows are expanded; kept across re-renders so a
+  // refresh or filter change doesn't collapse what you just opened.
+  expandedEmails: new Set(),
 };
 
 const TOKEN_KEY = "invoice_admin_id_token";
@@ -1148,54 +1151,108 @@ function renderAudit() {
   }
 
   for (const { visible, invoices, references } of groups) {
-    // Grouping chrome only earns its place when one email produced several
-    // rows; a lone invoice is already self-contained.
-    const grouped = visible.length > 1;
-    if (grouped) {
-      const first = visible[0];
-      const header = document.createElement("tr");
-      header.className = "email-group";
-      header.innerHTML = `
-        <td colspan="6">
-          <span class="email-group-subject">${escapeHtml(first.subject || "(no subject)")}</span>
-          <span class="email-group-meta">${escapeHtml(first.from || "")}${
-            first.from ? " · " : ""
-          }${escapeHtml(describeEmailGroup([...invoices, ...references]))}</span>
-        </td>`;
-      body.appendChild(header);
+    // One email = one line. Emails that produced several invoices collapse into
+    // a summary row you can expand; a lone invoice is already one line.
+    if (visible.length > 1) {
+      body.appendChild(buildEmailSummaryRow(visible, invoices, references));
+      const expanded = state.expandedEmails.has(visible[0].messageId);
+      visible.forEach((it) => {
+        const tr = buildInvoiceRow(it, { grouped: true, references: [] });
+        if (!expanded) tr.classList.add("hidden");
+        body.appendChild(tr);
+      });
+    } else {
+      body.appendChild(buildInvoiceRow(visible[0], { grouped: false, references }));
     }
-
-    visible.forEach((it) => {
-      const isReference = it.documentKind === "SUPPORTING_DOCUMENT";
-      // Without a group header there's nowhere else to mention the attachments,
-      // so note them on the invoice row itself.
-      const attachmentNote =
-        !grouped && !isReference && references.length
-          ? `<span class="row-attachments">+${references.length} reference document${
-              references.length === 1 ? "" : "s"
-            }</span>`
-          : "";
-
-      const tr = document.createElement("tr");
-      tr.className = grouped ? "row-click grouped" : "row-click";
-      tr.innerHTML = `
-        <td>${escapeHtml(fmtDate(it.receivedAt))}</td>
-        <td class="cell-strong">${escapeHtml(it.vendorName || "—")}${attachmentNote}</td>
-        <td>${escapeHtml(it.invoiceNumber || "—")}</td>
-        <td class="num">${escapeHtml(fmtAmount(it.totalAmount, it.currency))}</td>
-        <td><span class="badge ${displayStatusClass(it.displayStatus)}">${escapeHtml(fmtDisplayStatus(it.displayStatus))}</span></td>
-        <td class="num">${
-          // Confidence is an extraction-quality signal for a document we're
-          // going to book. It says nothing useful about a reference document.
-          it.status === "COMPLETED" && !isReference
-            ? `<span class="conf ${confidenceClass(it.confidence)}">${fmtPct(it.confidence)}</span>`
-            : "—"
-        }</td>
-      `;
-      tr.onclick = () => openDetail(it.messageId, it.attachmentId);
-      body.appendChild(tr);
-    });
   }
+}
+
+/** A single collapsed line standing in for one email's invoices. */
+function buildEmailSummaryRow(visible, invoices, references) {
+  const first = visible[0];
+  const expanded = state.expandedEmails.has(first.messageId);
+
+  // Only state a shared value when it genuinely is shared — a summary that
+  // invents a single status or confidence for a mixed group would be worse
+  // than showing nothing.
+  const shared = (pick) => {
+    const values = [...new Set(visible.map(pick))];
+    return values.length === 1 ? values[0] : null;
+  };
+  const currency = shared((r) => r.currency);
+  const total = currency
+    ? visible.reduce((sum, r) => sum + (Number(r.totalAmount) || 0), 0)
+    : null;
+  const status = shared((r) => r.displayStatus);
+  const confidence = shared((r) => r.confidence);
+  const vendor = shared((r) => r.vendorName);
+
+  const tr = document.createElement("tr");
+  tr.className = "row-click email-summary";
+  tr.innerHTML = `
+    <td>
+      <span class="email-caret">${expanded ? "▾" : "▸"}</span>
+      ${escapeHtml(fmtDate(first.receivedAt))}
+    </td>
+    <td class="cell-strong">
+      ${escapeHtml(vendor || first.subject || "(no subject)")}
+      <span class="row-attachments">${escapeHtml(
+        describeEmailGroup([...invoices, ...references])
+      )}</span>
+    </td>
+    <td>${escapeHtml(`${visible.length} invoices`)}</td>
+    <td class="num">${currency ? escapeHtml(fmtAmount(total, currency)) : "—"}</td>
+    <td>${
+      status
+        ? `<span class="badge ${displayStatusClass(status)}">${escapeHtml(fmtDisplayStatus(status))}</span>`
+        : `<span class="badge pending">Mixed</span>`
+    }</td>
+    <td class="num">${
+      typeof confidence === "number"
+        ? `<span class="conf ${confidenceClass(confidence)}">${fmtPct(confidence)}</span>`
+        : "—"
+    }</td>
+  `;
+  tr.onclick = () => {
+    if (state.expandedEmails.has(first.messageId)) {
+      state.expandedEmails.delete(first.messageId);
+    } else {
+      state.expandedEmails.add(first.messageId);
+    }
+    renderAudit();
+  };
+  return tr;
+}
+
+function buildInvoiceRow(it, { grouped, references }) {
+  const isReference = it.documentKind === "SUPPORTING_DOCUMENT";
+  // On an ungrouped row there's no summary line to carry the attachment count,
+  // so note it here instead.
+  const attachmentNote =
+    !grouped && !isReference && references.length
+      ? `<span class="row-attachments">+${references.length} reference document${
+          references.length === 1 ? "" : "s"
+        }</span>`
+      : "";
+
+  const tr = document.createElement("tr");
+  tr.className = grouped ? "row-click grouped" : "row-click";
+  tr.innerHTML = `
+    <td>${escapeHtml(fmtDate(it.receivedAt))}</td>
+    <td class="cell-strong">${escapeHtml(it.vendorName || "—")}${attachmentNote}</td>
+    <td>${escapeHtml(it.invoiceNumber || "—")}</td>
+    <td class="num">${escapeHtml(fmtAmount(it.totalAmount, it.currency))}</td>
+    <td><span class="badge ${displayStatusClass(it.displayStatus)}">${escapeHtml(fmtDisplayStatus(it.displayStatus))}</span></td>
+    <td class="num">${
+      // Confidence is an extraction-quality signal for a document we're going
+      // to book. It says nothing useful about a reference document.
+      it.status === "COMPLETED" && !isReference
+        ? `<span class="conf ${confidenceClass(it.confidence)}">${fmtPct(it.confidence)}</span>`
+        : "—"
+    }</td>
+  `;
+  tr.onclick = () => openDetail(it.messageId, it.attachmentId);
+  return tr;
 }
 
 /* ========================================================================

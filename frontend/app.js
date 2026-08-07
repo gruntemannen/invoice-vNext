@@ -463,18 +463,22 @@ function renderVatRegistryPanel(d) {
     }
     ${
       vendorUnresolved
-        ? `<div style="margin-top:12px">
-             <button id="create-vendor-btn" class="button secondary" type="button">
-               Create vendor in NetSuite from this registry data
-             </button>
-             <div class="flag-stack">
-               <span class="flag info">
-                 Creates a new NetSuite vendor named "${escapeHtml(registeredName || d.vendorName || "—")}"
-                 with VAT number ${escapeHtml(v.normalizedVat || "—")}. Address and bank details are not
-                 set — add those in NetSuite directly, or they'll be filled in on a later push if
-                 vendor-master sync is configured.
-               </span>
+        ? `<div class="panel-action">
+             <div class="flag-stack"><span class="flag blocker">
+               This invoice's vendor isn't resolved in NetSuite. NetSuite requires one to post this
+               bill — create it from this registry data to unblock it.
+             </span></div>
+             <div class="panel-action-row">
+               <button id="create-vendor-btn" class="button secondary" type="button">
+                 Create vendor in NetSuite from this registry data
+               </button>
              </div>
+             <p class="panel-action-hint">
+               Creates "${escapeHtml(registeredName || d.vendorName || "—")}",
+               VAT ${escapeHtml(v.normalizedVat || "—")}. Address and bank details aren't set — add
+               those in NetSuite directly, or they'll be filled in on a later push if vendor-master
+               sync is configured.
+             </p>
            </div>`
         : ""
     }
@@ -563,27 +567,29 @@ async function renderDepartmentSelectorPanel(d) {
   panel.classList.remove("hidden");
   panel.innerHTML = `
     <div class="panel-title">Department</div>
-    ${
-      !currentId
-        ? `<div class="flag-stack"><span class="flag blocker">
-             This invoice's buyer didn't match a configured business unit, so no department was set.
-             NetSuite requires one to post this bill — pick one to unblock it.
-           </span></div>`
-        : ""
-    }
-    ${
-      posted
-        ? `<div class="flag-stack"><span class="flag info">
-             This bill is already posted in NetSuite. Changing the department here won't update the
-             posted record — change it in NetSuite directly.
-           </span></div>`
-        : ""
-    }
-    <div class="department-row">
-      <select id="department-select" ${posted ? "disabled" : ""}>
-        <option value="">Loading departments…</option>
-      </select>
-      <button id="department-save-btn" class="button secondary" type="button" disabled>Save</button>
+    <div class="panel-action">
+      ${
+        !currentId
+          ? `<div class="flag-stack"><span class="flag blocker">
+               This invoice's buyer didn't match a configured business unit, so no department was set.
+               NetSuite requires one to post this bill — pick one to unblock it.
+             </span></div>`
+          : ""
+      }
+      ${
+        posted
+          ? `<div class="flag-stack"><span class="flag info">
+               This bill is already posted in NetSuite. Changing the department here won't update the
+               posted record — change it in NetSuite directly.
+             </span></div>`
+          : ""
+      }
+      <div class="panel-action-row">
+        <select id="department-select" ${posted ? "disabled" : ""}>
+          <option value="">Loading departments…</option>
+        </select>
+        <button id="department-save-btn" class="button secondary" type="button" disabled>Save</button>
+      </div>
     </div>
   `;
 

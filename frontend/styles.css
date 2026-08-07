@@ -818,14 +818,20 @@ a:hover {
   color: var(--muted);
 }
 
-/* Department picker in the invoice drawer. */
-.department-row {
+/* Shared shape for an in-panel action: state the blocker, then the control
+   directly beneath it — used by both the department picker and the vendor-
+   creation button, so a held invoice presents its fixes the same way
+   wherever they appear instead of each panel inventing its own layout. */
+.panel-action {
+  margin-top: 10px;
+}
+.panel-action-row {
   display: flex;
   gap: 8px;
   align-items: center;
-  margin-top: 10px;
+  margin-top: 8px;
 }
-.department-row select {
+.panel-action-row select {
   flex: 1;
   min-width: 0;
   padding: 9px 10px;
@@ -836,9 +842,15 @@ a:hover {
   font-family: var(--font);
   font-size: 13px;
 }
-.department-row select:disabled {
+.panel-action-row select:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+.panel-action-hint {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--muted);
 }
 
 /* ------------------------------ Upload -------------------------------- */

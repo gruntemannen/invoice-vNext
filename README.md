@@ -36,6 +36,14 @@ Invoice Extractor currently provides:
   genuine duplicate or a push that would actually fail at NetSuite does. Anything blocked stays
   in AP review exactly as before, and the reviewer's action is an explicit "Approve & Send to
   NetSuite" override rather than a bare "log" step.
+- Supporting-document classification: invoice emails routinely carry non-invoice attachments
+  (cost-allocation schedules, customs exchange-rate notifications, remittance summaries). Any
+  attachment the extractor didn't recognise as an invoice type *and* that states no amount due is
+  classified `SUPPORTING_DOCUMENT`, shown as `Reference`, and kept and viewable — but it carries
+  none of the invoice-completeness flags, never joins duplicate detection, and is refused a
+  NetSuite push server-side rather than only being hidden in the UI. Both signals are required, so
+  a real invoice whose total briefly failed to parse still counts as an invoice and stops for
+  review as before.
 - A single unified lifecycle status per invoice, replacing separate extraction-status/review
   badges: `Imported` (still extracting) -> `On Hold` (needs review, a config gap, or a
   retryable NetSuite outage) -> `Processed` (NetSuite confirmed), or `Failed` at any point.

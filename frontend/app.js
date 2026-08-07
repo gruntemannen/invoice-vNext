@@ -251,6 +251,8 @@ function displayStatusClass(status) {
       return "ok";
     case "FAILED":
       return "fail";
+    case "REFERENCE":
+      return "neutral";
     case "ON_HOLD":
     case "IMPORTED":
     default:
@@ -268,6 +270,8 @@ function fmtDisplayStatus(status) {
       return "On hold";
     case "PROCESSED":
       return "Processed";
+    case "REFERENCE":
+      return "Reference";
     default:
       return "—";
   }
@@ -416,9 +420,12 @@ function renderVatRegistryPanel(d) {
   // Vendor isn't resolved to a NetSuite entity yet — this is the specific
   // signal to offer AP the option to create one from this registry data.
   // Never shown automatically triggers anything; it's just a button.
-  const vendorUnresolved = (d.controlFlags ?? []).some((f) =>
-    String(f?.message ?? "").startsWith("Vendor not resolved")
-  );
+  // Suppressed for supporting documents: they don't get a NetSuite vendor,
+  // and the "issuer" on something like a customs notification is a government
+  // body, not a supplier anyone should be creating in the vendor master.
+  const vendorUnresolved =
+    d.documentKind !== "SUPPORTING_DOCUMENT" &&
+    (d.controlFlags ?? []).some((f) => String(f?.message ?? "").startsWith("Vendor not resolved"));
 
   panel.classList.remove("hidden");
   panel.innerHTML = `
@@ -538,7 +545,8 @@ async function renderDepartmentSelectorPanel(d) {
   const panel = $("department-selector-panel");
   if (!panel) return;
 
-  if (d.status !== "COMPLETED") {
+  // Supporting documents never reach NetSuite, so its dimensions don't apply.
+  if (d.status !== "COMPLETED" || d.documentKind === "SUPPORTING_DOCUMENT") {
     panel.classList.add("hidden");
     panel.innerHTML = "";
     return;
@@ -1163,7 +1171,10 @@ async function openDetail(messageId, attachmentId) {
     // a stale HELD_FOR_REVIEW/HELD_FOR_CONFIGURATION/FAILED_* one can still be superseded.
     const liveStatuses = ["QUEUED", "IN_FLIGHT", "SUCCEEDED"];
     const alreadySent = liveStatuses.includes(netSuiteTransactionStatus(d));
-    if (alreadySent) {
+    if (d.documentKind === "SUPPORTING_DOCUMENT") {
+      // Not an invoice — there's nothing to send. The API refuses this too.
+      logButton.classList.add("hidden");
+    } else if (alreadySent) {
       // Nothing left to approve — the status is already shown in the fields above.
       logButton.classList.add("hidden");
     } else {

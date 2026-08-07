@@ -204,7 +204,10 @@ export const handler = async (event: SQSEvent) => {
         modelUsed,
       };
 
-      if (duplicateKey) {
+      // Only invoices join the duplicate index. Two copies of the same customs
+      // rate notification aren't a duplicate-payment risk, which is the thing
+      // that index exists to catch.
+      if (duplicateKey && flow.documentKind !== "SUPPORTING_DOCUMENT") {
         updates.duplicatePk = duplicateKey;
         updates.duplicateSk = `${normalized.invoice?.invoiceDate ?? receivedAt}#${messageId}#${attachmentId}`;
       }

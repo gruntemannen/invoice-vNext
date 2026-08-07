@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 export type ControlSeverity = "info" | "warning" | "blocker";
 export type ReviewStatus = "READY_FOR_NETSUITE" | "NEEDS_REVIEW";
 export type DuplicateReviewAction = "HOLD_FOR_REVIEW" | "ALLOW_NETSUITE";
+export type DocumentKind = "INVOICE" | "SUPPORTING_DOCUMENT";
 
 export interface ControlFlag {
   code: string;
@@ -23,6 +24,15 @@ export interface DuplicateMatch {
 }
 
 export interface FlowAssessment {
+  /**
+   * Whether this attachment is an invoice at all. Invoice emails routinely carry
+   * supporting material — cost-allocation schedules, customs exchange-rate
+   * notifications, remittance summaries — and each one used to land in the AP
+   * queue as a separate "invoice" failing one completeness check at a time.
+   * A SUPPORTING_DOCUMENT is kept and viewable, but is never pushed to NetSuite
+   * and doesn't carry the invoice-completeness flags.
+   */
+  documentKind: DocumentKind;
   /**
    * "Any flag at all" signal (blocker or warning) — drives what AP sees as needing
    * a look. Independent of `autoBookEligible`: a warning-only invoice can still be
@@ -109,6 +119,26 @@ export function summarizeDuplicateMatch(item: any): DuplicateMatch {
   };
 }
 
+/**
+ * Distinguishes a real invoice from supporting material that arrived in the
+ * same email. Requires BOTH signals before filing something away as non-
+ * invoice: the extractor didn't recognise it as a known invoice type (so not
+ * Standard/Proforma/Credit Note), AND it states no amount due.
+ *
+ * Demanding both is deliberate — a genuine invoice whose total briefly failed
+ * to parse still classifies as an invoice (and stops for review on the missing
+ * total, as before) rather than being quietly filed as reference material.
+ * Verified against a real 5-attachment AP email: the two Censhare India
+ * invoices are "Standard" with totals; the cost-allocation schedule and the
+ * CBIC customs rate notification are both "Other" with no amount.
+ */
+function classifyDocumentKind(invoice: any): DocumentKind {
+  const invoiceType = String(invoice?.invoiceType ?? "").trim().toLowerCase();
+  const total = invoice?.totalAmount;
+  const statesAnAmount = typeof total === "number" && Number.isFinite(total) && total !== 0;
+  return invoiceType === "other" && !statesAnAmount ? "SUPPORTING_DOCUMENT" : "INVOICE";
+}
+
 export function assessInvoiceFlow(
   extracted: any,
   options: FlowAssessmentOptions = {}
@@ -127,6 +157,33 @@ export function assessInvoiceFlow(
   const duplicateReview = normalizeDuplicateReview(
     options.duplicateReview ?? extracted?.meta?.duplicateReview
   );
+
+  // Non-invoice attachments short-circuit everything below: the completeness
+  // checks (vendor, invoice number, total, ...) only make sense for a document
+  // that's trying to be an invoice, and running them produces a wall of
+  // blockers for something that was never going to NetSuite anyway.
+  if (classifyDocumentKind(invoice) === "SUPPORTING_DOCUMENT") {
+    return {
+      documentKind: "SUPPORTING_DOCUMENT",
+      reviewStatus: "NEEDS_REVIEW",
+      autoBookEligible: false,
+      hasBlockingFlags: false,
+      // Deliberately excluded from duplicate detection — two copies of the same
+      // rate notification aren't a duplicate-payment risk, which is what that
+      // check exists to catch.
+      duplicateKey: null,
+      duplicateCount: 0,
+      duplicateReview: null,
+      flags: [
+        {
+          code: "supporting_document",
+          severity: "info",
+          message:
+            "Not an invoice — kept as a supporting document for reference. Never sent to NetSuite.",
+        },
+      ],
+    };
+  }
 
   if (!hasValue(vendor.name)) {
     flags.push({
@@ -312,6 +369,7 @@ export function assessInvoiceFlow(
     confidence >= minConfidence;
 
   return {
+    documentKind: "INVOICE",
     reviewStatus,
     autoBookEligible,
     hasBlockingFlags: blocking,

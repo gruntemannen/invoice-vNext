@@ -26,6 +26,7 @@ import {
 import {
   assessInvoiceFlow,
   normalizeDuplicateReview,
+  type DocumentKind,
   type DuplicateReviewAction,
 } from "./shared/flow";
 import {
@@ -162,7 +163,8 @@ async function listInvoices(event: APIGatewayProxyEventV2) {
       from: item.from,
       subject: item.subject,
       status: item.status,
-      displayStatus: computeDisplayStatus(item, netSuiteTransactionStatus),
+      displayStatus: computeDisplayStatus(item, netSuiteTransactionStatus, item.documentKind),
+      documentKind: item.documentKind,
       reviewStatus: item.reviewStatus ?? item.extractedJson?.meta?.reviewStatus,
       autoBookEligible: item.autoBookEligible ?? item.extractedJson?.meta?.autoBookEligible,
       controlFlags: item.controlFlags ?? item.extractedJson?.meta?.controlFlags ?? [],
@@ -210,7 +212,7 @@ async function getInvoiceDetail(event: APIGatewayProxyEventV2) {
         ...derived,
         netSuiteTransaction: summarizeTransaction(transaction),
         // Prefer the live transaction status over the (possibly lagging) mirrored one.
-        displayStatus: computeDisplayStatus(item, transaction.status),
+        displayStatus: computeDisplayStatus(item, transaction.status, derived.documentKind),
       });
     }
   }
@@ -266,6 +268,22 @@ async function createNetSuiteTransactionForInvoice(event: APIGatewayProxyEventV2
 
   try {
     const preview = await buildNetSuitePreview(item);
+
+    // Only invoices go to NetSuite. Supporting material (cost-allocation
+    // schedules, rate notifications, remittance summaries) stays here for
+    // reference. Enforced server-side, not just hidden in the UI, so a stale
+    // browser tab or a direct API call can't post a non-invoice as a bill.
+    if (preview.flow.documentKind === "SUPPORTING_DOCUMENT") {
+      return jsonResponse(
+        {
+          message:
+            "This attachment is a supporting document, not an invoice. It's kept for reference and isn't sent to NetSuite.",
+          documentKind: preview.flow.documentKind,
+        },
+        409
+      );
+    }
+
     let status: NetSuiteTransactionStatus = "QUEUED";
     let eventMessage = "Transaction logged and queued for NetSuite push.";
 
@@ -901,12 +919,23 @@ function claimGroups(value: unknown): string[] {
  *   ON_HOLD   - extracted but not yet successfully in NetSuite: needs AP review,
  *               a config gap, an outage/retryable failure, or simply not sent yet
  *   PROCESSED - the NetSuite transaction succeeded
+ *   REFERENCE - not an invoice at all (supporting material that arrived in the
+ *               same email); kept and viewable, but never pushed to NetSuite
  */
-export type DisplayStatus = "IMPORTED" | "FAILED" | "ON_HOLD" | "PROCESSED";
+export type DisplayStatus = "IMPORTED" | "FAILED" | "ON_HOLD" | "PROCESSED" | "REFERENCE";
 
-function computeDisplayStatus(item: any, netSuiteStatus: string | null | undefined): DisplayStatus {
-  if (item.status === "FAILED" || netSuiteStatus === "FAILED_PERMANENT") return "FAILED";
+function computeDisplayStatus(
+  item: any,
+  netSuiteStatus: string | null | undefined,
+  documentKind?: DocumentKind
+): DisplayStatus {
+  if (item.status === "FAILED") return "FAILED";
   if (item.status !== "COMPLETED") return "IMPORTED";
+  // Checked after extraction completes (the classification needs the extracted
+  // fields) but before any NetSuite state, since a supporting document has no
+  // NetSuite lifecycle to report.
+  if (documentKind === "SUPPORTING_DOCUMENT") return "REFERENCE";
+  if (netSuiteStatus === "FAILED_PERMANENT") return "FAILED";
   if (netSuiteStatus === "SUCCEEDED") return "PROCESSED";
   return "ON_HOLD";
 }
@@ -958,7 +987,8 @@ function withDerivedFlow(item: any) {
     autoBookEligible: flow.autoBookEligible,
     controlFlags: flow.flags,
     duplicateCount: flow.duplicateCount,
-    displayStatus: computeDisplayStatus(item, item.netSuiteTransactionStatus),
+    displayStatus: computeDisplayStatus(item, item.netSuiteTransactionStatus, flow.documentKind),
+    documentKind: flow.documentKind,
     netSuiteResolved: resolved,
   };
 }

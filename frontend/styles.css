@@ -702,6 +702,12 @@ a:hover {
   background: var(--amber-soft);
   color: var(--amber);
 }
+/* Supporting documents: deliberately muted — they need no action, so they
+   shouldn't read as urgently as anything awaiting review. */
+.badge.neutral {
+  background: var(--surface-2);
+  color: var(--muted);
+}
 .conf {
   font-weight: 700;
   font-variant-numeric: tabular-nums;

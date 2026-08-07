@@ -762,6 +762,38 @@ a:hover {
   margin-bottom: 5px;
 }
 
+/* Reference documents attached to an invoice (same email, not payable). */
+.reference-doc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.reference-doc {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.reference-doc-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.reference-doc-name {
+  font-size: 12.5px;
+  word-break: break-word;
+}
+.reference-doc-type {
+  font-size: 11px;
+  color: var(--muted);
+}
+
 /* Department picker in the invoice drawer. */
 .department-row {
   display: flex;

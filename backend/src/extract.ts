@@ -359,8 +359,18 @@ function normalizeExtraction(raw: any): any {
   const srcVendor = raw.vendor ?? raw.supplier ?? raw.seller ?? {};
   const srcBuyer = raw.buyer ?? raw.customer ?? raw.billTo ?? raw.recipient ?? {};
   const srcInvoice = raw.invoice ?? raw;
+  const srcDocument = raw.document ?? {};
 
   return {
+    // The model's own read on whether this attachment is a payable document at
+    // all. Undefined for records extracted before this was asked for, which
+    // assessInvoiceFlow falls back to a heuristic for.
+    document: {
+      isPayableInvoice:
+        typeof srcDocument.isPayableInvoice === "boolean" ? srcDocument.isPayableInvoice : undefined,
+      documentType: firstPresent(srcDocument.documentType),
+      classificationReason: firstPresent(srcDocument.classificationReason),
+    },
     vendor: {
       name: firstPresent(srcVendor.name, raw.vendorName, raw.vendor_name, raw.supplierName, raw.sellerName, raw.name),
       taxId: firstPresent(srcVendor.taxId, srcVendor.vatNumber, srcVendor.vatId, raw.taxId, raw.vatNumber, raw.vat),

@@ -121,18 +121,27 @@ export function summarizeDuplicateMatch(item: any): DuplicateMatch {
 
 /**
  * Distinguishes a real invoice from supporting material that arrived in the
- * same email. Requires BOTH signals before filing something away as non-
- * invoice: the extractor didn't recognise it as a known invoice type (so not
- * Standard/Proforma/Credit Note), AND it states no amount due.
+ * same email.
  *
- * Demanding both is deliberate — a genuine invoice whose total briefly failed
- * to parse still classifies as an invoice (and stops for review on the missing
- * total, as before) rather than being quietly filed as reference material.
- * Verified against a real 5-attachment AP email: the two Censhare India
- * invoices are "Standard" with totals; the cost-allocation schedule and the
- * CBIC customs rate notification are both "Other" with no amount.
+ * Primary signal is the extraction model's own judgement
+ * (`document.isPayableInvoice`) — it has the whole document in front of it and
+ * can tell a customs rate notification from an invoice far more reliably than
+ * field-shape rules can. "Is this the document asking to be paid?" is exactly
+ * the kind of call it should be making, not one to reverse-engineer downstream.
+ *
+ * The field-shape heuristic below is only the fallback, for records extracted
+ * before the model was asked to classify. It requires BOTH signals — an
+ * unrecognised invoice type AND no stated amount — so a genuine invoice whose
+ * total briefly failed to parse still counts as an invoice (and stops for
+ * review on the missing total) rather than being filed away as reference.
  */
-function classifyDocumentKind(invoice: any): DocumentKind {
+function classifyDocumentKind(extracted: any): DocumentKind {
+  const isPayableInvoice = extracted?.document?.isPayableInvoice;
+  if (typeof isPayableInvoice === "boolean") {
+    return isPayableInvoice ? "INVOICE" : "SUPPORTING_DOCUMENT";
+  }
+
+  const invoice = extracted?.invoice ?? {};
   const invoiceType = String(invoice?.invoiceType ?? "").trim().toLowerCase();
   const total = invoice?.totalAmount;
   const statesAnAmount = typeof total === "number" && Number.isFinite(total) && total !== 0;
@@ -162,7 +171,8 @@ export function assessInvoiceFlow(
   // checks (vendor, invoice number, total, ...) only make sense for a document
   // that's trying to be an invoice, and running them produces a wall of
   // blockers for something that was never going to NetSuite anyway.
-  if (classifyDocumentKind(invoice) === "SUPPORTING_DOCUMENT") {
+  if (classifyDocumentKind(extracted) === "SUPPORTING_DOCUMENT") {
+    const documentType = String(extracted?.document?.documentType ?? "").trim();
     return {
       documentKind: "SUPPORTING_DOCUMENT",
       reviewStatus: "NEEDS_REVIEW",
@@ -178,8 +188,9 @@ export function assessInvoiceFlow(
         {
           code: "supporting_document",
           severity: "info",
-          message:
-            "Not an invoice — kept as a supporting document for reference. Never sent to NetSuite.",
+          message: documentType
+            ? `Not an invoice (${documentType}) — kept as a reference document. Never sent to NetSuite.`
+            : "Not an invoice — kept as a reference document. Never sent to NetSuite.",
         },
       ],
     };

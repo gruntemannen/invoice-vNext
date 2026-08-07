@@ -616,6 +616,49 @@ async function renderDepartmentSelectorPanel(d) {
   }
 }
 
+// Non-invoice attachments from the same email, shown on the invoice they back
+// up. Downloading reuses the per-attachment download endpoint, so these need
+// no storage of their own — they're already stored, just surfaced here.
+function renderReferenceDocumentsPanel(d) {
+  const panel = $("reference-documents-panel");
+  if (!panel) return;
+
+  const docs = d.referenceDocuments ?? [];
+  if (docs.length === 0) {
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return;
+  }
+
+  panel.classList.remove("hidden");
+  panel.innerHTML = `
+    <div class="panel-title">
+      Reference documents (${docs.length}) — from the same email, not sent to NetSuite
+    </div>
+    <div class="reference-doc-list">
+      ${docs
+        .map(
+          (doc) => `
+          <div class="reference-doc">
+            <div class="reference-doc-main">
+              <span class="reference-doc-name">${escapeHtml(doc.filename || "Attachment")}</span>
+              ${doc.documentType ? `<span class="reference-doc-type">${escapeHtml(doc.documentType)}</span>` : ""}
+            </div>
+            <button class="button secondary small" type="button"
+              data-reference-attachment="${escapeHtml(doc.attachmentId)}">Download</button>
+          </div>`
+        )
+        .join("")}
+    </div>
+  `;
+
+  panel.querySelectorAll("[data-reference-attachment]").forEach((button) => {
+    button.addEventListener("click", () =>
+      downloadPdf(d.messageId, button.dataset.referenceAttachment)
+    );
+  });
+}
+
 async function saveDepartmentOverride(messageId, attachmentId) {
   const select = $("department-select");
   const saveBtn = $("department-save-btn");
@@ -1127,6 +1170,8 @@ async function openDetail(messageId, attachmentId) {
   $("vat-registry-panel").innerHTML = "";
   $("department-selector-panel").classList.add("hidden");
   $("department-selector-panel").innerHTML = "";
+  $("reference-documents-panel").classList.add("hidden");
+  $("reference-documents-panel").innerHTML = "";
   overlay.classList.remove("hidden");
   document.body.classList.add("no-scroll");
 
@@ -1146,6 +1191,7 @@ async function openDetail(messageId, attachmentId) {
     renderDuplicateReviewPanel(d);
     renderVatRegistryPanel(d);
     renderDepartmentSelectorPanel(d);
+    renderReferenceDocumentsPanel(d);
 
     let jsonPayload;
     if (d.status === "FAILED") {

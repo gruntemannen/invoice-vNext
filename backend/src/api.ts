@@ -205,18 +205,22 @@ async function getInvoiceDetail(event: APIGatewayProxyEventV2) {
   }
 
   const derived = withDerivedFlow(item);
+  const referenceDocuments =
+    derived.documentKind === "SUPPORTING_DOCUMENT" ? [] : await listReferenceDocuments(item);
+
   if (item.netSuiteTransactionId) {
     const transaction = await getNetSuiteTransaction(TABLE_NAME, item.netSuiteTransactionId);
     if (transaction) {
       return jsonResponse({
         ...derived,
+        referenceDocuments,
         netSuiteTransaction: summarizeTransaction(transaction),
         // Prefer the live transaction status over the (possibly lagging) mirrored one.
         displayStatus: computeDisplayStatus(item, transaction.status, derived.documentKind),
       });
     }
   }
-  return jsonResponse(derived);
+  return jsonResponse({ ...derived, referenceDocuments });
 }
 
 async function getNetSuiteFormat(event: APIGatewayProxyEventV2) {
@@ -798,6 +802,51 @@ async function findByAttachmentId(messageId: string, attachmentId: string) {
   );
 
   return res.Items?.[0] ?? null;
+}
+
+/**
+ * The non-invoice attachments that arrived in the same email as this invoice.
+ *
+ * Supporting material (cost-allocation schedules, rate notifications, remittance
+ * advices) is evidence FOR the invoices it was sent with, so it's surfaced on
+ * each invoice from that email rather than standing alone. They're linked by
+ * `messageId` — the email — rather than owned by one invoice, because a single
+ * schedule commonly backs several invoices in the same message and picking one
+ * to "own" it would be arbitrary.
+ *
+ * Returns [] for a supporting document itself; it doesn't need to list its peers.
+ */
+async function listReferenceDocuments(item: any): Promise<any[]> {
+  if (!item?.messageId) return [];
+
+  const res = await docClient.send(
+    new QueryCommand({
+      TableName: TABLE_NAME,
+      KeyConditionExpression: "messageId = :pk",
+      ExpressionAttributeValues: { ":pk": item.messageId },
+    })
+  );
+
+  return (res.Items ?? [])
+    .filter((sibling: any) => sibling.attachmentId && sibling.attachmentId !== item.attachmentId)
+    .map((sibling: any) => ({ sibling, derived: withDerivedFlow(sibling) }))
+    .filter(({ derived }) => derived.documentKind === "SUPPORTING_DOCUMENT")
+    .map(({ sibling, derived }) => ({
+      attachmentId: sibling.attachmentId,
+      filename: filenameFromAttachmentKey(sibling.attachmentKey, sibling.attachmentId),
+      documentType: sibling.extractedJson?.document?.documentType ?? null,
+      classificationReason: sibling.extractedJson?.document?.classificationReason ?? null,
+      receivedAt: sibling.receivedAt,
+      status: sibling.status,
+      displayStatus: derived.displayStatus,
+    }));
+}
+
+/** `attachments/{messageId}/{attachmentId}_{name}` -> `{name}`. */
+function filenameFromAttachmentKey(attachmentKey?: string, attachmentId?: string): string {
+  const last = String(attachmentKey ?? "").split("/").pop() ?? "";
+  const prefix = `${attachmentId ?? ""}_`;
+  return last.startsWith(prefix) ? last.slice(prefix.length) : last;
 }
 
 async function buildNetSuitePreview(item: any): Promise<{

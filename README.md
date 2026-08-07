@@ -37,13 +37,16 @@ Invoice Extractor currently provides:
   in AP review exactly as before, and the reviewer's action is an explicit "Approve & Send to
   NetSuite" override rather than a bare "log" step.
 - Supporting-document classification: invoice emails routinely carry non-invoice attachments
-  (cost-allocation schedules, customs exchange-rate notifications, remittance summaries). Any
-  attachment the extractor didn't recognise as an invoice type *and* that states no amount due is
-  classified `SUPPORTING_DOCUMENT`, shown as `Reference`, and kept and viewable — but it carries
-  none of the invoice-completeness flags, never joins duplicate detection, and is refused a
-  NetSuite push server-side rather than only being hidden in the UI. Both signals are required, so
-  a real invoice whose total briefly failed to parse still counts as an invoice and stops for
-  review as before.
+  (cost-allocation schedules, customs exchange-rate notifications, remittance advices). The
+  extraction model classifies each attachment directly (`document.isPayableInvoice`) — only a
+  document that itself requests or adjusts payment counts as an invoice. Anything else is
+  classified `SUPPORTING_DOCUMENT`, shown as `Reference`, and **attached to the invoices from the
+  same email as a downloadable reference document** rather than standing alone in the review
+  queue. Supporting documents carry none of the invoice-completeness flags, never join duplicate
+  detection, and are refused a NetSuite push server-side rather than only being hidden in the UI.
+  Records extracted before the model was asked to classify fall back to a deliberately
+  conservative heuristic (unrecognised invoice type *and* no stated amount), so a real invoice
+  whose total briefly failed to parse still counts as an invoice and stops for review as before.
 - A single unified lifecycle status per invoice, replacing separate extraction-status/review
   badges: `Imported` (still extracting) -> `On Hold` (needs review, a config gap, or a
   retryable NetSuite outage) -> `Processed` (NetSuite confirmed), or `Failed` at any point.

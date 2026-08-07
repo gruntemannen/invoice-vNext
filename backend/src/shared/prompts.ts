@@ -5,14 +5,19 @@
 
 export const buildExtractionPrompt = (textSnippet: string, hasDocument: boolean = false) => {
   const intro = hasDocument
-    ? "Look at the attached invoice document and extract the data."
-    : `Extract invoice data from this text:\n\n${textSnippet}`;
+    ? "Look at the attached document, decide whether it is a payable invoice, and extract the data."
+    : `Decide whether this text is a payable invoice, then extract the data:\n\n${textSnippet}`;
 
   return `${intro}
 
 Return ONLY valid JSON in this exact format:
 
 {
+  "document": {
+    "isPayableInvoice": true,
+    "documentType": "short label, e.g. Invoice, Credit note, Cost allocation schedule, Exchange rate notification, Remittance advice, Delivery note, Timesheet, Contract",
+    "classificationReason": "one short sentence explaining the choice"
+  },
   "vendor": {
     "name": "seller name",
     "taxId": "VAT/tax number or null",
@@ -66,6 +71,20 @@ Return ONLY valid JSON in this exact format:
 }
 
 Rules:
+- FIRST decide document.isPayableInvoice. AP emails routinely bundle supporting material with the
+  actual invoices, and only a payable document should ever be booked.
+- isPayableInvoice = true ONLY for documents that themselves request or adjust payment: invoices,
+  proforma invoices, and credit notes.
+- isPayableInvoice = false for anything else attached alongside them, for example: cost allocation
+  or cost breakdown schedules, currency/exchange-rate notifications from a tax or customs
+  authority, remittance advices, delivery notes, timesheets, price lists, contracts, bank
+  statements, reminders, and vendor statements of account.
+- A document is not a payable invoice merely because it names an amount, a company, or a reference
+  number. Ask whether THIS document is the one asking to be paid.
+- When isPayableInvoice is false: still fill in what genuinely appears on the document, but leave
+  totalAmount, netAmount and taxAmount null rather than 0, and return an empty lineItems array.
+  Do NOT turn the rows of a rate table, an allocation breakdown, or a summary listing into
+  lineItems — those are not billed lines.
 - vendor = the invoice ISSUER/SELLER (the company being paid, who created this invoice).
 - vendor is NOT the buyer/recipient/bill-to/ship-to.
 - buyer = the invoice recipient/customer/legal entity being billed.
@@ -92,6 +111,7 @@ export const buildRepairPrompt = (brokenJson: string) => {
 
 REQUIRED FORMAT:
 {
+  "document": { "isPayableInvoice": true, "documentType": "...", "classificationReason": "..." },
   "vendor": { "name": "...", "taxId": "...", "address": "...", "email": null, "bankDetails": { "ibans": [], "bic": null, "bankName": null, "accountName": null, "accountNumber": null } },
   "buyer": { "name": "...", "taxId": "...", "address": "...", "email": null, "entityCode": null },
   "invoice": { "invoiceNumber": "...", "purchaseOrderNumber": "...", "invoiceType": "...", "transactionIntent": "VendorBill", "invoiceDate": "...", "dueDate": "...", "currency": "...", "paymentTerms": null, "description": null, "servicePeriod": { "startDate": null, "endDate": null }, "remittanceReference": null, "netAmount": 0, "taxAmount": 0, "totalAmount": 0 },

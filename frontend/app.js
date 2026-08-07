@@ -1097,6 +1097,29 @@ function filteredInvoices() {
   });
 }
 
+// One email can carry several attachments — commonly a few invoices plus the
+// schedules and notifications backing them. Grouping by message makes the unit
+// in the list match the unit that actually arrived; without it, four rows
+// sharing only a timestamp look like four unrelated invoices.
+function groupByEmail(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const key = row.messageId ?? "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  return [...groups.values()];
+}
+
+function describeEmailGroup(group) {
+  const invoices = group.filter((r) => r.documentKind !== "SUPPORTING_DOCUMENT").length;
+  const references = group.length - invoices;
+  const parts = [];
+  if (invoices) parts.push(`${invoices} invoice${invoices === 1 ? "" : "s"}`);
+  if (references) parts.push(`${references} reference document${references === 1 ? "" : "s"}`);
+  return parts.join(" · ");
+}
+
 function renderAudit() {
   const body = $("audit-body");
   const rows = filteredInvoices();
@@ -1108,24 +1131,43 @@ function renderAudit() {
     return;
   }
 
-  rows.forEach((it) => {
-    const tr = document.createElement("tr");
-    tr.className = "row-click";
-    tr.innerHTML = `
-      <td>${escapeHtml(fmtDate(it.receivedAt))}</td>
-      <td class="cell-strong">${escapeHtml(it.vendorName || "—")}</td>
-      <td>${escapeHtml(it.invoiceNumber || "—")}</td>
-      <td class="num">${escapeHtml(fmtAmount(it.totalAmount, it.currency))}</td>
-      <td><span class="badge ${displayStatusClass(it.displayStatus)}">${escapeHtml(fmtDisplayStatus(it.displayStatus))}</span></td>
-      <td class="num">${
-        it.status === "COMPLETED"
-          ? `<span class="conf ${confidenceClass(it.confidence)}">${fmtPct(it.confidence)}</span>`
-          : "—"
-      }</td>
-    `;
-    tr.onclick = () => openDetail(it.messageId, it.attachmentId);
-    body.appendChild(tr);
-  });
+  for (const group of groupByEmail(rows)) {
+    // A single-attachment email needs no grouping chrome — the header would be
+    // pure noise on what is already one self-contained row.
+    const grouped = group.length > 1;
+    if (grouped) {
+      const first = group[0];
+      const header = document.createElement("tr");
+      header.className = "email-group";
+      header.innerHTML = `
+        <td colspan="6">
+          <span class="email-group-subject">${escapeHtml(first.subject || "(no subject)")}</span>
+          <span class="email-group-meta">${escapeHtml(first.from || "")}${
+            first.from ? " · " : ""
+          }${escapeHtml(describeEmailGroup(group))}</span>
+        </td>`;
+      body.appendChild(header);
+    }
+
+    group.forEach((it) => {
+      const tr = document.createElement("tr");
+      tr.className = grouped ? "row-click grouped" : "row-click";
+      tr.innerHTML = `
+        <td>${escapeHtml(fmtDate(it.receivedAt))}</td>
+        <td class="cell-strong">${escapeHtml(it.vendorName || "—")}</td>
+        <td>${escapeHtml(it.invoiceNumber || "—")}</td>
+        <td class="num">${escapeHtml(fmtAmount(it.totalAmount, it.currency))}</td>
+        <td><span class="badge ${displayStatusClass(it.displayStatus)}">${escapeHtml(fmtDisplayStatus(it.displayStatus))}</span></td>
+        <td class="num">${
+          it.status === "COMPLETED"
+            ? `<span class="conf ${confidenceClass(it.confidence)}">${fmtPct(it.confidence)}</span>`
+            : "—"
+        }</td>
+      `;
+      tr.onclick = () => openDetail(it.messageId, it.attachmentId);
+      body.appendChild(tr);
+    });
+  }
 }
 
 /* ========================================================================

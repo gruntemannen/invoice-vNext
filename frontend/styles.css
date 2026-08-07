@@ -673,6 +673,28 @@ a:hover {
 .cell-strong {
   font-weight: 600;
 }
+
+/* Email grouping: one header per message, then its attachments beneath. */
+.table tbody tr.email-group td {
+  background: var(--surface-2);
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.email-group-subject {
+  font-weight: 600;
+  font-size: 12.5px;
+}
+.email-group-meta {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+/* Left rule ties an attachment row visually to the email above it. */
+.table tbody tr.grouped td:first-child {
+  box-shadow: inset 3px 0 0 var(--border-strong);
+  padding-left: 24px;
+}
 .table-foot {
   padding: 16px;
   display: flex;

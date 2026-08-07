@@ -1120,23 +1120,39 @@ function describeEmailGroup(group) {
   return parts.join(" · ");
 }
 
+// The audit list is a list of invoices. Reference documents are attachments on
+// the invoices they arrived with, not rows in their own right — they have no
+// amount and no meaningful confidence, so a row per reference is just noise.
+//
+// The one exception: an email that contained NO invoice at all still shows its
+// reference documents, so an attachment can never silently vanish from the
+// audit list just because nothing in that email was payable.
+function selectVisibleRows(rows) {
+  return groupByEmail(rows).map((group) => {
+    const invoices = group.filter((r) => r.documentKind !== "SUPPORTING_DOCUMENT");
+    const references = group.filter((r) => r.documentKind === "SUPPORTING_DOCUMENT");
+    return { visible: invoices.length ? invoices : references, invoices, references };
+  });
+}
+
 function renderAudit() {
   const body = $("audit-body");
-  const rows = filteredInvoices();
-  $("audit-count").textContent = `${rows.length} row${rows.length === 1 ? "" : "s"}`;
+  const groups = selectVisibleRows(filteredInvoices());
+  const rowCount = groups.reduce((total, g) => total + g.visible.length, 0);
+  $("audit-count").textContent = `${rowCount} row${rowCount === 1 ? "" : "s"}`;
   body.innerHTML = "";
 
-  if (rows.length === 0) {
+  if (rowCount === 0) {
     body.innerHTML = `<tr><td colspan="6"><div class="empty">No invoices match your filters.</div></td></tr>`;
     return;
   }
 
-  for (const group of groupByEmail(rows)) {
-    // A single-attachment email needs no grouping chrome — the header would be
-    // pure noise on what is already one self-contained row.
-    const grouped = group.length > 1;
+  for (const { visible, invoices, references } of groups) {
+    // Grouping chrome only earns its place when one email produced several
+    // rows; a lone invoice is already self-contained.
+    const grouped = visible.length > 1;
     if (grouped) {
-      const first = group[0];
+      const first = visible[0];
       const header = document.createElement("tr");
       header.className = "email-group";
       header.innerHTML = `
@@ -1144,22 +1160,34 @@ function renderAudit() {
           <span class="email-group-subject">${escapeHtml(first.subject || "(no subject)")}</span>
           <span class="email-group-meta">${escapeHtml(first.from || "")}${
             first.from ? " · " : ""
-          }${escapeHtml(describeEmailGroup(group))}</span>
+          }${escapeHtml(describeEmailGroup([...invoices, ...references]))}</span>
         </td>`;
       body.appendChild(header);
     }
 
-    group.forEach((it) => {
+    visible.forEach((it) => {
+      const isReference = it.documentKind === "SUPPORTING_DOCUMENT";
+      // Without a group header there's nowhere else to mention the attachments,
+      // so note them on the invoice row itself.
+      const attachmentNote =
+        !grouped && !isReference && references.length
+          ? `<span class="row-attachments">+${references.length} reference document${
+              references.length === 1 ? "" : "s"
+            }</span>`
+          : "";
+
       const tr = document.createElement("tr");
       tr.className = grouped ? "row-click grouped" : "row-click";
       tr.innerHTML = `
         <td>${escapeHtml(fmtDate(it.receivedAt))}</td>
-        <td class="cell-strong">${escapeHtml(it.vendorName || "—")}</td>
+        <td class="cell-strong">${escapeHtml(it.vendorName || "—")}${attachmentNote}</td>
         <td>${escapeHtml(it.invoiceNumber || "—")}</td>
         <td class="num">${escapeHtml(fmtAmount(it.totalAmount, it.currency))}</td>
         <td><span class="badge ${displayStatusClass(it.displayStatus)}">${escapeHtml(fmtDisplayStatus(it.displayStatus))}</span></td>
         <td class="num">${
-          it.status === "COMPLETED"
+          // Confidence is an extraction-quality signal for a document we're
+          // going to book. It says nothing useful about a reference document.
+          it.status === "COMPLETED" && !isReference
             ? `<span class="conf ${confidenceClass(it.confidence)}">${fmtPct(it.confidence)}</span>`
             : "—"
         }</td>

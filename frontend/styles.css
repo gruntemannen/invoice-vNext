@@ -690,6 +690,14 @@ a:hover {
   color: var(--muted);
   margin-top: 2px;
 }
+/* Attachment count on a lone invoice row, where there's no group header. */
+.row-attachments {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-top: 2px;
+}
 /* Left rule ties an attachment row visually to the email above it. */
 .table tbody tr.grouped td:first-child {
   box-shadow: inset 3px 0 0 var(--border-strong);

@@ -15,7 +15,7 @@
     "@aws-sdk/lib-dynamodb": "^3.596.0",
     "@aws-sdk/s3-request-presigner": "^3.596.0",
     "mailparser": "^3.6.5",
-    "uuid": "^9.0.1"
+    "uuid": "^14.0.3"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.160",
